@@ -294,7 +294,9 @@ function makeEnv(opts) {
     readyState: 'complete',
     title: '', documentElement: { innerHTML: '', contains: () => true, appendChild() {} },
     createElement: el, body: el('body'), getElementById: () => null,
-    querySelectorAll: () => [], addEventListener() {}
+    // opts.video：给「真的跑一遍跳过/撤回」的用例准备的假播放器
+    querySelectorAll: (sel) => (sel === 'video' && opts.video) ? [opts.video] : [],
+    addEventListener() {}
   };
   global.window = {};
   global.unsafeWindow = {};
@@ -1491,6 +1493,90 @@ function ctxOf(bvid, page) {
     };
     check('未对齐的段：mapBySeasonChain 直接返回 null',
       await P.mapBySeasonChain(badChain, 2), null);
+  }
+
+  /* --- 27. 跳过偏移 + 撤回（v0.4.4） ---
+   * 用户报的三件事：
+   *   ① 点了「撤回」，过一会儿还是会被自动跳过
+   *   ② 想要一个「在原来跳过的基础上加减秒数」的设置（上游按原片标的时间戳，B站这版常差一两秒）
+   *   ③ 撤回提示默认停留 8 秒太长
+   * ①的根因：撤回回调里 `delete runtime.skipped[key]`。轮询是 50ms 一次，
+   *   而撤回又把播放头送回区间内部 → 下一轮立刻重新跳过，等于没撤。
+   *   （当年为了绕开这个自激，撤回位置还特意写成 `from - 1`。） */
+  head('27. 跳过偏移与撤回（v0.4.4）');
+  {
+    const mkVideo = (o) => Object.assign({
+      currentTime: 0, duration: 1500, paused: false, ended: false,
+      play() { this.paused = false; },
+      addEventListener() {}, getBoundingClientRect: () => ({ width: 800, height: 450 })
+    }, o);
+    const OP = { type: 'op', start: 100, end: 190 };
+    const ED = { type: 'ed', start: 880, end: 960 };
+
+    /* ① 跳过偏移 */
+    const targetWith = (off, video, seg) =>
+      makeEnv({ store: { skipOffset: off } }).api.api_.skipTarget(video || mkVideo(), seg || OP);
+    check('偏移 0（默认）→ 落在官方终点 +ε', targetWith(0), 190.06);
+    check('+3 → 多跳 3 秒（把 OP 后的黑屏一起跳掉）', targetWith(3), 193.06);
+    check('-5 → 少跳 5 秒（留住 OP 尾巴）', targetWith(-5), 185.06);
+    // 短片段 + 大负偏移：下限锁在「起跳点 +1 秒」，绝不倒回片段内部
+    check('-30（已被配置夹住）用在 15 秒的回顾上 → 锁在起点 +1 秒',
+      targetWith(-30, mkVideo(), { type: 'recap', start: 100, end: 115 }), 101);
+    check('-100 会被配置夹成 -30（不会出现离谱的负跳跃）', targetWith(-100), 160.06);
+    check('+30 但视频只剩 200 秒 → 锁在片尾前', targetWith(30, mkVideo({ duration: 200 })), 199.95);
+
+    const cfgWith = (store) => makeEnv({ store }).api.api_.getConfig();
+    check('偏移上限 30 秒（手滑输错也不失控）', cfgWith({ skipOffset: 999 }).skipOffset, 30);
+    check('偏移下限 -30 秒', cfgWith({ skipOffset: -999 }).skipOffset, -30);
+    check('偏移填了非数字 → 回落到 0', cfgWith({ skipOffset: 'abc' }).skipOffset, 0);
+
+    /* ② 撤回之后不能再被自动跳过 */
+    const v1 = mkVideo({ currentTime: 120 });
+    const e1 = makeEnv({ store: { autoDetect: 'auto', skipOffset: 0 }, video: v1 });
+    const rt1 = e1.api._runtime;
+    rt1.result = { ok: true, segments: [OP, ED] };
+    rt1.video = v1;
+    e1.api._checkOnce();
+    check('播放头在 OP 区间里 → 自动跳到终点', Math.round(v1.currentTime * 100) / 100, 190.06);
+    checkTrue('「已跳过」标记已写下', rt1.skipped['op:100'] === true);
+    checkTrue('撤回回调挂到了 runtime.undo 上', typeof rt1.undo === 'function');
+
+    rt1.undo();
+    check('撤回后回到原位置（原样回去，不再 -1 秒）', v1.currentTime, 120);
+    checkTrue('撤回**不清除**「已跳过」标记（防重跳的关键）', rt1.skipped['op:100'] === true);
+
+    rt1.lastSkipAt = 0;                       // 排除 160ms 冷却期的干扰，只让「已跳过」标记来挡
+    for (let i = 0; i < 6; i++) e1.api._checkOnce();
+    check('撤回后连续轮询都不再跳过', v1.currentTime, 120);
+
+    /* 撤回只作用于那一段，别的段落照常跳 */
+    const v2 = mkVideo({ currentTime: 900 });
+    const e2 = makeEnv({ store: { autoDetect: 'auto' }, video: v2 });
+    const rt2 = e2.api._runtime;
+    rt2.result = { ok: true, segments: [OP, ED] };
+    rt2.video = v2;
+    e2.api._checkOnce();
+    check('ED 区间里 → 跳到 ED 终点', Math.round(v2.currentTime * 100) / 100, 960.06);
+    rt2.undo();
+    check('撤回 ED 后回到 900', v2.currentTime, 900);
+    v2.currentTime = 120; rt2.lastSkipAt = 0;
+    e2.api._checkOnce();
+    check('撤回 ED 不影响 OP 段（照样跳）', Math.round(v2.currentTime * 100) / 100, 190.06);
+
+    /* ③ 配置默认值与迁移 */
+    const fresh = makeEnv().api.api_.getConfig();
+    check('新装默认：撤回提示 4 秒', fresh.undoSeconds, 4);
+    check('新装默认：偏移 0', fresh.skipOffset, 0);
+    check('老配置（cfgVersion 2 + 存着 8 秒）→ 迁移成 4 秒',
+      cfgWith({ cfgVersion: 2, undoSeconds: 8 }).undoSeconds, 4);
+    check('迁移不动用户改过的其它项',
+      cfgWith({ cfgVersion: 2, undoSeconds: 8, skipOffset: -2, jumpEd: false }).skipOffset, -2);
+    check('迁移不动 jumpEd',
+      cfgWith({ cfgVersion: 2, undoSeconds: 8, skipOffset: -2, jumpEd: false }).jumpEd, false);
+    check('已经是新版（cfgVersion 3）的配置原样保留',
+      cfgWith({ cfgVersion: 3, undoSeconds: 12 }).undoSeconds, 12);
+    check('「不显示撤回」（0 秒）也能存住',
+      cfgWith({ cfgVersion: 3, undoSeconds: 0 }).undoSeconds, 0);
   }
 
   /* --- 汇总 --- */

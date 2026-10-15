@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.4.3
+// @version      0.4.4
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -62,7 +62,12 @@
     jumpRecap: false,      // 跳过总集篇回顾（很多人想看，默认关）
     jumpMixed: false,      // 跳过「融进正片画面」的 OP/ED（没独立 OP 段的番，跳过会切正片，默认关）
 
-    undoSeconds: 8,        // 跳过后「撤回」提示停留秒数（0 = 不显示撤回）
+    /* 跳完之后落点再前后挪几秒（正数＝多跳，负数＝少跳）。
+     * 上游时间戳是按「原片」标的，B站这版可能剪过/加过片头，落点常差一两秒；
+     * 负数不会倒回片段内部（最多落在起跳点之后 1 秒），所以「少跳」是安全的。 */
+    skipOffset: 0,
+
+    undoSeconds: 4,        // 跳过后「撤回」提示停留秒数（0 = 不显示撤回）
     showToast: true,       // 跳转提示
 
     useSeasonTitle: true,  // 优先用 UGC 合集里 UP 主改过的单集标题
@@ -86,11 +91,14 @@
   (function loadConfig() {
     /* 一次性配置迁移。
      * v1：showIdlePill 默认 false；v2 起默认 true（用户要求「未识别时也显示胶囊」默认开）。
-     * 老安装里存着的 false 既可能是旧默认、也可能是手动关的 —— 但旧默认本来就不显示，
-     * 手动再去关一次没有意义，所以这里一律清掉，让新默认生效。 */
-    var CFG_VERSION = 2;
-    if ((gmGet('cfgVersion', 1) || 1) < CFG_VERSION) {
-      try { GM_deleteValue('showIdlePill'); } catch (e) { /* ignore */ }
+     *     老安装里存着的 false 既可能是旧默认、也可能是手动关的 —— 但旧默认本来就不显示，
+     *     手动再去关一次没有意义，所以这里一律清掉，让新默认生效。
+     * v3：undoSeconds 默认 8 秒 → 4 秒（用户反馈撤回提示停留太久）。同理清掉旧值。 */
+    var prevVer = gmGet('cfgVersion', 1) || 1;
+    var CFG_VERSION = 3;
+    if (prevVer < CFG_VERSION) {
+      if (prevVer < 2) { try { GM_deleteValue('showIdlePill'); } catch (e) { /* ignore */ } }
+      if (prevVer < 3) { try { GM_deleteValue('undoSeconds'); } catch (e) { /* ignore */ } }
       gmSet('cfgVersion', CFG_VERSION);
     }
     Object.keys(DEFAULTS).forEach(function (k) { config[k] = gmGet(k, DEFAULTS[k]); });
@@ -101,6 +109,10 @@
     config.showToast = !!config.showToast;
     config.useSeasonTitle = !!config.useSeasonTitle;
     config.showIdlePill = !!config.showIdlePill;
+    var off = Number(config.skipOffset);
+    config.skipOffset = isFinite(off) ? Math.max(-30, Math.min(30, off)) : 0;
+    var us = Number(config.undoSeconds);
+    config.undoSeconds = isFinite(us) ? Math.max(0, Math.min(30, us)) : DEFAULTS.undoSeconds;
   })();
 
   /* ==================================================================
@@ -1857,6 +1869,7 @@
     skipping: false,
     lastSkipAt: 0,
     skipped: {},               // 记录本集已跳过的时间戳类型，避免反复跳
+    undo: null,                // 最近一次跳过的「撤回」回调（调试钩子：控制台/测试可直接调用）
     lastSegKey: ''
   };
 
@@ -1870,6 +1883,22 @@
     catch (e) { return false; }
   }
 
+  /* 跳过片段的实际落点。config.skipOffset 让用户微调（上游按原片标的时间戳，
+   * B站这版剪过／加过片头时落点常差一两秒）：
+   *   正数＝多跳几秒（跳过 OP 后面那点黑屏／静帧）
+   *   负数＝少跳几秒（保留 OP 尾巴）
+   * 下限锁在「起跳点 +1 秒」—— 再怎么减也不会倒回片段里面去。 */
+  function skipTarget(video, seg) {
+    var off = Number(config.skipOffset) || 0;
+    var dur = (video && video.duration) || 0;
+    var t = seg.end + off + EPSILON;
+    var floor = seg.start + 1;
+    if (t < floor) t = floor;
+    var ceil = dur ? dur - 0.05 : seg.end + off + EPSILON;
+    if (t > ceil) t = ceil;
+    return t;
+  }
+
   function performSkip(video, seg) {
     if (runtime.skipping) return;
     if (Date.now() - runtime.lastSkipAt < COOLDOWN_MS) return;
@@ -1880,7 +1909,7 @@
     runtime.skipped[seg.type + ':' + Math.round(seg.start)] = true;
 
     var wasPaused = video.paused;
-    var target = Math.min(seg.end + EPSILON, (video.duration || seg.end) - 0.05);
+    var target = skipTarget(video, seg);
     var from = video.currentTime;
 
     var ok = doSeek(video, target);
@@ -1888,19 +1917,27 @@
 
     if (ok) {
       if (!wasPaused && video.paused) { try { video.play(); } catch (e) { /* ignore */ } }
-      notifySkip(seg, from, video);
+      notifySkip(seg, from, video, target);
     }
   }
 
-  function notifySkip(seg, from, video) {
+  function notifySkip(seg, from, video, target) {
     var label = seg.type === 'op' ? '片头 OP' : (seg.type === 'ed' ? '片尾 ED' : '回顾 Recap');
-    if (config.showToast) {
-      showToast('已跳过 ' + label, fmtTime(seg.start) + ' → ' + fmtTime(seg.end), function () {
-        // 撤回：这是防错跳的最后一道保险
-        try { video.currentTime = Math.max(0, from - 1); } catch (e) { /* ignore */ }
-        delete runtime.skipped[seg.type + ':' + Math.round(seg.start)];
-      });
-    }
+    if (!config.showToast) return;
+    var off = Number(config.skipOffset) || 0;
+    var desc = fmtTime(seg.start) + ' → ' + fmtTime(target || seg.end);
+    if (off) desc += '（偏移 ' + (off > 0 ? '+' : '') + off + 's）';
+    var undo = function () {
+      /* 撤回：这是防错跳的最后一道保险。
+       * 注意 **不要再删 runtime.skipped 里那条记录** —— 原来删了，于是下一轮轮询
+       * （50ms 一次）看到播放头又落回区间里就一直重新跳过，用户点了撤回等于没点。
+       * 记录留着 = 这一集这段不再自动跳（换集／换视频时 runtime.skipped 会整体重置）。
+       * 回到原位也不用再减 1 秒了：那是当年为了绕开「删记录导致立刻重跳」才加的。 */
+      try { video.currentTime = Math.max(0, from); } catch (e) { /* ignore */ }
+      showToast('已撤回', '这一集不再自动跳过这段 ' + label);
+    };
+    runtime.undo = undo;          // 调试钩子：控制台 / 测试里可以直接调用验证
+    showToast('已跳过 ' + label, desc, undo);
   }
 
   function checkOnce() {
@@ -2033,8 +2070,12 @@
       var btn = document.createElement('button');
       btn.textContent = '撤回';
       btn.addEventListener('click', function () {
+        var mine = el;
         onUndo();
-        toastRoot.innerHTML = '';
+        /* 只摘掉**自己**这一条 —— 撤回回调里会弹一条「已撤回」，
+         * 如果无脑 toastRoot.innerHTML='' 会把刚弹出来的那条一起抹掉，
+         * 用户点了「撤回」屏幕上什么反馈都没有。 */
+        if (mine && mine.parentNode === toastRoot) toastRoot.removeChild(mine);
       });
       el.appendChild(btn);
     }
@@ -2653,6 +2694,8 @@
       '<div class="row"><div><div class="lab">跳过 ED</div></div><input type="checkbox" class="ed"></div>' +
       '<div class="row"><div><div class="lab">跳过回顾 Recap</div><div class="tip">总集篇的回顾片段，很多人想看</div></div><input type="checkbox" class="recap"></div>' +
       '<div class="row"><div><div class="lab">跳过「融进正片」的 OP/ED</div><div class="tip">有些番没有独立 OP 段，OP 是和画面融在一起播的（每集还可能不一样）。跳过这类区间会切掉正片内容，默认关</div></div><input type="checkbox" class="mixed"></div>' +
+      '<div class="row"><div><div class="lab">跳过偏移（秒）</div><div class="tip">在数据库给的时间戳上再挪一点。正数＝多跳（跳过 OP 后的黑屏／静帧），负数＝少跳（保留 OP 尾巴，最多减到片段起点，不会倒着跳）</div></div>' +
+      '<slot name="offset"></slot></div>' +
       '<div class="row"><div><div class="lab">撤回提示秒数</div><div class="tip">跳过后可以点「撤回」回到原位置，0＝不显示</div></div>' +
       '<slot name="undo"></slot></div>' +
       '<div class="row"><div><div class="lab">显示跳转提示</div></div><input type="checkbox" class="toast"></div>' +
@@ -2676,6 +2719,10 @@
     undoInput.className = 'undo';
     undoInput.type = 'number'; undoInput.min = '0'; undoInput.max = '30';
     slotted.push(undoInput);
+    var offInput = mkSlot('input', 'offset', INP_CSS + 'width:90px;');
+    offInput.className = 'offset';
+    offInput.type = 'number'; offInput.min = '-30'; offInput.max = '30'; offInput.step = '1';
+    slotted.push(offInput);
 
     // 复选框：只做「不给焦点」（tabindex=-1 + 阻止 mousedown 默认行为），
     // 翻转交给浏览器原生行为 —— 自己翻的实现见 15.2 的踩坑记录
@@ -2692,6 +2739,7 @@
     panel.querySelector('.recap').checked = config.jumpRecap;
     panel.querySelector('.mixed').checked = config.jumpMixed;
     undoInput.value = config.undoSeconds;
+    offInput.value = config.skipOffset;
     panel.querySelector('.toast').checked = config.showToast;
     panel.querySelector('.seasonT').checked = config.useSeasonTitle;
     panel.querySelector('.idle').checked = config.showIdlePill;
@@ -2709,6 +2757,10 @@
         jumpRecap: panel.querySelector('.recap').checked,
         jumpMixed: panel.querySelector('.mixed').checked,
         undoSeconds: Math.max(0, parseInt(undoInput.value, 10) || 0),
+        skipOffset: Math.max(-30, Math.min(30, (function () {
+          var n = parseInt(offInput.value, 10);
+          return isFinite(n) ? n : 0;
+        })())),
         showToast: panel.querySelector('.toast').checked,
         useSeasonTitle: panel.querySelector('.seasonT').checked,
         showIdlePill: panel.querySelector('.idle').checked
@@ -2726,6 +2778,7 @@
   function rerun() {
     runtime.result = null;
     runtime.skipped = {};
+    runtime.undo = null;
     stopMonitor();
     buildContext().then(function (ctx) {
       runtime.ctx = ctx;
@@ -2802,7 +2855,9 @@
         candidateMedia: candidateMedia, searchByName: searchByName,
         buildSeasonChain: buildSeasonChain, mapBySeasonChain: mapBySeasonChain,
         alignGroupsToSeasons: alignGroupsToSeasons, nameScore: nameScore,
-        CHAIN_VERSION: CHAIN_VERSION, isJunkTailPart: isJunkTailPart
+        CHAIN_VERSION: CHAIN_VERSION, isJunkTailPart: isJunkTailPart,
+        skipTarget: skipTarget,
+        getConfig: function () { return Object.assign({}, config); }
       }
     };
     try {
