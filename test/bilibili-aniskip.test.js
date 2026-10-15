@@ -65,6 +65,30 @@ const VIDEOS = {
     pubdate: 1700000000, videos: 1, duration: 3120,   // 52 分钟：正片 + 结尾塞别的片段
     owner: { mid: 90005, name: '尾巴君' },
     pages: [{ page: 1, part: '某动画 第01话', duration: 3120, cid: 5001 }]
+  },
+  // 真实数据（api.bilibili.com/x/web-interface/view，2026-10-15 抓取）
+  BV1jfDYBSEKs: {
+    aid: 116361653259359, cid: 37304795821, bvid: 'BV1jfDYBSEKs',
+    title: '【4K超清】尖帽子的魔法工坊 1-13话全集',
+    pubdate: 1775538873, videos: 13, duration: 23849,
+    owner: { mid: 3493112693394137, name: '晓月の诗' },
+    pages: [
+      { page: 1, part: '01', duration: 1799, cid: 37304795821 },
+      { page: 2, part: '02', duration: 2164, cid: 37325113978 },
+      { page: 3, part: '03', duration: 1799, cid: 37481744795 },
+      { page: 4, part: '04', duration: 1799, cid: 37677826503 },
+      { page: 5, part: '05', duration: 1799, cid: 37887018454 },
+      { page: 6, part: '06', duration: 1799, cid: 38091362022 },
+      { page: 7, part: '07', duration: 1799, cid: 38266015006 },
+      { page: 8, part: '08', duration: 1799, cid: 38432212345 },
+      { page: 9, part: '09', duration: 1799, cid: 38610209764 },
+      { page: 10, part: '10', duration: 1799, cid: 38780601174 },
+      { page: 11, part: '11', duration: 1799, cid: 38965940068 },
+      { page: 12, part: '12', duration: 1850, cid: 39144327028 },
+      { page: 13, part: '13', duration: 1845, cid: 39324290005 }
+    ],
+    // UGC 合集名才是「4月新番」的来源
+    season: { id: 7843931, title: '【4月新番】尖帽子的魔法工坊' }
   }
 };
 
@@ -72,10 +96,30 @@ const ANILIST_DB = {
   '葬送的芙莉莲': [{ id: 154587, idMal: 52991, episodes: 28, format: 'TV', startDate: { year: 2023 }, title: { native: '葬送のフリーレン', romaji: 'Sousou no Frieren' }, synonyms: [] }],
   'NANA': [{ id: 787, idMal: 1468, episodes: 47, format: 'TV', startDate: { year: 2006 }, title: { native: 'NANA', romaji: 'NANA' }, synonyms: [] }],
   '今天给大家做个糖醋排骨': [],
-  'ああああ': []
+  'ああああ': [],
+  // 真实条目：尖帽子的魔法工坊（AniList 搜索只认日文/罗马字，中文是 0 条 —— 所以要先过 Bangumi 桥）
+  'とんがり帽子のアトリエ': [{ id: 147105, idMal: 51553, episodes: 13, format: 'ONA', startDate: { year: 2026 }, title: { native: 'とんがり帽子のアトリエ', romaji: 'Tongari Boushi no Atelier', english: 'Witch Hat Atelier' }, synonyms: [] }]
 };
 
 const ANISKIP_DB = {
+  // 真实数据：尖帽子的魔法工坊 MAL 51553（api.aniskip.com，2026-10-15 抓取）
+  // 第 1/5/10 话上游确实没有数据 —— 脚本应表现为「这一话不跳」，而不是崩或瞎猜
+  // 另外注意每话 OP 起点从 2 秒到 383 秒都有 —— 固定秒数方案在这里必然错
+  '51553/2': { found: true, results: [
+    { interval: { startTime: 58, endTime: 147 }, skipType: 'op', episodeLength: 1420.076 },
+    { interval: { startTime: 1325, endTime: 1415 }, skipType: 'ed', episodeLength: 1420 }
+  ] },
+  '51553/3': { found: true, results: [
+    { interval: { startTime: 110.8, endTime: 198.7 }, skipType: 'op', episodeLength: 1420 }
+  ] },
+  '51553/5': { found: false, results: [] },
+  '51553/9': { found: true, results: [
+    { interval: { startTime: 383.487, endTime: 471.709 }, skipType: 'op', episodeLength: 1420 },
+    { interval: { startTime: 1325.98, endTime: 1414.03 }, skipType: 'ed', episodeLength: 1420 }
+  ] },
+  '51553/13': { found: true, results: [
+    { interval: { startTime: 2, endTime: 90 }, skipType: 'op', episodeLength: 1415 }
+  ] },
   '52991/1': { found: true, results: [
     { interval: { startTime: 2.5, endTime: 92.5 }, skipType: 'op', episodeLength: 1440 },
     { interval: { startTime: 1300, endTime: 1390 }, skipType: 'ed', episodeLength: 1440 }
@@ -1035,6 +1079,126 @@ function ctxOf(bvid, page) {
     // OVA：明确不跳，而不是猜一个条目去跳
     const rOva = await e3.api.identify(lzCtx(24));
     checkTrue('P24（OVA）明确不跳', !rOva.ok && rOva.reason === 'chain-miss', rOva.reason);
+  }
+
+  /* --- 23. 真实案例：尖帽子的魔法工坊（BV1jfDYBSEKs） ---
+   * 用户实测：「用标题自动填」填出来的番名是「4月新番」，实际应是「尖帽子的魔法工坊」。
+   * 真实接口数据（api.bilibili.com/x/web-interface/view）：
+   *   title            = 【4K超清】尖帽子的魔法工坊 1-13话全集
+   *   pages[0].part    = 01
+   *   ugc_season.title = 【4月新番】尖帽子的魔法工坊     ← 罪魁祸首
+   * 原因：weak 引号策略把【】里的内容当候选，「4月新番」不含任何噪声关键词，
+   * 拿 42(weak) + 3(表意文字) + 8(长度 4~30) = 53 分，压过真番名的 41 分。 */
+  head('23. 真实案例：尖帽子的魔法工坊（BV1jfDYBSEKs）');
+  {
+    const MAIN_G = '【4K超清】尖帽子的魔法工坊 1-13话全集';
+    const SEASON_TITLE_G = '【4月新番】尖帽子的魔法工坊';
+    const gCtx = (page) => ({
+      bvid: 'BV1jfDYBSEKs', aid: 116361653259359, cid: 37304795821 + page, page: page,
+      owner: { mid: 3493112693394137, name: '晓月の诗' }, mainTitle: MAIN_G,
+      partTitle: String(page).padStart(2, '0'), duration: 1799, pubdate: 1775538873,
+      videos: 13,
+      pages: Array.from({ length: 13 }, (_, i) => ({ page: i + 1, part: String(i + 1).padStart(2, '0'), duration: 1799, cid: 37304795821 + i })),
+      season: { id: 7843931, title: SEASON_TITLE_G }, seasonId: 7843931,
+      seasonTitle: SEASON_TITLE_G, seasonEpisodeTitle: MAIN_G, incomplete: false
+    });
+
+    const P = makeEnv().api.api_;
+    const cands = P.animeNameCandidates(gCtx(1));
+
+    check('档期标签「4月新番」被认成噪声', P.quotedSegments(SEASON_TITLE_G).map(x => x.text), []);
+    check('候选里没有「4月新番」', cands.filter(x => /新番/.test(x)), []);
+    check('首选是干净的番名', cands[0], '尖帽子的魔法工坊');
+    // 「【4月新番】」→ 撕掉档期标签后只剩空括号「【 】」，被空括号清理规则一并吃掉
+    check('清洗合集名（残留空括号也被清掉）', P.cleanTitle(SEASON_TITLE_G), '尖帽子的魔法工坊');
+    check('由主标题推出的候选也干净', P.animeNameCandidates({
+      mainTitle: MAIN_G, partTitle: '01', seasonTitle: null, seasonEpisodeTitle: '', videos: 13, page: 1
+    })[0], '尖帽子的魔法工坊');
+
+    // 话数区间「1-13话」不能再留个孤零零的「1」在尾巴上
+    check('「1-13话全集」整段剪掉', P.stripSeasonMarks('尖帽子的魔法工坊 1-13话全集'), '尖帽子的魔法工坊');
+    check('「全26话」仍然认', P.stripSeasonMarks('想要成为影之实力者 两季32话全集'), '想要成为影之实力者');
+    check('「第1-3季」区间不受影响', P.stripSeasonMarks('无职转生 第1-3季'), '无职转生');
+
+    // 反例：不要因为加了「新番」噪声就误伤正常番名
+    check('番名里的常见字不受影响 ①', P.animeNameCandidates({
+      mainTitle: '「葬送的芙莉莲」第01话', partTitle: '第01话', seasonTitle: null, seasonEpisodeTitle: '', videos: 1, page: 1
+    })[0], '葬送的芙莉莲');
+    check('番名里的常见字不受影响 ②', P.cleanTitle('转生史莱姆日记 番外篇 第01话'), '转生史莱姆日记 番外篇 第01话');
+  }
+
+  /* --- 24. 端到端：尖帽子的魔法工坊真的能跳（BV1jfDYBSEKs，真实上游数据） ---
+   * 上一组只验了「番名抽对了」。这一组走完整链路：
+   *   标题 → 候选 → Bangumi 桥 → AniList(id/idMal) → AniSkip/Anime Skip → 校验 → 可跳区间
+   * 所有外部响应都是 2026-10-15 从真实接口抓下来的。 */
+  head('24. 端到端：尖帽子的魔法工坊（BV1jfDYBSEKs）');
+  {
+    const BGM_WHA = [{ id: 377130, name: 'とんがり帽子のアトリエ', name_cn: '尖帽子的魔法工房', date: '2026-04-06', eps: 13, platform: 'TV' }];
+    const AL_WHA = { id: 147105, idMal: 51553, episodes: 13, format: 'ONA', startDate: { year: 2026 }, title: { native: 'とんがり帽子のアトリエ', romaji: 'Tongari Boushi no Atelier', english: 'Witch Hat Atelier' }, relations: { edges: [] } };
+
+    const net = makeNet({
+      'https://api.bgm.tv/v0/search/subjects': (req) => {
+        const kw = JSON.parse(req.data).keyword;
+        return { data: /尖帽子的魔法工[坊房]|とんがり帽子/.test(kw) ? BGM_WHA : [] };
+      },
+      'https://api.bgm.tv/v0/subjects/': { name: 'とんがり帽子のアトリエ', name_cn: '尖帽子的魔法工房', infobox: [] },
+      'https://graphql.anilist.co': (req) => {
+        const q = JSON.parse(req.data);
+        if (q.variables && q.variables.id !== undefined) {
+          return { data: { Media: String(q.variables.id) === '147105' ? AL_WHA : null } };
+        }
+        return { data: { Page: { media: ANILIST_DB[q.variables.q] || [] } } };
+      },
+      // Anime Skip 只有第 9 话有（真实数据）
+      'https://api.anime-skip.com/graphql': () => ({ data: { findShowsByExternalId: [{
+        name: 'Witch Hat Atelier',
+        episodes: [{ number: '9', timestamps: [
+          { at: 0, type: { name: 'Canon' } }, { at: 382, type: { name: 'Intro' } },
+          { at: 472, type: { name: 'Canon' } }, { at: 1325, type: { name: 'Credits' } },
+          { at: 1415, type: { name: 'Preview' } }
+        ] }]
+      }] } })
+    });
+
+    const e = makeEnv({ store: { autoDetect: 'auto' }, net });
+    const v = VIDEOS.BV1jfDYBSEKs;
+    const gctx = (page) => {
+      const p = v.pages[page - 1];
+      return {
+        bvid: v.bvid, aid: v.aid, cid: p.cid, page: page, owner: v.owner,
+        mainTitle: v.title, partTitle: p.part, duration: p.duration,
+        pubdate: v.pubdate, videos: v.videos, pages: v.pages,
+        season: v.season, seasonId: v.season.id,
+        seasonTitle: v.season.title, seasonEpisodeTitle: v.title, incomplete: false
+      };
+    };
+
+    // 第 2 话：AniSkip 有 op + ed
+    const r2 = await e.api.identify(gctx(2));
+    checkTrue('P2 识别成功', r2.ok, r2.reason || r2.confidence);
+    check('P2 → MAL 51553 第 2 话', [r2.malId, r2.episode], [51553, 2]);
+    check('P2 拿到 op 区间 58→147', (r2.segments || []).filter(s => s.type === 'op').map(s => [s.start, s.end]), [[58, 147]]);
+    check('P2 拿到 ed 区间', (r2.segments || []).filter(s => s.type === 'ed').map(s => [s.start, s.end]), [[1325, 1415]]);
+
+    // 第 9 话：两个源都有数据，合并后不重复
+    const r9 = await e.api.identify(gctx(9));
+    checkTrue('P9 识别成功', r9.ok, r9.reason || r9.confidence);
+    check('P9 只有一段 op（两源合并去重）', (r9.segments || []).filter(s => s.type === 'op').length, 1);
+    checkTrue('P9 的 op 起点取自 AniSkip（优先源）',
+      (r9.segments || []).some(s => s.type === 'op' && Math.abs(s.start - 383.487) < 1),
+      (r9.segments || []).map(s => s.type + ':' + s.start));
+
+    // 第 13 话：OP 从第 2 秒开始
+    const r13 = await e.api.identify(gctx(13));
+    checkTrue('P13 识别成功', r13.ok, r13.reason || r13.confidence);
+    check('P13 → 第 13 话', r13.episode, 13);
+
+    // 第 5 话：上游没有这一话的数据 → 识别成功但 0 段。
+    // 这是有意设计：胶囊显示「尖帽子的魔法工坊 第5集 · 0 段」+ 橙点，
+    // 比一个失败态更有用（用户能看出「认出来了，只是这集没数据」），且不会跳任何东西。
+    const r5 = await e.api.identify(gctx(5));
+    checkTrue('P5 上游无数据 → 0 段（不是失败态）', r5.ok && (r5.segments || []).length === 0, [r5.ok, r5.reason, (r5.segments || []).length]);
+    check('P5 没有任何可跳区间', (r5.segments || []).filter(s => s.type === 'op' || s.type === 'ed' || s.type === 'recap'), []);
   }
 
   /* --- 汇总 --- */
