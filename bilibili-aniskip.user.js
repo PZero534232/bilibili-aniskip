@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.4.2
+// @version      0.4.3
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -362,12 +362,21 @@
   }
 
   // 数据库条目自己是第几季：AniList 标题一般写「… 第3期」，第 1 季通常没有标记
+  /* 两种形状都要吃得下：
+   *   · AniList 原始 media —— title 是对象 { native, romaji }
+   *   · 季链里的 seasonNode —— title 已经是**字符串**（用 native 挑出来的）
+   * 原来只会读 title.native，喂进 seasonNode 时静默拿不到 → 一律退回「按位次猜」，
+   * 于是「分P写着第三季、按季号找起锚点」这件事完全没生效（BV1YEaE6REdF）。 */
   function entryOrdinal(media, fallback) {
-    var ti = (media && media.title) || {};
-    var t = (ti.native || '') + ' ' + (ti.romaji || '');
+    var ti = (media && media.title) || '';
+    var t = (typeof ti === 'string') ? ti : ((ti.native || '') + ' ' + (ti.romaji || ''));
     var m = /第\s*([一二两三四五六七八九十\d]{1,3})\s*[季期部]/.exec(t);
     if (m) { var n = normalizeOrdinal(m[1]); if (n) return n; }
     m = /[Ss]eason\s*(\d{1,2})/.exec(t);
+    if (m) return parseInt(m[1], 10);
+    // 「3rd season」「4th Season」—— 序号写在 season 前面。AniList 上 Re:Zero 这类
+    // 长标题就是这么写的，原来匹配不上只能退回「按位次猜」，于是第 3 季被当成第 4 个条目。
+    m = /(\d{1,2})\s*(?:st|nd|rd|th)\s*[Ss]eason/.exec(t);
     if (m) return parseInt(m[1], 10);
     return fallback || 0;
   }
@@ -422,6 +431,16 @@
       groups.push({ season: m.season, startPage: m.page, endPage: end });
     });
 
+    // 末尾常挂着 UP 主塞的花絮/预告（实测 BV1YEaE6REdF 最后一个是「1分钟」，99 秒）。
+    // 它们没有季标记、也没写话号、时长短得离谱 —— 算进段里会让整段话数和数据库对不上，
+    // 于是那一整季被判成「没对上条目、不跳」。只在**最后一段的尾部**剔掉这种 P。
+    (function trimJunkTail() {
+      var last = groups[groups.length - 1];
+      var k = pages.length - 1;
+      while (k >= 0 && pages[k].page > last.startPage && isJunkTailPart(pages[k])) k--;
+      if (k >= 0 && pages[k].page >= last.startPage) last.endPage = pages[k].page;
+    })();
+
     groups = groups.filter(function (g) { return g.endPage >= g.startPage; });
     if (groups.length < 2) return null;
     for (var i = 1; i < groups.length; i++) {
@@ -430,6 +449,16 @@
     }
     groups.forEach(function (g) { g.episodes = g.endPage - g.startPage + 1; });
     return groups;
+  }
+
+  /* 「不是正片」的尾巴：没有季标记、没写话号、还特别短（花絮／预告／1 分钟彩蛋）。
+   * 三个条件都要满足才敢扔 —— 宁可少扔，不可把真·短篇动画当成垃圾剔掉。 */
+  function isJunkTailPart(p) {
+    if (!p) return false;
+    if (partSeasonOf(p.part)) return false;
+    if (partEpisodeOf(p.part)) return false;
+    var d = p.duration || 0;
+    return d > 0 && d < 300;
   }
 
   /* 分P标题里的「季内话数」：'【S2】01' → 1、'第 3 集' → 3 */
@@ -1168,6 +1197,18 @@
     };
   }
 
+  /* 从 startAt 起按累计话数贪心地凑够 g.episodes 话 */
+  function takeFrom(g, seasons, startAt) {
+    var tol = Math.max(2, Math.round(g.episodes * 0.1));
+    var pick = [], sum = 0, k = startAt;
+    while (k < seasons.length && (sum < g.episodes - tol || !pick.length)) {
+      var s = seasons[k];
+      if (!s.episodes) break;                 // 话数未知的条目无法参与累计
+      pick.push(s); sum += s.episodes; k++;
+    }
+    return { entries: pick, sum: sum, next: k, ok: !!pick.length && Math.abs(sum - g.episodes) <= tol };
+  }
+
   /* 分P分段 ↔ 数据库条目序列 的对齐。
    * 实测坑（BV1KspF6iELH「无职转生 第1-3季」）：B站分段是
    *   第一季 24 P / 第二季 25 P / 第三季 14 P，
@@ -1175,22 +1216,37 @@
    * 两边不是一对一 —— 按位次硬配（原来的做法）会把第 2 段配到「第2クール」上，
    * 于是第 24 个 P 之后全部错位。但**累计话数**能对上：
    *   第1段 24 ≈ 11+12=23（差的 1 是 OVA）、第2段 25 = 13+12、第3段 14 = 14。
-   * 所以按累计话数贪心对齐，容差内才采纳；对不上就标记「未解析」，该段不跳（宁可不跳，不可错跳）。 */
+   * 所以按累计话数贪心对齐，容差内才采纳；对不上就标记「未解析」，该段不跳（宁可不跳，不可错跳）。
+   *
+   * 但**光按累计话数从家族最早一季开始数是不够的**（实测 BV1YEaE6REdF：
+   *   36 个 P = 第三季1–16 + 第四季1–19，而数据库家族有 5 个条目 S1/S2上/S2下/S3/S4）。
+   * 从 S1 开始累计，「第三季」那一段（16 话）会被配到 S1（25 话）上，
+   * 于是「合集第 2 话」算成第一季第 2 话 —— 选第三季、选第四季都算错。
+   * 所以只要分P标题自己点了季号（「第三季」），就先按**季号**找到该从哪个条目起配。
+   * 序号找不到（例：无职转生的 UP 分段与 AniList 编号对不齐）就退回原来的累计贪心。 */
   function alignGroupsToSeasons(groups, seasons) {
     var out = [], si = 0;
+    var ords = seasons.map(function (s, i) { return entryOrdinal(s, i + 1); });
+
     for (var gi = 0; gi < groups.length; gi++) {
       var g = groups[gi];
-      var tol = Math.max(2, Math.round(g.episodes * 0.1));
-      var pick = [], sum = 0;
-      while (si < seasons.length && (sum < g.episodes - tol || !pick.length)) {
-        var s = seasons[si];
-        if (!s.episodes) break;                 // 话数未知的条目无法参与累计
-        pick.push(s); sum += s.episodes; si++;
+
+      var anchored = null, startAt = si;
+      if (g.season) {
+        for (var k = si; k < seasons.length; k++) {
+          if (ords[k] === g.season) { startAt = k; break; }
+        }
+        if (startAt !== si) anchored = takeFrom(g, seasons, startAt);
       }
+
+      var base = takeFrom(g, seasons, si);
+      // 季号锚点对得上就用它；否则用累计贪心；两个都不 ok 时仍信季号（那是 UP 自己标的）
+      var chosen = (anchored && anchored.ok) ? anchored : (base.ok ? base : (anchored || base));
+
+      si = chosen.next;
       out.push({
         season: g.season, startPage: g.startPage, endPage: g.endPage, total: g.episodes,
-        entries: pick, sum: sum, diff: sum - g.episodes,
-        ok: !!pick.length && Math.abs(sum - g.episodes) <= tol
+        entries: chosen.entries, sum: chosen.sum, diff: chosen.sum - g.episodes, ok: chosen.ok
       });
     }
     // 尾段：条目还有剩（例如第三季没被连进续集链），补进最后一个没对齐的段
@@ -1247,7 +1303,7 @@
     });
   }
 
-  // 组装季链：自身 + 沿 SEQUEL/PREQUEL 展开（最多 3 层，防异常数据无限扩张）
+  // 组装季链：自身 + 沿 SEQUEL/PREQUEL 展开（条目总数封顶，防异常数据无限扩张）
   // 分P标题里带季标记时，以「UP 主自己分的段」为准（更可靠），续季关系只用来取各季 ID
   /* ==================================================================
    * 9.1 季链（多季连播合集用）
@@ -1257,8 +1313,13 @@
    * 「单独发一季」这类稿件本来就不该有季链，退回单季后反而正确。
    * 同时也用它给缓存键加后缀，避免读到旧算法留下的错链。
    * v3：修 expand 漏掉祖父辈（导致绝对集号错位）+ 用标题里的季序号挑选季成员
+   * v4：分段对齐按分P标题自己的季号起锚（BV1YEaE6REdF「第三季1-16 + 第四季1-19」
+   *     原来会被配到第一季头上）+ expand 改为限制家族条目总数（不再按跳数砍链条）
+   *     + 未对齐的分段一律不跳（原来 entries 非空就照跳）
    * ================================================================== */
-  var CHAIN_VERSION = 3;
+  var CHAIN_VERSION = 4;
+  var MAX_FAMILY_SIZE = 24;   // 一家子最多收 24 个条目（防异常数据无限扩张）
+  var MAX_FAMILY_HOPS = 10;   // 沿续季关系最多走 10 跳（长番如 Re:Zero 要 4 跳）
 
   function buildSeasonChain(anilistId, totalEpsFromTitle, ctx, baseName, extraMedia, refTitle) {
     var ckey = 'chainv' + CHAIN_VERSION + ':' + anilistId + ':' + (totalEpsFromTitle || 0) + ':' + ((ctx && ctx.bvid) || '') + ':' + (baseName || '');
@@ -1288,10 +1349,15 @@
        * 注意：**不要**在调用前先把 first 标进 seen —— 那样 expand 会认为「都处理过了」
        * 直接返回，于是只拿到与自己直接相邻的一季，祖父辈永远补不进来。
        * 实测 BV1LUTt6fE6K（100 个女朋友）：从第 3 期出发只推出「第 2 期 + 第 3 期」，
-       * 缺了第 1 期 → 绝对集号整体错位 12 话 → 合集第 1 话被算成第 2 期第 1 话。 */
+       * 缺了第 1 期 → 绝对集号整体错位 12 话 → 合集第 1 话被算成第 2 期第 1 话。
+       * 深度上限同样不能卡死：Re:Zero 从第 4 季往回要 4 跳才够得到第 1 季，
+       * 卡在 3 跳就少一季（实测 BV1YEaE6REdF）。改成正经的防炸方式 ——
+       * **限制家族条目总数**，环由 seen 挡。 */
       function expand(nodes, depth) {
-        if (depth > 3) return Promise.resolve();
-        var todo = (nodes || []).filter(function (n) { return n && n.id && !seen[n.id]; });
+        if (depth > MAX_FAMILY_HOPS) return Promise.resolve();
+        var room = MAX_FAMILY_SIZE - Object.keys(byId).length;
+        if (room <= 0) return Promise.resolve();
+        var todo = (nodes || []).filter(function (n) { return n && n.id && !seen[n.id]; }).slice(0, room);
         if (!todo.length) return Promise.resolve();
         todo.forEach(function (n) { seen[n.id] = 1; add(n); });
         return Promise.all(todo.map(function (n) {
@@ -1397,6 +1463,12 @@
       var s = chain.seasons[i];
       if (!s.episodes) continue;                  // 话数未知的季不参与映射
       if (absEp < s.startAbs || absEp > s.endAbs) continue;
+
+      /* 这一段没能和数据库条目对上（aligned === false）→ 明确不跳。
+       * 不能因为它「entries 非空」就照用 —— 那些 entries 是贪心凑出来的，
+       * 实测 BV1YEaE6REdF 把「第三季」配到第一季上，直接拿第一季的时间戳跳。
+       * 错跳比不跳糟糕十倍（identify 里同样会退回「不跳」并说明原因）。 */
+      if (s.aligned === false) return null;
 
       // 这一段对应数据库里的多个条目（B站「第一季」= Ⅰ + 第2クール）：
       // 用「段内话号」在条目序列里累加定位
@@ -1607,13 +1679,13 @@
   /* ==================================================================
    * 13. 主识别流程
    * ================================================================== */
-  function fetchSegsFor(malId, anilistId, ep) {
+  function fetchSegsFor(malId, anilistId, ep, videoDuration) {
     return applyRelationRules(malId, ep).then(function (rm) {
       return Promise.all([
         fetchAniSkip(rm.malId, rm.ep),
         fetchAnimeSkip(anilistId, rm.ep)
       ]).then(function (r) {
-        return { segs: mergeSegments(r[0], r[1], 0), rm: rm };
+        return { segs: mergeSegments(r[0], r[1], videoDuration || 0), rm: rm };
       });
     });
   }
@@ -1643,7 +1715,7 @@
           bind.seasonChain.chainVer === CHAIN_VERSION) {
         var hit = mapBySeasonChain(bind.seasonChain, bindEp.num);
         if (hit && hit.malId) {
-          return fetchSegsFor(hit.malId, hit.anilistId, hit.ep).then(function (r) {
+          return fetchSegsFor(hit.malId, hit.anilistId, hit.ep, ctx.duration).then(function (r) {
             var setTitle = hit.group && hit.group.entries && hit.group.entries.length > 1
               ? hit.group.entries.map(function (e) { return e.title; }).join(' + ')
               : (hit.title || bind.title);
@@ -1681,7 +1753,7 @@
         chainMiss = true;
       }
 
-      return fetchSegsFor(bind.malId, bind.anilistId, bindEp.num).then(function (r) {
+      return fetchSegsFor(bind.malId, bind.anilistId, bindEp.num, ctx.duration).then(function (r) {
         var reasons = ['手动绑定 · 集号来自 ' + bindEp.from];
         if (chainMiss) reasons.push('第 ' + bindEp.num + ' 话没落在季链范围内，按单季处理');
         return {
@@ -1734,7 +1806,7 @@
         var useAni = hit ? hit.anilistId : match.anilistId;
         var useEp = hit ? hit.ep : ep.num;
 
-        return fetchSegsFor(useMal, useAni, useEp).then(function (r) {
+        return fetchSegsFor(useMal, useAni, useEp, ctx.duration).then(function (r) {
           var conf = computeConfidence(ctx, match, ep, r.segs);
           if (chain) {
             conf.reasons.push(chain.partial ? '季链（有话数未知的季）' : '季链 ' + chain.seasons.length + ' 季 / 共 ' + chain.total + ' 话');
@@ -2729,7 +2801,8 @@
         bgmSearch: bgmSearch, bgmAliases: bgmAliases, bgmResolve: bgmResolve,
         candidateMedia: candidateMedia, searchByName: searchByName,
         buildSeasonChain: buildSeasonChain, mapBySeasonChain: mapBySeasonChain,
-        alignGroupsToSeasons: alignGroupsToSeasons, nameScore: nameScore
+        alignGroupsToSeasons: alignGroupsToSeasons, nameScore: nameScore,
+        CHAIN_VERSION: CHAIN_VERSION, isJunkTailPart: isJunkTailPart
       }
     };
     try {

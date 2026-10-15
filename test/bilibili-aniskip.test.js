@@ -1303,13 +1303,194 @@ function ctxOf(bvid, page) {
     check('旧版季链被忽略 → 仍取第 3 期', [rOld.malId, rOld.episode], [62811, 1]);
 
     // 新版本算出来的季链（chainVer 匹配）才允许覆盖
-    const fresh = Object.assign({}, stale, { chainVer: 3, seasons: [
+    const fresh = Object.assign({}, stale, { chainVer: P.CHAIN_VERSION, seasons: [
       { anilistId: 162694, malId: 54714, title: '…第1期', episodes: 12, startAbs: 1, endAbs: 12 },
       { anilistId: 172258, malId: 57616, title: '…第2期', episodes: 12, startAbs: 13, endAbs: 24 },
       { anilistId: 200637, malId: 62811, title: '…第3期', episodes: 12, startAbs: 25, endAbs: 36 }] });
     const eFresh = makeEnv({ store: { autoDetect: 'off', _bindings: JSON.stringify(mkBind(fresh)) }, net: gfNet() });
     const rFresh = await eFresh.api.identify(Object.assign(gfCtx(), { page: 1 }));
     check('新版季链（第 1 话 → 第1期）才被采用', [rFresh.malId, rFresh.episode], [54714, 1]);
+  }
+
+  /* --- 26. 真实案例：多季合集的季边界（BV1YEaE6REdF，Re:Zero 第三季+第四季） ---
+   * 用户实测：这个稿件的 36 个分P其实是「第三季1–16 + 第四季1–19 + 1分钟花絮」，
+   *   ① 候选里选「3rd season」，面板却说「合集第 2 话 → 第一季第 2 话」
+   *   ② 选「4th season」，又说「→ 第二季第 2 话」
+   * 真实数据（api.bilibili.com + graphql.anilist.co，2026-10-15 抓取）：
+   *   title = 【你死不过我你信吗 全四季】4K超清未删减完整版（标题写"全四季"，实际只投了第三、四季）
+   *   分P    = 第三季1–16（P1–P16）、第四季1–19（P17–P35）、P36 =「1分钟」99 秒
+   *   条目    = S1 21355/MAL 31240(25) → S2上 108632/MAL 39587(13) → S2下 119661/MAL 42203(12)
+   *             → S3 163134/MAL 54857(16) → S4 189046/MAL 61316(19)
+   * 四个缺陷（前两个叠加才让「按季号起锚」彻底失效）：
+   *   ① entryOrdinal 只认 media.title.native（对象），而季链里的 title 是**字符串**
+   *      → 静默拿到 undefined → 一律退回按位次猜
+   *   ② AniList 标题写的是「3rd season」——序号在 season **前面**，原来匹配不上
+   *   ③ expand 卡死 3 跳：从第 4 季往回够不到第 1 季 → 家族少一季 → 整体错位
+   *   ④ 未对齐的分段（aligned:false）只要 entries 非空就照跳 → 取到错误季的时间戳 */
+  head('26. 真实案例：多季合集季边界（BV1YEaE6REdF · Re:Zero）');
+  {
+    const nd = (id, idMal, eps, year, name) => ({ id, idMal, episodes: eps, startDate: { year }, title: { native: name, romaji: name } });
+    const eg = (t, n) => ({ relationType: t, node: n });
+    const NATIVE = {
+      s1: 'Re:ゼロから始める異世界生活', s2a: 'Re:ゼロから始める異世界生活 2nd Season',
+      s2b: 'Re:ゼロから始める異世界生活 2nd Season Part 2', s3: 'Re:ゼロから始める異世界生活 3rd season',
+      s4: 'Re:ゼロから始める異世界生活 4th season'
+    };
+    // 关系查询不返回 format —— 桩里也不该有（桩要反映现实）
+    const RZ = {
+      21355: Object.assign(nd(21355, 31240, 25, 2016, NATIVE.s1), { relations: { edges: [
+        eg('SIDE_STORY', nd(100049, 36286, 2, 2018, 'Re:ゼロから始める異世界生活 OVAs')),
+        eg('SEQUEL', nd(108632, 39587, 13, 2020, NATIVE.s2a))] } }),
+      108632: Object.assign(nd(108632, 39587, 13, 2020, NATIVE.s2a), { relations: { edges: [
+        eg('PREQUEL', nd(21355, 31240, 25, 2016, NATIVE.s1)),
+        eg('SEQUEL', nd(119661, 42203, 12, 2021, NATIVE.s2b))] } }),
+      119661: Object.assign(nd(119661, 42203, 12, 2021, NATIVE.s2b), { relations: { edges: [
+        eg('PREQUEL', nd(108632, 39587, 13, 2020, NATIVE.s2a)),
+        eg('SEQUEL', nd(163134, 54857, 16, 2024, NATIVE.s3))] } }),
+      163134: Object.assign(nd(163134, 54857, 16, 2024, NATIVE.s3), { relations: { edges: [
+        eg('PREQUEL', nd(119661, 42203, 12, 2021, NATIVE.s2b)),
+        eg('SPIN_OFF', nd(182417, 60012, 16, 2024, 'Re:ゼロから始める休憩時間(ブレイクタイム) 3rd Season')),
+        eg('SEQUEL', nd(189046, 61316, 19, 2026, NATIVE.s4))] } }),
+      189046: Object.assign(nd(189046, 61316, 19, 2026, NATIVE.s4), { relations: { edges: [
+        eg('PREQUEL', nd(163134, 54857, 16, 2024, NATIVE.s3)),
+        eg('SPIN_OFF', nd(210687, 63830, 19, 2026, 'Re:ゼロから始める休憩時間(ブレイクタイム) 4th Season'))] } })
+    };
+
+    // 真实分P（part / duration）
+    const P26 = [
+      ['第三季1', 7258], ['第三季2', 1824], ['第三季3', 1836], ['第三季4', 1836], ['第三季5', 1836], ['第三季6', 1836],
+      ['第三季7', 2186], ['第三季8', 1836], ['第三季9', 1836], ['第三季10', 1836], ['第三季11', 1836], ['第三季12', 2106],
+      ['第三季13', 1836], ['第三季14', 1836], ['第三季15', 1836], ['第三季16', 1856],
+      ['第四季1', 1853], ['第四季2', 1853], ['第四季3', 1853], ['第四季4', 1853], ['第四季5', 1853], ['第四季6', 1853],
+      ['第四季7', 1852], ['第四季8', 1873], ['第四季9', 1852], ['第四季10', 1853], ['第四季11', 1902], ['第四季12', 1852],
+      ['第四季13', 2172], ['第四季14', 1852], ['第四季15', 1853], ['第四季16', 2032], ['第四季17', 1853], ['第四季18', 1803],
+      ['第四季19', 3334], ['1分钟', 99]
+    ];
+    const RZ_PAGES = P26.map(([part, duration], i) => ({ page: i + 1, part, duration, cid: 7100 + i }));
+
+    const r26Ctx = (page) => {
+      const p = RZ_PAGES[page - 1];
+      return {
+        bvid: 'BV1YEaE6REdF', aid: 117000000000001, cid: p.cid, page,
+        owner: { mid: 1, name: '修复40K放映厅' },
+        mainTitle: '【你死不过我你信吗 全四季】4K超清未删减完整版',
+        partTitle: p.part, duration: p.duration, pubdate: 1783095936, videos: 36,
+        pages: RZ_PAGES, seasonId: 0, seasonTitle: '', seasonEpisodeTitle: '', incomplete: false
+      };
+    };
+
+    // 真实时间戳（2026-10-15 抓取）：S3 有，S4 还没有（2026 新番）
+    const ANISKIP_RZ = {
+      '54857/1': { found: true, results: [
+        { interval: { startTime: 157.449, endTime: 246.745 }, skipType: 'op', episodeLength: 1769.9 },
+        { interval: { startTime: 1307.97, endTime: 1420 }, skipType: 'ed', episodeLength: 1420.0533 }] },
+      '54857/2': { found: true, results: [
+        { interval: { startTime: 98.647, endTime: 188.647 }, skipType: 'op', episodeLength: 1420.002 }] }
+    };
+    const net26 = makeNet({
+      'https://graphql.anilist.co': (req) => {
+        const q = JSON.parse(req.data);
+        if (q.variables && q.variables.id !== undefined) return { data: { Media: RZ[q.variables.id] || null } };
+        return { data: { Page: { media: [] } } };
+      },
+      'https://api.aniskip.com/v2/skip-times': (req) => {
+        const m = /skip-times\/(\d+)\/(\d+)/.exec(req.url);
+        return ANISKIP_RZ[m[1] + '/' + m[2]] || { found: false, results: [] };
+      }
+    });
+
+    const P = makeEnv({ net: net26 }).api.api_;
+
+    /* ① 分段：两个季，末尾的「1分钟」花絮不算进段里 */
+    const gs = P.seasonGroupsFromParts(r26Ctx(2));
+    check('分段 = 第三季(16) + 第四季(19)',
+      gs && gs.map(g => [g.season, g.episodes]), [[3, 16], [4, 19]]);
+    check('末尾 99 秒的「1分钟」被剔掉', gs && gs[1].endPage, 35);
+    checkTrue('「1分钟」被判定为花絮尾巴', P.isJunkTailPart({ part: '1分钟', duration: 99 }));
+    check('真正的短篇标记不会被误判', P.isJunkTailPart({ part: '第三季1', duration: 200 }), false);
+
+    const v2 = r26Ctx(2);
+    check('P2 的合集内绝对集号 = 2（分P自己写着第三季2）',
+      (h => [h.absEp, h.season])(P.absEpisodeFromPart(v2)), [2, 3]);
+
+    /* ② entryOrdinal 两种形状都要认（季链里的 title 是字符串） */
+    const strSea = (name) => ({ anilistId: 0, title: name, episodes: 12 });
+    check('「3rd season」序号在 season 前面也要认', P.entryOrdinal(strSea(NATIVE.s3), 99), 3);
+    check('「4th season」→ 4', P.entryOrdinal(strSea(NATIVE.s4), 99), 4);
+    check('「2nd Season Part 2」→ 2', P.entryOrdinal(strSea(NATIVE.s2b), 99), 2);
+    check('第 1 季无标记 → 用兜底序号', P.entryOrdinal(strSea(NATIVE.s1), 1), 1);
+    check('AniList 原始 media（title 是对象）仍然认',
+      P.entryOrdinal({ title: { native: '… 3rd season', romaji: '' } }, 99), 3);
+
+    /* ③ 季链：分P写着第几季 —— 不论锚点选第 3 季还是第 4 季，分段都要对 */
+    for (const [label, anchor] of [['选第 3 期', 163134], ['选第 4 期', 189046]]) {
+      const chain = await P.buildSeasonChain(anchor, 0, r26Ctx(2), 'Re:Zero', [], NATIVE.s3);
+      check(label + '：第 1 段 = 第三季、第 2 段 = 第四季，两段都对上了',
+        chain.seasons.map(s => [s.season, s.malId, s.aligned]), [[3, 54857, true], [4, 61316, true]]);
+      check(label + '：没有对不上的段', chain.mismatch, false);
+
+      const map = (n) => P.mapBySeasonChain(chain, n);
+      check(label + '：合集第 1 话 → 第三季第 1 话', (h => [h.malId, h.ep])(map(1)), [54857, 1]);
+      check(label + '：合集第 2 话 → 第三季第 2 话', (h => [h.malId, h.ep])(map(2)), [54857, 2]);
+      check(label + '：合集第 16 话 → 第三季第 16 话', (h => [h.malId, h.ep])(map(16)), [54857, 16]);
+      check(label + '：合集第 17 话 → 第四季第 1 话', (h => [h.malId, h.ep])(map(17)), [61316, 1]);
+      check(label + '：合集第 35 话 → 第四季第 19 话', (h => [h.malId, h.ep])(map(35)), [61316, 19]);
+      check(label + '：合集第 36 话（花絮）不跳', map(36), null);
+    }
+
+    /* ③-b 分P没有季标记时只能靠续季关系推 —— 这一路才直接考验「家族收全」。
+     * 从第 4 季往回要 4 跳才够得到第 1 季，原来 expand 卡死 3 跳就少一季。 */
+    const flatCtx = () => {
+      const pages = Array.from({ length: 66 }, (_, i) => ({ page: i + 1, part: String(i + 1), duration: 1450, cid: 8100 + i }));
+      return Object.assign(r26Ctx(1), {
+        bvid: 'BVFLAT000001', aid: 117000000000002, pages, videos: 66,
+        page: 1, cid: 8100, partTitle: '1', duration: 1450
+      });
+    };
+    for (const [label, anchor] of [['选第 3 期', 163134], ['选第 4 期', 189046]]) {
+      const ch = await P.buildSeasonChain(anchor, 0, flatCtx(), 'Re:Zero', [], NATIVE.s3);
+      check(label + '（分P无季标记）：沿续季关系收全 5 个条目',
+        ch.seasons.map(s => s.malId), [31240, 39587, 42203, 54857, 61316]);
+      check(label + '（分P无季标记）：第 1 话 → 第 1 季第 1 话',
+        (h => [h.malId, h.ep])(P.mapBySeasonChain(ch, 1)), [31240, 1]);
+      check(label + '（分P无季标记）：第 51 话 → 第 3 季第 1 话',
+        (h => [h.malId, h.ep])(P.mapBySeasonChain(ch, 51)), [54857, 1]);
+      check(label + '（分P无季标记）：第 67 话 → 第 4 季第 1 话',
+        (h => [h.malId, h.ep])(P.mapBySeasonChain(ch, 67)), [61316, 1]);
+    }
+
+    /* ④ 端到端：绑第三季 + P2 → 必须取第三季的时间戳 */
+    const chain26 = await P.buildSeasonChain(163134, 0, r26Ctx(2), 'Re:Zero', [], NATIVE.s3);
+    const bind26 = {
+      'b:BV1YEaE6REdF': {
+        anilistId: 163134, malId: 54857, title: NATIVE.s3, episodes: 16,
+        anchorPage: 1, anchorEp: 1, seasonChain: chain26, t: Date.now()
+      }
+    };
+    const e26 = makeEnv({ store: { autoDetect: 'off', _bindings: JSON.stringify(bind26) }, net: net26 });
+    const r2 = await e26.api.identify(r26Ctx(2));
+    checkTrue('P2 识别成功', r2.ok, r2.reason || r2.confidence);
+    check('P2 → MAL 54857 第 2 话（不是第一季的 31240）', [r2.malId, r2.episode], [54857, 2]);
+    check('P2 拿到第三季的 op 98.647→188.647',
+      (r2.segments || []).filter(s => s.type === 'op').map(s => [s.start, s.end]), [[98.647, 188.647]]);
+
+    // P17（第四季第 1 话）：上游还没有数据 → 认出来了但 0 段，不能瞎跳
+    const r17 = await e26.api.identify(r26Ctx(17));
+    check('P17 → MAL 61316 第 1 话（第四季）', [r17.malId, r17.episode], [61316, 1]);
+    check('P17 上游无数据 → 0 段', (r17.segments || []).length, 0);
+
+    // P36 是 99 秒的花絮：即使集号被抽成 1，取到的 op(157s) 也超出视频长度 → 一段都不跳
+    const r36 = await e26.api.identify(r26Ctx(36));
+    check('P36（99 秒花絮）不跳任何东西', (r36.segments || []).length, 0);
+
+    /* ⑤ 反例：没对上数据库条目的段，一律不跳（不能因为 entries 非空就照用） */
+    const badChain = {
+      chainVer: P.CHAIN_VERSION, source: 'parts', total: 20, mismatch: true,
+      seasons: [{ season: 3, startPage: 1, endPage: 20, episodes: 20, startAbs: 1, endAbs: 20, aligned: false,
+        entries: [{ anilistId: 21355, malId: 31240, title: NATIVE.s1, episodes: 25, startWithin: 1 }] }]
+    };
+    check('未对齐的段：mapBySeasonChain 直接返回 null',
+      await P.mapBySeasonChain(badChain, 2), null);
   }
 
   /* --- 汇总 --- */
