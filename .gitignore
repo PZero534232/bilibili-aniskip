@@ -1,0 +1,13 @@
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# 依赖与构建产物（本脚本无需构建，此处为以防万一）
+node_modules/
+dist/
+*.log
