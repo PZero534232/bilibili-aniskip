@@ -12,16 +12,29 @@ const SRCS = [
 const SRC = fs.readFileSync(SRCS.find(function (p) { return fs.existsSync(p); }), 'utf8');
 
 let pass = 0, fail = 0;
+// -q / --quiet：只打失败与汇总（改代码时反复跑用，输出短）
+const QUIET = process.argv.indexOf('-q') >= 0 || process.argv.indexOf('--quiet') >= 0;
 function check(name, got, want) {
   const g = JSON.stringify(got), w = JSON.stringify(want);
-  if (g === w) { pass++; console.log('  ✓ ' + name); }
+  if (g === w) { pass++; if (!QUIET) console.log('  ✓ ' + name); }
   else { fail++; console.log('  ✗ ' + name + '\n      期望 ' + w + '\n      实际 ' + g); }
 }
 function checkTrue(name, cond, extra) {
-  if (cond) { pass++; console.log('  ✓ ' + name); }
+  if (cond) { pass++; if (!QUIET) console.log('  ✓ ' + name); }
   else { fail++; console.log('  ✗ ' + name + (extra !== undefined ? '  -> ' + JSON.stringify(extra) : '')); }
 }
-function head(t) { console.log('\n── ' + t + ' ' + '─'.repeat(Math.max(0, 52 - t.length))); }
+function head(t) { if (!QUIET) console.log('\n── ' + t + ' ' + '─'.repeat(Math.max(0, 52 - t.length))); }
+
+/* 新加的调试钩子做「缺了就报告失败」而不是抛异常 —— 这样把新测试拿去跑旧版本时，
+ * 能看到完整的失败清单，而不是第一处就崩掉。 */
+const hook = (env, name) => (env.api.api_ && env.api.api_[name]) || (env.api && env.api[name]) || null;
+const cacheOf = (env) => { const c = hook(env, '_cache'); return c || {}; };
+const cacheGetOf = (env, k, ttl) => { const f = hook(env, '_cacheGet'); return typeof f === 'function' ? f(k, ttl) : null; };
+const flushOf = (env) => { const f = hook(env, '_flushCache'); if (typeof f === 'function') f(); };
+const callHook = (env, name, ...args) => {
+  const f = hook(env, name);
+  return typeof f === 'function' ? f(...args) : null;
+};
 
 /* ---------------- 假数据 ---------------- */
 const VIDEOS = {
@@ -91,6 +104,10 @@ const VIDEOS = {
     season: { id: 7843931, title: '【4月新番】尖帽子的魔法工坊' }
   }
 };
+
+// BV_TEST000001 带下划线，不是合法的 BV 号（currentBvid 的正则抽不出来），
+// 需要真正跑一遍 rerun / buildContext 的用例用这个合法别名
+VIDEOS.BV1TEST00001 = Object.assign({}, VIDEOS.BV_TEST000001, { bvid: 'BV1TEST00001' });
 
 const ANILIST_DB = {
   '葬送的芙莉莲': [{ id: 154587, idMal: 52991, episodes: 28, format: 'TV', startDate: { year: 2023 }, title: { native: '葬送のフリーレン', romaji: 'Sousou no Frieren' }, synonyms: [] }],
@@ -275,6 +292,8 @@ function makeEnv(opts) {
   const store = Object.assign({}, opts.store);
   const net = opts.net || makeNet();
   const timers = [];
+  const intervals = [];                 // 记录注册过哪些轮询（查「重复注册」用）
+  const cleared = [];                   // 记录清理掉了哪些句柄
 
   global.GM_getValue = (k, d) => (k in store ? store[k] : d);
   global.GM_setValue = (k, v) => { store[k] = v; };
@@ -303,11 +322,11 @@ function makeEnv(opts) {
   global.location = opts.location || { pathname: '/video/BV_TEST000001', search: '?p=1' };
   global.setTimeout = () => 0;
   global.clearTimeout = () => {};
-  global.clearInterval = () => {};
-  global.setInterval = () => 0;
+  global.clearInterval = (id) => { cleared.push(id); };
+  global.setInterval = (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; };
 
   eval(SRC);
-  return { api: global.unsafeWindow.__biliAniskip, store };
+  return { api: global.unsafeWindow.__biliAniskip, store, intervals, cleared };
 }
 
 function ctxOf(bvid, page) {
@@ -1577,6 +1596,377 @@ function ctxOf(bvid, page) {
       cfgWith({ cfgVersion: 3, undoSeconds: 12 }).undoSeconds, 12);
     check('「不显示撤回」（0 秒）也能存住',
       cfgWith({ cfgVersion: 3, undoSeconds: 0 }).undoSeconds, 0);
+  }
+
+  /* --- 28. 网络失败 / 缓存策略（v0.4.5） ---
+   * 老实现把所有网络错误都 catch 成 []（= 「这一集上游没有时间戳」），于是：
+   *   · 用户看到「0 段」却不知道是网络挂了还是真没数据；
+   *   · 失败/空结果被按 7 天、30 天缓存，上游补了数据也长时间不生效。
+   * 现在要求：失败可区分、失败不缓存、空结果按短 TTL 缓存。 */
+  head('28. 网络失败 / 缓存策略（v0.4.5）');
+  {
+    /* ① 两个时间戳源都挂了 → 明确报网络失败，而不是「0 段」 */
+    const e1 = makeEnv({ store: { autoDetect: 'auto' } });
+    const orig1 = global.GM_xmlhttpRequest;
+    global.GM_xmlhttpRequest = (req) => {
+      if (/api\.aniskip\.com|api\.anime-skip\.com/.test(req.url)) { req.onerror && req.onerror({ status: 0 }); return; }
+      orig1(req);
+    };
+    const r1 = await e1.api.identify(ctxOf('BV_TEST000001', 1));
+    check('两个源都失败 → net-error（不是「0 段」成功）', [r1.ok, r1.reason], [false, 'net-error']);
+    checkTrue('失败的结果不写进时间戳缓存',
+      !Object.keys(cacheOf(e1)).some(k => /^seg:/.test(k)), Object.keys(cacheOf(e1)));
+
+    /* ② 上游明确回答「这一集没有」→ 仍然是成功 + 0 段（不能把老行为改坏） */
+    const e2 = makeEnv({
+      store: { autoDetect: 'auto' },
+      net: makeNet({ 'https://api.aniskip.com/v2/skip-times': { found: false, results: [] } })
+    });
+    const r2 = await e2.api.identify(ctxOf('BV_TEST000001', 1));
+    checkTrue('上游明确无数据 → ok + 0 段', r2.ok === true && (r2.segments || []).length === 0, r2.reason);
+
+    /* ③ 番名搜索接口挂了 → net-error，而不是「番名匹配失败」 */
+    const e3 = makeEnv({ store: { autoDetect: 'auto' } });
+    const orig3 = global.GM_xmlhttpRequest;
+    global.GM_xmlhttpRequest = (req) => {
+      if (/graphql\.anilist\.co/.test(req.url)) { req.onerror && req.onerror({ status: 0 }); return; }
+      orig3(req);
+    };
+    const r3 = await e3.api.identify(ctxOf('BV_TEST000001', 1));
+    check('番名搜索失败 → net-error', [r3.ok, r3.reason], [false, 'net-error']);
+
+    /* ④ 负缓存：明确的「没有」按 6 小时过期，正经结果仍按 7 天 */
+    const segKeys = Object.keys(cacheOf(e2)).filter(k => /^seg:as:/.test(k));
+    checkTrue('「上游无此集」记为负缓存', segKeys.length > 0 && segKeys.every(k => cacheOf(e2)[k].neg === 1), segKeys);
+    const key = segKeys[0];
+    const posKey = Object.keys(cacheOf(e2)).find(k => /^al:/.test(k));
+    if (key && posKey) {
+      cacheOf(e2)[key].t = Date.now() - 7 * 3600000;      // 假装 7 小时前查过
+      check('负缓存 6 小时就过期', cacheGetOf(e2, key, 7 * 86400000), undefined);
+      cacheOf(e2)[posKey].t = Date.now() - 7 * 3600000;
+      check('负缓存的短 TTL 不牵连正经结果（搜索缓存仍有效）',
+        Array.isArray(cacheGetOf(e2, posKey, 30 * 86400000)), true);
+    } else {
+      check('负缓存 6 小时就过期', null, undefined);
+      check('负缓存的短 TTL 不牵连正经结果（搜索缓存仍有效）', null, true);
+    }
+
+    /* ⑤ 分季规则：网络失败不许缓存 30 天；404（上游明确没有）才允许缓存 */
+    const e4 = makeEnv({ store: { autoDetect: 'auto' } });
+    const orig4 = global.GM_xmlhttpRequest;
+    global.GM_xmlhttpRequest = (req) => {
+      if (/relation-rules/.test(req.url)) { req.onerror && req.onerror({ status: 0 }); return; }
+      orig4(req);
+    };
+    await callHook(e4, 'applyRelationRules', 52991, 1);
+    checkTrue('网络失败不缓存分季规则',
+      !Object.keys(cacheOf(e4)).some(k => /^rel:/.test(k)), Object.keys(cacheOf(e4)));
+
+    const e5 = makeEnv({ store: { autoDetect: 'auto' } });
+    const orig5 = global.GM_xmlhttpRequest;
+    global.GM_xmlhttpRequest = (req) => {
+      if (/relation-rules/.test(req.url)) { req.onload && req.onload({ status: 404, responseText: '' }); return; }
+      orig5(req);
+    };
+    await callHook(e5, 'applyRelationRules', 52991, 1);
+    checkTrue('404 才允许缓存「这部番没有分季规则」',
+      Object.keys(cacheOf(e5)).some(k => /^rel:/.test(k)), Object.keys(cacheOf(e5)));
+
+    /* ⑥ 缓存只存用得上的字段（整份 view JSON 会把 GM 存储撑爆） */
+    const big = {
+      code: 0, data: {
+        aid: 1, cid: 2, title: 't', pubdate: 0, videos: 1, duration: 1440,
+        owner: { mid: 7, name: 'up', avatar: 'A'.repeat(4000) },
+        pages: [{ page: 1, part: 'p1', duration: 1440, cid: 2, dimension: { width: 1920, height: 1080 } }],
+        desc: 'D'.repeat(4000),
+        ugc_season: { id: 9, title: '合集', cover: 'C'.repeat(4000), sections: [{ episodes: [{ bvid: 'BV_A', aid: 1, title: 'ep', cid: 999, arc: { junk: 1 } }] }] },
+        junk: 'J'.repeat(4000)
+      }
+    };
+    const e6 = makeEnv({ net: makeNet({ 'https://api.bilibili.com/x/web-interface/view': big }) });
+    const info = (await callHook(e6, 'fetchVideoInfo', 'BV_CLEAN00001')) || {};
+    checkTrue('丢掉无用字段（desc / junk / 头像 / 封面）',
+      info.desc === undefined && info.junk === undefined &&
+      (info.owner || {}).avatar === undefined && (info.ugc_season || {}).cover === undefined,
+      Object.keys(info));
+    const pg = (info.pages || [])[0] || {};
+    check('保留 pages 里要用的字段', [pg.page, pg.part, pg.duration], [1, 'p1', 1440]);
+    const ep0 = (((info.ugc_season || {}).sections || [])[0] || {}).episodes || [];
+    check('保留合集单集标题（做标题线索用）', (ep0[0] || {}).title, 'ep');
+
+    /* ⑦ 防抖窗口内关页不丢写 */
+    const e7 = makeEnv({ store: { autoDetect: 'auto' } });
+    await e7.api.identify(ctxOf('BV_TEST000001', 1));
+    flushOf(e7);
+    checkTrue('flushCache 立刻落盘', typeof e7.store._cache === 'string' && e7.store._cache.length > 2, e7.store._cache);
+    checkTrue('落盘的缓存里确实有时间戳',
+      /seg:as:52991:1/.test(e7.store._cache || ''), e7.store._cache);
+  }
+
+  /* --- 28b. 季链展开的并发上限 ---
+   * 一家子可能有 24 个条目，原来一次性并发 24 个 AniList 请求（限流 90/min），
+   * 冷启动时容易被 429。改成批次并发。 */
+  head('28b. 季链展开的并发上限（防 AniList 限流）');
+  {
+    const FAN = {};
+    const leaf = (id) => ({
+      id: id, idMal: 900 + id, episodes: 12, format: 'TV', title: { native: 'S' + id },
+      startDate: { year: 2020 }, relations: { edges: [] }
+    });
+    const kids = [2, 3, 4, 5, 6, 7, 8, 9];
+    FAN[1] = {
+      id: 1, idMal: 900, episodes: 12, format: 'TV', title: { native: 'ROOT' }, startDate: { year: 2020 },
+      relations: { edges: kids.map(k => ({ relationType: 'SEQUEL', node: leaf(k) })) }
+    };
+    kids.forEach(k => { FAN[k] = leaf(k); });
+
+    const e = makeEnv();
+    const orig = global.GM_xmlhttpRequest;
+    let inFlight = 0, maxInFlight = 0;
+    const held = [];
+    global.GM_xmlhttpRequest = (req) => {
+      if (req.url.indexOf('https://graphql.anilist.co') === 0) {
+        const q = JSON.parse(req.data);
+        if (/Media\(id/.test(q.query)) {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          held.push({ req, id: q.variables.id });
+          return;
+        }
+      }
+      orig(req);
+    };
+
+    const ctxNoParts = {
+      bvid: 'BV_FAN0000001', videos: 1, page: 1, pages: [{ page: 1, part: '01', duration: 1440 }],
+      mainTitle: 'x', partTitle: '01', seasonId: null, seasonEpisodeTitle: '', seasonTitle: ''
+    };
+    const p = e.api.api_.buildSeasonChain(1, 0, ctxNoParts, 'x', null, 'x');
+    const tick = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+    await tick();
+
+    let guard = 0;
+    while (held.length && guard++ < 60) {
+      const h = held.shift();
+      inFlight--;
+      h.req.onload({ status: 200, responseText: JSON.stringify({ data: { Media: FAN[h.id] } }) });
+      await tick();
+    }
+    const chain = await p;
+    checkTrue('关系查询并发不超过 4', maxInFlight <= 4, maxInFlight);
+    checkTrue('确实并发了（不是退化成串行）', maxInFlight > 1, maxInFlight);
+    checkTrue('家族仍然收全（8 个子条目）', chain && chain.seasons.length === 9, chain && chain.seasons.length);
+  }
+
+  /* --- 29. 模式与置信度门槛（v0.4.5） ---
+   * README 一直这么写，代码却从来没实现：
+   *   ask  = 识别出来让你自己点着跳（原本和 auto 一模一样，直接跳）
+   *   auto = 命中**且置信度足够**才跳（confThreshold / hintThreshold 是死配置，从没被读过）
+   * 这里把三条语义钉死。 */
+  head('29. 模式与置信度门槛（v0.4.5）');
+  {
+    const okR = (score, manual) => ({ ok: true, manual: !!manual, confidence: { score: score } });
+
+    /* ① 纯策略函数 */
+    const f = (store, r) => callHook(makeEnv({ store }), 'shouldAutoSkip', r);
+    check('off：不自动跳', f({ autoDetect: 'off' }, okR(99)), false);
+    check('off：手动绑定照跳（绑过＝用户要它跳）', f({ autoDetect: 'off' }, okR(0, true)), true);
+    check('ask：识别出来也不自动跳', f({ autoDetect: 'ask' }, okR(99)), false);
+    check('auto：置信度不够（50 < 60）不跳', f({ autoDetect: 'auto' }, okR(50)), false);
+    check('auto：置信度够（70 ≥ 60）才跳', f({ autoDetect: 'auto' }, okR(70)), true);
+    check('auto：门槛可调（confThreshold 90 → 80 分不跳）', f({ autoDetect: 'auto', confThreshold: 90 }, okR(80)), false);
+    check('没识别成功 → 永不自动跳', f({ autoDetect: 'auto' }, { ok: false }), false);
+
+    /* ② 提示门槛 hintThreshold */
+    const g = (store, r) => callHook(makeEnv({ store }), 'shouldShowIdentifyToast', r);
+    check('置信度低于提示门槛 → 连提示都不给', g({ autoDetect: 'auto' }, okR(20)), false);
+    check('置信度够 → 提示', g({ autoDetect: 'auto' }, okR(80)), true);
+    check('off 模式下的手动绑定 → 仍然提示', g({ autoDetect: 'off' }, okR(80, true)), true);
+    check('关掉「显示跳转提示」→ 不提示', g({ autoDetect: 'auto', showToast: false }, okR(80)), false);
+
+    /* ③ rerun 真实接线：ask 不能启动轮询 */
+    const loc = { pathname: '/video/BV1TEST00001', search: '?p=1' };
+    const askEnv = makeEnv({ store: { autoDetect: 'ask' }, location: loc });
+    await askEnv.api.rerun();
+    const rtA = askEnv.api._runtime;
+    checkTrue('ask：识别成功', !!(rtA.result && rtA.result.ok), rtA.result && rtA.result.reason);
+    check('ask：不自动跳', rtA.allowAutoSkip, false);
+    checkTrue('ask：不启动轮询', !rtA.timer, rtA.timer);
+
+    const autoEnv = makeEnv({ store: { autoDetect: 'auto' }, location: loc });
+    await autoEnv.api.rerun();
+    const rtB = autoEnv.api._runtime;
+    check('auto + 高置信度：允许自动跳', rtB.allowAutoSkip, true);
+    checkTrue('auto：启动轮询', !!rtB.timer, rtB.timer);
+
+    const lowEnv = makeEnv({ store: { autoDetect: 'auto', confThreshold: 100 }, location: loc });
+    await lowEnv.api.rerun();
+    check('auto 但没过门槛：不自动跳', lowEnv.api._runtime.allowAutoSkip, false);
+    checkTrue('auto 但没过门槛：不启动轮询', !lowEnv.api._runtime.timer);
+  }
+
+  /* --- 30. 黑名单语义 / 死代码（v0.4.5） --- */
+  head('30. 黑名单语义 / 死代码（v0.4.5）');
+  {
+    /* ① 拉黑要优先于绑定：绑定是「这是某番」，拉黑是「这视频不是番」——
+     * 后者是用户更晚、更明确的一次表态，不能被绑定压过去。 */
+    const binding = {
+      'b:BV_TEST000001': { anilistId: 154587, malId: 52991, title: '葬送のフリーレン', episodes: 28, anchorPage: 1, anchorEp: 3 }
+    };
+    const e1 = makeEnv({
+      store: {
+        autoDetect: 'off',
+        _bindings: JSON.stringify(binding),
+        _blacklist: JSON.stringify({ 'b:BV_TEST000001': { t: Date.now() } })
+      }
+    });
+    const r1 = await e1.api.identify(ctxOf('BV_TEST000001', 1));
+    check('拉黑优先于绑定', [r1.ok, r1.reason], [false, 'blacklisted']);
+
+    /* ② 拉黑粒度固定：老实现只写「黑名单键的第一个」（有 seasonId 时是 s:，
+     * 没有时是 b:），同一个按钮在不同稿件上写进不同的表。 */
+    const e2 = makeEnv();
+    callHook(e2, 'setBlacklist', { bvid: 'BV_X000000001', cid: 5, seasonId: 999, mainTitle: 't' });
+    check('「不是番剧」固定按 BV 粒度落表', Object.keys(JSON.parse(e2.store._blacklist || '{}')), ['b:BV_X000000001']);
+
+    /* ③ 死代码清理 */
+    checkTrue('titleOffset 死代码已删（没有写入方却一直在读）', !/titleOffset/.test(SRC));
+    checkTrue('noFocusAll / lastSegKey 死代码已删', !/noFocusAll|lastSegKey/.test(SRC));
+    checkTrue('集号正则里没有重复的「話」', !/話\|話/.test(SRC));
+
+    /* ④ 关系查询必须带 format —— 否则 seasonNode 读到的 format 永远是空，
+     * 续集链带进来的剧场版／音乐条目过滤不掉（测试桩里塞了 format，所以一直是假绿） */
+    checkTrue('AniList 关系查询带 format',
+      /relations\{edges\{relationType node\{[^}]*format/.test(SRC));
+    checkTrue('季链过滤里确实用了 format',
+      /s\.format !== 'MOVIE' && s\.format !== 'MUSIC'/.test(SRC));
+
+    /* ⑤ 胶囊文案补齐（原来 no-match / low-score 会掉进「识别失败」的红点） */
+    checkTrue('胶囊文案补齐 no-match', /'no-match':/.test(SRC));
+    checkTrue('胶囊文案补齐 low-score', /'low-score':/.test(SRC));
+    checkTrue('胶囊文案补齐 net-error', /'net-error':/.test(SRC));
+  }
+
+  /* --- 31. ask 手动跳过 / 监听器 / 切集竞态（v0.4.5） --- */
+  head('31. ask 手动跳过 / 监听器 / 切集竞态（v0.4.5）');
+  {
+    const mkVideo = (t, dur) => {
+      const v = {
+        tagName: 'VIDEO', paused: false, ended: false, readyState: 4, duration: dur, dataset: {}, _ct: t,
+        getBoundingClientRect: () => ({ width: 800, height: 450 }),
+        play() {}, addEventListener() {}, removeEventListener() {}
+      };
+      Object.defineProperty(v, 'currentTime', { get() { return this._ct; }, set(x) { this._ct = x; } });
+      return v;
+    };
+    const LOC = { pathname: '/video/BV1TEST00001', search: '?p=1' };
+
+    /* ① ask 模式：点「跳过」才跳 */
+    const v1 = mkVideo(50, 1440);
+    const e1 = makeEnv({ store: { autoDetect: 'ask' }, location: LOC, video: v1 });
+    const rt1 = e1.api._runtime;
+    await e1.api.rerun();
+    check('ask：识别到 OP + ED 两段', (rt1.result.segments || []).length, 2);
+    checkTrue('ask：用户点「跳过」→ 真的跳', e1.api._skipNow(), true);
+    check('ask：落到 OP 终点 +ε', Math.round(v1.currentTime * 100) / 100, 92.56);
+    check('ask：同一段不会重复跳', e1.api._skipNow(), false);
+    v1._ct = 1350;
+    checkTrue('ask：播放头在 ED 里 → 点跳过跳 ED', e1.api._skipNow(), true);
+    check('ask：落到 ED 终点 +ε', Math.round(v1.currentTime * 100) / 100, 1390.06);
+
+    /* ② 监听器不能越挂越多（切 P 会反复 startMonitor） */
+    const added = [], removed = [];
+    const v2 = {
+      tagName: 'VIDEO', paused: false, ended: false, duration: 1440, dataset: {}, currentTime: 0,
+      getBoundingClientRect: () => ({ width: 800, height: 450 }),
+      addEventListener: (ev) => { added.push(ev); },
+      removeEventListener: (ev) => { removed.push(ev); }
+    };
+    const e2 = makeEnv({ video: v2 });
+    const rt2 = e2.api._runtime;
+    rt2.video = v2;
+    e2.api._startMonitor();
+    check('startMonitor 挂 3 个事件监听', added.length, 3);
+    e2.api._stopMonitor();
+    check('stopMonitor 把监听全摘掉', removed.length, 3);
+    checkTrue('stopMonitor 清空监听句柄', rt2.videoListeners === null);
+    e2.api._startMonitor();
+    e2.api._startMonitor();
+    check('重复 startMonitor 不会叠加监听', added.length - removed.length, 3);
+
+    /* ③ boot 只注册一条 SPA 定位轮询 */
+    const e3 = makeEnv();
+    check('boot 注册 1.2s 定位轮询', e3.intervals.filter(i => i.ms === 1200).length, 1);
+    e3.api._boot();
+    e3.api._boot();
+    check('重复 boot 不再叠加轮询', e3.intervals.filter(i => i.ms === 1200).length, 1);
+
+    /* ④ 切集竞态：先发的慢链回来得晚，不许覆盖新视频的上下文/结果 */
+    const binding = {
+      'b:BV1GARBAGE01': { anilistId: 154587, malId: 52991, title: '葬送のフリーレン', episodes: 28, anchorPage: 1, anchorEp: 1 }
+    };
+    const e4 = makeEnv({
+      store: { autoDetect: 'auto', _bindings: JSON.stringify(binding) },
+      location: LOC
+    });
+    const rt4 = e4.api._runtime;
+    const orig4 = global.GM_xmlhttpRequest;
+    const held = [];
+    let release = false;
+    global.GM_xmlhttpRequest = (req) => {
+      if (!release && req.url.indexOf('https://graphql.anilist.co') === 0) { held.push(req); return; }
+      orig4(req);
+    };
+    const tick = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
+
+    const p1 = e4.api.rerun();                 // 第一个视频：识别要打 AniList，被我们扣住
+    await tick();
+    global.location = { pathname: '/video/BV1GARBAGE01', search: '?p=1' };   // 用户切走了
+    const p2 = e4.api.rerun();                 // 第二个视频：走手动绑定，不需要 AniList
+    await tick();
+    await p2;
+    check('新视频的结果已就位', [rt4.ctx.bvid, rt4.result.manual], ['BV1GARBAGE01', true]);
+
+    release = true;                            // 现在才放行第一个视频那条慢链
+    held.forEach((req) => req.onload({
+      status: 200,
+      responseText: JSON.stringify({ data: { Page: { media: ANILIST_DB['葬送的芙莉莲'] } } })
+    }));
+    await p1;
+    check('迟到的旧识别结果不覆盖新上下文', rt4.ctx.bvid, 'BV1GARBAGE01');
+    check('迟到的旧结果不改变新视频的结果', rt4.result.manual, true);
+  }
+
+  /* --- 32. CSP 兜底 / 落盘时机（v0.4.5） --- */
+  head('32. CSP 兜底 / 落盘时机（v0.4.5）');
+  {
+    checkTrue('胶囊关键样式内联（CSP 拦掉 <style> 也还能看）', /pill\.style\.cssText\s*=/.test(SRC));
+    checkTrue('胶囊圆点/分隔线也补了内联兜底', /dots\[di\]\.style\.cssText/.test(SRC));
+    checkTrue('关页前立刻落盘（pagehide）', /addEventListener\('pagehide', flushCache\)/.test(SRC));
+    checkTrue('切到后台标签页时落盘', /visibilitychange/.test(SRC));
+    checkTrue('ask 模式胶囊上有「跳过」入口', /data-a="go">跳过/.test(SRC));
+  }
+
+  /* --- 33. 文档一致性（v0.4.5） ---
+   * 这一版有一半的 bug 是「README 说的和代码做的不一样」。
+   * 把几条最容易再次漂移的钉在测试里。 */
+  head('33. 文档一致性（v0.4.5）');
+  {
+    const SRC_PATH = SRCS.find((p) => fs.existsSync(p));
+    const README = ['README.md', path.join('..', 'README.md')]
+      .map((r) => path.join(path.dirname(SRC_PATH), r))
+      .map((p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null))
+      .find((x) => x) || '';
+
+    checkTrue('版本号升到 0.4.5', /@version\s+0\.4\.5/.test(SRC));
+    checkTrue('README 有 0.4.5 更新日志', /###\s*0\.4\.5/.test(README));
+    checkTrue('README 的「撤回提示秒数」默认值是 4（不再是 8）',
+      /\|\s*撤回提示秒数\s*\|\s*`4`\s*\|/.test(README));
+    checkTrue('README 设置表补上了「跳过偏移」', /跳过偏移/.test(README));
+    checkTrue('README 不再写死用例数', !/19[0-9]\s*项用例/.test(README));
+    checkTrue('README 写清了 ask = 点了才跳', /`ask`[\s\S]{0,200}点了才跳/.test(README));
+    checkTrue('README 写清了 auto 的置信度门槛', /置信度 ≥ 60/.test(README));
+    checkTrue('README 提到了网络失败态', /网络请求失败/.test(README));
   }
 
   /* --- 汇总 --- */

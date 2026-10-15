@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.4.4
+// @version      0.4.5
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -542,23 +542,27 @@
    * ================================================================== */
   var CACHE_TTL = {
     seg: 7 * 86400000,      // 时间戳 7 天
-    bind: 90 * 86400000,    // 手动绑定 90 天（长期有效）
     rel: 30 * 86400000,     // 分季重映射 30 天
     search: 30 * 86400000,  // AniList 搜索 30 天
-    miss: 6 * 3600000       // 查不到记 6 小时，避免反复打 API
+    miss: 6 * 3600000       // 上游明确说「没有」的负缓存 6 小时（见 cacheGet）
   };
 
   var cache = {};
   try { cache = JSON.parse(gmGet('_cache', '{}')) || {}; } catch (e) { cache = {}; }
 
+  /* 读缓存。负缓存（上游明确回答「没有这一集/搜不到」）只按 CACHE_TTL.miss 算寿命 ——
+   * 实测问题：老实现把 found:false 的空结果也按 7 天（search 甚至 30 天）缓存，
+   * 上游后来补了时间戳，用户这边最长一周都不生效。 */
   function cacheGet(key, ttl) {
     var e = cache[key];
     if (!e) return undefined;
-    if (Date.now() - e.t > ttl) { delete cache[key]; return undefined; }
+    var eff = e.neg ? Math.min(ttl, CACHE_TTL.miss) : ttl;
+    if (Date.now() - e.t > eff) { delete cache[key]; return undefined; }
     return e.v;
   }
-  function cacheSet(key, val) {
+  function cacheSet(key, val, opts) {
     cache[key] = { t: Date.now(), v: val };
+    if (opts && opts.negative) cache[key].neg = 1;
     // 上限保护，避免无限膨胀
     var ks = Object.keys(cache);
     if (ks.length > 400) {
@@ -571,9 +575,20 @@
   function persistCache() {
     if (cacheTimer) clearTimeout(cacheTimer);
     cacheTimer = setTimeout(function () {
+      cacheTimer = null;
       try { gmSet('_cache', JSON.stringify(cache)); } catch (e) { /* ignore */ }
     }, 800);
   }
+  /* 立刻落盘。防抖窗口有 800ms，用户关标签页时那一批写入会丢。 */
+  function flushCache() {
+    if (cacheTimer) { clearTimeout(cacheTimer); cacheTimer = null; }
+    try { gmSet('_cache', JSON.stringify(cache)); } catch (e) { /* ignore */ }
+  }
+
+  /* 网络错误计数：区分「上游说没有」和「网线断了 / 被限流」。
+   * 老实现把所有 catch 都吞成 []，UI 上两者长得一模一样，用户只能靠猜。 */
+  var netErrors = 0;
+  function noteNetError() { netErrors++; }
 
   // 手动绑定表 & 黑名单
   var bindings = {};
@@ -606,6 +621,34 @@
     return q ? q[1] : null;
   }
 
+  /* 只留识别用得上的字段再进缓存：整份 view JSON 里带着长简介、封面、stat、
+   * 每集 arc 等等，一个热门合集能顶掉几百 KB 的 GM 存储（上限只有 400 条 / 无体积控制）。 */
+  function trimViewData(d) {
+    return {
+      aid: d.aid,
+      cid: d.cid,
+      title: d.title,
+      pubdate: d.pubdate,
+      videos: d.videos,
+      duration: d.duration,
+      owner: d.owner ? { mid: d.owner.mid, name: d.owner.name } : null,
+      pages: (d.pages || []).map(function (x) {
+        return { page: x.page, part: x.part, duration: x.duration, cid: x.cid };
+      }),
+      ugc_season: d.ugc_season ? {
+        id: d.ugc_season.id,
+        title: d.ugc_season.title,
+        sections: (d.ugc_season.sections || []).map(function (s) {
+          return {
+            episodes: (s.episodes || []).map(function (e) {
+              return { bvid: e.bvid, aid: e.aid, title: e.title };
+            })
+          };
+        })
+      } : null
+    };
+  }
+
   function fetchVideoInfo(bvid) {
     var ckey = 'bili:' + bvid;
     var c = cacheGet(ckey, 6 * 3600000);
@@ -613,10 +656,15 @@
     return jget('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid))
       .then(function (d) {
         if (d && d.code === 0 && d.data) {
-          cacheSet(ckey, d.data);
-          return d.data;
+          var info = trimViewData(d.data);
+          cacheSet(ckey, info);
+          return info;
         }
         throw new Error((d && d.message) || 'view api failed');
+      })
+      .catch(function (err) {
+        noteNetError();
+        throw err;
       });
   }
 
@@ -825,7 +873,7 @@
   }
 
   var EP_PATTERNS = [
-    { re: /第\s*(\d{1,3})\s*(?:话|集|回|話|話)/, conf: 30 },
+    { re: /第\s*(\d{1,3})\s*(?:话|集|回|話)/, conf: 30 },
     { re: /[Ee][Pp]?\s*\.?\s*(\d{1,3})(?!\d)/, conf: 28 },
     { re: /[Ee]pisod\w*\s*\.?\s*(\d{1,3})/i, conf: 28 },
     { re: /^\s*(\d{1,3})\s*[.、．]?\s*$/, conf: 20 },
@@ -868,19 +916,12 @@
     if (ctx.videos > 1 && (!best || best.score < 20)) {
       best = { num: 1, score: 12, from: 'pageIndex', text: 'P' + ctx.page };
     }
-    if (best) best.num = applyTitleOffset(ctx, best.num);
     return best;
   }
 
-  // 分P合集的固有坑：P1 常常是「预告 / PV / 先行」而不是第 1 集
-  // titleOffset = 1 表示「P 序号比实际集号大 1」
-  function applyTitleOffset(ctx, n) {
-    if (ctx.videos <= 1) return n;
-    var b = getBinding(ctx);
-    var off = b && b.titleOffset;
-    if (typeof off === 'number' && off) n = n - off;
-    return n;
-  }
+  /* 注：这里曾经有一个 applyTitleOffset()，读绑定里的「标题集号偏移」把抽到的集号再挪几话。
+   * 但保存绑定时从来不写这个字段、面板上也没有对应输入项 —— 纯死代码，删掉。
+   * 集号偏移现在靠 anchorPage/anchorEp（绑一次算整个 BV）解决。 */
 
   /* ------------------------------------------------------------------
    * 集号解析（手动绑定的核心）
@@ -955,10 +996,10 @@
     return jpost(ANILIST, { query: ANILIST_SEARCH_Q, variables: { q: name } })
       .then(function (d) {
         var media = (d && d.data && d.data.Page && d.data.Page.media) || [];
-        cacheSet(ckey, media);
+        cacheSet(ckey, media, { negative: !media.length });
         return media;
       })
-      .catch(function () { return []; });
+      .catch(function () { noteNetError(); return []; });
   }
 
   /* ---- 中文名 → 日文原名的桥：Bangumi ----
@@ -977,10 +1018,10 @@
     return jpost(BANGUMI_SEARCH + '?limit=' + (limit || 8), { keyword: kw, filter: { type: [2] } })
       .then(function (d) {
         var list = (d && d.data) || [];
-        cacheSet(ckey, list);
+        cacheSet(ckey, list, { negative: !list.length });
         return list;
       })
-      .catch(function () { return []; });
+      .catch(function () { noteNetError(); return []; });
   }
 
   // 条目的别名（英文 / 罗马字 / 繁中 / 简写都在里面，简写的救命稻草）
@@ -1006,7 +1047,7 @@
         cacheSet(ckey, out);
         return out;
       })
-      .catch(function () { return []; });
+      .catch(function () { noteNetError(); return []; });
   }
 
   function bgmTitleScore(entry, extras, query) {
@@ -1027,7 +1068,7 @@
     var c = cacheGet(ckey, CACHE_TTL.search);
     if (c !== undefined) return Promise.resolve(c);
     return bgmSearch(name, 8).then(function (list) {
-      if (!list.length) { cacheSet(ckey, null); return null; }
+      if (!list.length) { cacheSet(ckey, null, { negative: true }); return null; }
       var ranked = list.map(function (e) { return { entry: e, s: bgmTitleScore(e, null, name) }; })
                        .sort(function (a, b) { return b.s - a.s; });
 
@@ -1166,7 +1207,14 @@
     if (c !== undefined) return Promise.resolve(apply(c));
     return jget('https://api.aniskip.com/v2/relation-rules/' + encodeURIComponent(malId))
       .then(function (d) { var r = d && d.rules; cacheSet(ckey, r || []); return apply(r); })
-      .catch(function () { cacheSet(ckey, []); return { malId: malId, ep: ep, mapped: false }; });
+      .catch(function (err) {
+        /* 只有「上游明确说没有这部番的规则」（4xx）才能缓存 30 天 —— 否则网络抖动
+         * 会把「没有分季规则」写死一个月，Fairy Tail 这类需要重映射的番会一直取错季。 */
+        var msg = (err && err.message) || '';
+        if (/^HTTP 4/.test(msg)) cacheSet(ckey, []);
+        else noteNetError();
+        return { malId: malId, ep: ep, mapped: false };
+      });
   }
 
   /* ==================================================================
@@ -1180,9 +1228,13 @@
    * 累计边界；某季话数未知（新番还没播完常见）时，用标题里的「全N话」反推。
    * 全部信息都会写进绑定里，面板上可见、可手改 —— 因为这属于「猜」，必须让用户能纠正。
    * ================================================================== */
+  /* 注意 relations 里的节点也要 format —— 下面 buildSeasonChain 靠它剔掉剧场版 / 音乐条目。
+   * 老查询漏了这个字段，seasonNode 读到的 format 永远是空字符串，
+   * 于是一整条续集链带进来的剧场版过滤不掉（只有「同名搜索」那条路真的过滤）。
+   * 测试桩里塞了 format，所以这个 bug 在测试里看不出来 —— 属于「假绿」。 */
   var ANILIST_REL_Q =
     'query($id:Int){Media(id:$id,type:ANIME){id idMal episodes title{native romaji} startDate{year} ' +
-    'relations{edges{relationType node{id idMal episodes startDate{year} title{native romaji}}}}}}';
+    'relations{edges{relationType node{id idMal episodes format startDate{year} title{native romaji}}}}}}';
 
   function anilistRelations(id) {
     var ckey = 'alrel:' + id;
@@ -1194,7 +1246,7 @@
         cacheSet(ckey, m);
         return m;
       })
-      .catch(function () { return null; });
+      .catch(function () { noteNetError(); return null; });
   }
 
   function seasonNode(node) {
@@ -1328,10 +1380,13 @@
    * v4：分段对齐按分P标题自己的季号起锚（BV1YEaE6REdF「第三季1-16 + 第四季1-19」
    *     原来会被配到第一季头上）+ expand 改为限制家族条目总数（不再按跳数砍链条）
    *     + 未对齐的分段一律不跳（原来 entries 非空就照跳）
+   * v5：关系查询补上 format，剧场版/音乐条目终于过滤得掉 —— 结果会变，
+   *     所以旧链必须作废（否则读缓存还是老错链）
    * ================================================================== */
-  var CHAIN_VERSION = 4;
+  var CHAIN_VERSION = 5;
   var MAX_FAMILY_SIZE = 24;   // 一家子最多收 24 个条目（防异常数据无限扩张）
   var MAX_FAMILY_HOPS = 10;   // 沿续季关系最多走 10 跳（长番如 Re:Zero 要 4 跳）
+  var EXPAND_CONCURRENCY = 4; // 每批并发的关系查询数（AniList 限流 90 次/分钟，别一次打 24 个）
 
   function buildSeasonChain(anilistId, totalEpsFromTitle, ctx, baseName, extraMedia, refTitle) {
     var ckey = 'chainv' + CHAIN_VERSION + ':' + anilistId + ':' + (totalEpsFromTitle || 0) + ':' + ((ctx && ctx.bvid) || '') + ':' + (baseName || '');
@@ -1364,7 +1419,10 @@
        * 缺了第 1 期 → 绝对集号整体错位 12 话 → 合集第 1 话被算成第 2 期第 1 话。
        * 深度上限同样不能卡死：Re:Zero 从第 4 季往回要 4 跳才够得到第 1 季，
        * 卡在 3 跳就少一季（实测 BV1YEaE6REdF）。改成正经的防炸方式 ——
-       * **限制家族条目总数**，环由 seen 挡。 */
+       * **限制家族条目总数**，环由 seen 挡。
+       *
+       * 并发也要限制：一层可能就有 20 多个续集节点，一次性全发出去会撞 AniList
+       * 的 90 次/分钟限流（冷启动 + 缓存全空时最容易触发），所以按批走。 */
       function expand(nodes, depth) {
         if (depth > MAX_FAMILY_HOPS) return Promise.resolve();
         var room = MAX_FAMILY_SIZE - Object.keys(byId).length;
@@ -1372,12 +1430,21 @@
         var todo = (nodes || []).filter(function (n) { return n && n.id && !seen[n.id]; }).slice(0, room);
         if (!todo.length) return Promise.resolve();
         todo.forEach(function (n) { seen[n.id] = 1; add(n); });
-        return Promise.all(todo.map(function (n) {
-          return anilistRelations(n.id).then(function (full) {
-            if (full) add(full);
-            return expand(kidsOf(full || n), depth + 1);
+
+        var batches = [];
+        for (var i = 0; i < todo.length; i += EXPAND_CONCURRENCY) {
+          batches.push(todo.slice(i, i + EXPAND_CONCURRENCY));
+        }
+        return batches.reduce(function (chain, batch) {
+          return chain.then(function () {
+            return Promise.all(batch.map(function (n) {
+              return anilistRelations(n.id).then(function (full) {
+                if (full) add(full);
+                return expand(kidsOf(full || n), depth + 1);
+              });
+            }));
           });
-        })).then(function () {});
+        }, Promise.resolve()).then(function () {});
       }
 
       return expand(kidsOf(self), 1).then(function () {
@@ -1517,6 +1584,10 @@
    * 注意 episodeLength 必传；传 0 = 返回全部版本
    * （视频结尾常被塞别的片段防下架，真实时长不可信，所以一律传 0 后本地去重）
    * ================================================================== */
+  /* 数据源统一返回 { segs, failed }：
+   *   failed=true  = 请求失败（网络 / 限流 / 5xx），**不代表**「这一集没有时间戳」
+   *   failed=false + segs=[] = 上游明确回答「没有」
+   * 老实现一律 catch → []，UI 上两者完全相同，用户只能猜。 */
   function fetchAniSkip(malId, ep) {
     var types = [];
     if (config.jumpOp) types.push('op');
@@ -1526,14 +1597,14 @@
     // 实测无职转生大量集数就是这种（每集 OP 画面都不同 / 干脆没有独立 OP），
     // 跳过这类区间会切掉正片内容，所以独立成开关、默认关。
     if (config.jumpMixed) types.push('mixed-op', 'mixed-ed');
-    if (!types.length) return Promise.resolve([]);
+    if (!types.length) return Promise.resolve({ segs: [], failed: false });
 
     var qs = types.map(function (t) { return 'types[]=' + t; }).join('&');
     var url = 'https://api.aniskip.com/v2/skip-times/' + encodeURIComponent(malId) + '/' +
               encodeURIComponent(ep) + '?' + qs + '&episodeLength=0';
     var ckey = 'seg:as:' + malId + ':' + ep + ':' + types.join(',');
     var c = cacheGet(ckey, CACHE_TTL.seg);
-    if (c !== undefined) return Promise.resolve(c);
+    if (c !== undefined) return Promise.resolve({ segs: c, failed: false });
 
     return jget(url).then(function (d) {
       var res = (d && d.found && d.results) || [];
@@ -1548,9 +1619,9 @@
           epLen: r.episodeLength || 0
         };
       });
-      cacheSet(ckey, segs);
-      return segs;
-    }).catch(function () { return []; });
+      cacheSet(ckey, segs, { negative: !segs.length });
+      return { segs: segs, failed: false };
+    }).catch(function () { noteNetError(); return { segs: [], failed: true }; });
   }
 
   /* ==================================================================
@@ -1571,10 +1642,10 @@
   };
 
   function fetchAnimeSkip(anilistId, ep) {
-    if (!anilistId) return Promise.resolve([]);
+    if (!anilistId) return Promise.resolve({ segs: [], failed: false });
     var ckey = 'seg:askp:' + anilistId + ':' + ep;
     var c = cacheGet(ckey, CACHE_TTL.seg);
-    if (c !== undefined) return Promise.resolve(c);
+    if (c !== undefined) return Promise.resolve({ segs: c, failed: false });
 
     return jpost('https://api.anime-skip.com/graphql',
       { query: ANIMESKIP_Q, variables: { id: String(anilistId) } },
@@ -1601,10 +1672,10 @@
             }
           });
         });
-        cacheSet(ckey, segs);
-        return segs;
+        cacheSet(ckey, segs, { negative: !segs.length });
+        return { segs: segs, failed: false };
       })
-      .catch(function () { return []; });
+      .catch(function () { noteNetError(); return { segs: [], failed: true }; });
   }
 
   /* ==================================================================
@@ -1688,6 +1759,36 @@
     return { score: Math.max(0, Math.min(100, score)), reasons: reasons };
   }
 
+  /* 时间戳接口整体挂掉时的统一结果 —— 和「上游说这一集没有」严格区分开 */
+  function netFailResult(extra) {
+    return Object.assign({
+      ok: false, reason: 'net-error', netFailed: true,
+      confidence: { score: 0, reasons: ['时间戳接口请求失败（网络／限流），稍后重试'] }
+    }, extra || {});
+  }
+
+  /* ==================================================================
+   * 12.5 模式策略 —— off / ask / auto 的真实语义
+   *
+   * 老实现里 autoDetect 只在识别入口读过一次：结果一出来就无条件 startMonitor，
+   * 于是 ask 和 auto 完全一样（都自动跳），confThreshold / hintThreshold
+   * 两个配置项从来没被引用过。策略集中在这里，别再散到轮询里。
+   * ================================================================== */
+  function shouldAutoSkip(r) {
+    if (!r || !r.ok) return false;
+    if (r.manual) return true;                    // 手动绑定＝用户明确要它跳
+    if (config.autoDetect !== 'auto') return false;  // off：不猜；ask：等用户点
+    var score = (r.confidence && r.confidence.score) || 0;
+    return score >= (Number(config.confThreshold) || 0);
+  }
+
+  function shouldShowIdentifyToast(r) {
+    if (!config.showToast || !r || !r.ok) return false;
+    if (config.autoDetect === 'off' && !r.manual) return false;
+    var score = (r.confidence && r.confidence.score) || 0;
+    return score >= (Number(config.hintThreshold) || 0);   // 太低连提示都不给
+  }
+
   /* ==================================================================
    * 13. 主识别流程
    * ================================================================== */
@@ -1697,7 +1798,15 @@
         fetchAniSkip(rm.malId, rm.ep),
         fetchAnimeSkip(anilistId, rm.ep)
       ]).then(function (r) {
-        return { segs: mergeSegments(r[0], r[1], videoDuration || 0), rm: rm };
+        var a = r[0] || { segs: [], failed: false };
+        var b = r[1] || { segs: [], failed: false };
+        return {
+          segs: mergeSegments(a.segs, b.segs, videoDuration || 0),
+          rm: rm,
+          // 两个源都失败才判定为网络问题；只有一个失败而另一个明确回答「没有」，
+          // 那个回答本身仍然可信，按正常流程走
+          failed: !!(a.failed && b.failed)
+        };
       });
     });
   }
@@ -1711,8 +1820,15 @@
   }
 
   function identify(ctx) {
+    netErrors = 0;                       // 本次识别周期内累计的网络失败数
     var ms = detectMultiSeason(ctx);
     var guess = episodeGuess(ctx);
+
+    // 拉黑优先于绑定：绑定是「这是某番」，拉黑是「这视频不是番」——
+    // 后者是用户更晚、更明确的一次表态（老实现把绑定放在前面，拉黑过的绑定照样跳）
+    if (isBlacklisted(ctx)) {
+      return Promise.resolve({ ok: false, reason: 'blacklisted', multiSeason: ms });
+    }
 
     // 手动绑定优先 —— 绑过就代表用户明确要它跳，不再走标题猜测
     var bind = getBinding(ctx);
@@ -1728,6 +1844,7 @@
         var hit = mapBySeasonChain(bind.seasonChain, bindEp.num);
         if (hit && hit.malId) {
           return fetchSegsFor(hit.malId, hit.anilistId, hit.ep, ctx.duration).then(function (r) {
+            if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: bindEp });
             var setTitle = hit.group && hit.group.entries && hit.group.entries.length > 1
               ? hit.group.entries.map(function (e) { return e.title; }).join(' + ')
               : (hit.title || bind.title);
@@ -1766,6 +1883,7 @@
       }
 
       return fetchSegsFor(bind.malId, bind.anilistId, bindEp.num, ctx.duration).then(function (r) {
+        if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: bindEp });
         var reasons = ['手动绑定 · 集号来自 ' + bindEp.from];
         if (chainMiss) reasons.push('第 ' + bindEp.num + ' 话没落在季链范围内，按单季处理');
         return {
@@ -1779,9 +1897,6 @@
       });
     }
 
-    if (isBlacklisted(ctx)) {
-      return Promise.resolve({ ok: false, reason: 'blacklisted', multiSeason: ms });
-    }
     // off 模式：没有绑定就不做任何推测，普通视频在这里直接止步
     if (config.autoDetect === 'off') {
       return Promise.resolve({ ok: false, reason: 'autodetect-off', multiSeason: ms });
@@ -1799,7 +1914,9 @@
 
     return pickBestMatch(cands, ep.num, ctx).then(function (match) {
       if (!match || !match.malId) {
-        return { ok: false, reason: 'no-match', multiSeason: ms, confidence: { score: 0, reasons: ['番名匹配失败'] } };
+        // 搜不到也要分清是「真没有这个番」还是「网络挂了」
+        var rn = netErrors ? 'net-error' : 'no-match';
+        return { ok: false, reason: rn, match: match || null, multiSeason: ms, confidence: { score: 0, reasons: [netErrors ? '番名搜索请求失败，稍后重试' : '番名匹配失败'] } };
       }
       if (match.score < 22) {
         return { ok: false, reason: 'low-score', match: match, multiSeason: ms, confidence: { score: 0, reasons: ['番名匹配置信度不足，不敢采纳'] } };
@@ -1819,6 +1936,7 @@
         var useEp = hit ? hit.ep : ep.num;
 
         return fetchSegsFor(useMal, useAni, useEp, ctx.duration).then(function (r) {
+          if (r.failed) return netFailResult({ manual: false, multiSeason: ms, ep: ep, match: match, seasonChain: chain || null });
           var conf = computeConfidence(ctx, match, ep, r.segs);
           if (chain) {
             conf.reasons.push(chain.partial ? '季链（有话数未知的季）' : '季链 ' + chain.seasons.length + ' 季 / 共 ' + chain.total + ' 话');
@@ -1870,7 +1988,15 @@
     lastSkipAt: 0,
     skipped: {},               // 记录本集已跳过的时间戳类型，避免反复跳
     undo: null,                // 最近一次跳过的「撤回」回调（调试钩子：控制台/测试可直接调用）
-    lastSegKey: ''
+    /* 是否允许自动跳。轮询本来就只由 rerun 按策略启动，这里再兜一道：
+     * 默认 true 是给「调试/测试直接驱动 checkOnce」留的，rerun 每次都会按
+     * off/ask/auto + 置信度重新赋值。 */
+    allowAutoSkip: true,
+    gen: 0,                    // 代际令牌：切 P / 切视频后，迟到的旧识别结果必须作废
+    videoListeners: null,      // 挂在 video 上的监听（stopMonitor 要摘掉，否则切 P 叠加）
+    booted: false,             // SPA 定位轮询是否已经挂上（防重复注入）
+    bootTimer: null,
+    lastLocKey: ''
   };
 
   function shouldSkipThisSegment(seg) {
@@ -1899,10 +2025,10 @@
     return t;
   }
 
-  function performSkip(video, seg) {
-    if (runtime.skipping) return;
-    if (Date.now() - runtime.lastSkipAt < COOLDOWN_MS) return;
-    if (runtime.skipped[seg.type + ':' + Math.round(seg.start)]) return;
+  function performSkip(video, seg, force) {
+    if (runtime.skipping) return false;
+    if (!force && Date.now() - runtime.lastSkipAt < COOLDOWN_MS) return false;
+    if (runtime.skipped[seg.type + ':' + Math.round(seg.start)]) return false;
 
     runtime.skipping = true;
     runtime.lastSkipAt = Date.now();
@@ -1919,6 +2045,7 @@
       if (!wasPaused && video.paused) { try { video.play(); } catch (e) { /* ignore */ } }
       notifySkip(seg, from, video, target);
     }
+    return ok;
   }
 
   function notifySkip(seg, from, video, target) {
@@ -1948,6 +2075,7 @@
       video = nv;
     }
     if (!video) return;
+    if (runtime.allowAutoSkip === false) return;   // off / ask / 置信度不足：等用户点，不自动跳
     if (!runtime.result || !runtime.result.ok) return;
     var segs = runtime.result.segments || [];
     if (!segs.length) return;
@@ -1965,18 +2093,31 @@
     }
   }
 
+  var MONITOR_EVENTS = ['playing', 'timeupdate', 'seeked'];
+
   function startMonitor() {
     stopMonitor();
     runtime.timer = setInterval(checkOnce, POLL_MS);
     var v = runtime.video;
-    if (v) {
-      ['playing', 'timeupdate', 'seeked'].forEach(function (ev) {
-        v.addEventListener(ev, function () { checkOnce(); });
-      });
-    }
+    if (!v) return;
+    /* 监听要留句柄：老实现每次 startMonitor 都挂 3 个匿名监听又从不摘，
+     * 而 rerun 每次换 P / 换视频都会调一次 —— 同一个 <video> 上越挂越多，
+     * 一次播放事件会触发 N 次 checkOnce。 */
+    var handler = function () { checkOnce(); };
+    MONITOR_EVENTS.forEach(function (ev) {
+      try { v.addEventListener(ev, handler); } catch (e) { /* ignore */ }
+    });
+    runtime.videoListeners = { video: v, handler: handler };
   }
   function stopMonitor() {
     if (runtime.timer) { clearInterval(runtime.timer); runtime.timer = null; }
+    var l = runtime.videoListeners;
+    if (l) {
+      MONITOR_EVENTS.forEach(function (ev) {
+        try { l.video.removeEventListener(ev, l.handler); } catch (e) { /* ignore */ }
+      });
+      runtime.videoListeners = null;
+    }
   }
 
   /* ==================================================================
@@ -2188,25 +2329,56 @@
         'autodetect-off': '未识别',
         blacklisted: '已加入「不是番剧」名单',
         'no-episode': '没找到集号', 'no-name': '标题无番名',
-        'chain-miss': '这一话不跳（OVA／段没对上条目）'
+        'chain-miss': '这一话不跳（OVA／段没对上条目）',
+        // 这三个以前没登记，一律掉进「识别失败」的红点 ——
+        // 但「番名没匹配上」「置信度不足」根本不是错误，更不是网络故障
+        'no-match': '没匹配到番剧，可点「绑定」',
+        'low-score': '番名不太确定，可点「绑定」',
+        'net-error': '网络请求失败，稍后重试'
       }[r.reason] || '识别失败';
-      // autodetect-off 是「正常状态」而不是错误 —— 用灰点，别用红点吓人
-      parts.push('<span class="dot ' + (idleOff ? 'off' : 'err') + '"></span>' +
+      // autodetect-off 是「正常状态」、net-error 是「外部故障」，都不该用红点吓人
+      var dotCls = (idleOff || r.reason === 'no-match' || r.reason === 'low-score') ? 'off'
+                 : (r.reason === 'net-error' ? 'warn' : 'err');
+      parts.push('<span class="dot ' + dotCls + '"></span>' +
         '<span>' + (idleOff ? '番剧跳过 · ' : '') + escapeHtml(why) + '</span>');
       parts.push('<span class="sep"></span><span class="act" data-a="bind">' + (bound ? '改' : '绑定') + '</span>');
     } else {
       var segCount = (r.segments || []).filter(segmentEnabled).length;
       var dotClass = segCount ? '' : 'warn';
+      // ask 模式（或 auto 但置信度没过门槛）：识别结果摆在这儿，跳不跳由用户点
+      var waiting = r.autoSkip === false;
       parts.push('<span class="dot ' + dotClass + '"></span>' +
         '<span>' + escapeHtml(r.title) + ' 第' + r.episode + '集</span>' +
-        '<span class="sep"></span><span>' + segCount + ' 段</span>' +
-        '<span class="sep"></span><span class="act" data-a="bind">改</span>' +
+        '<span class="sep"></span><span>' + segCount + ' 段</span>');
+      if (waiting && segCount) {
+        parts.push('<span class="sep"></span><span class="act" data-a="go">跳过</span>');
+      }
+      parts.push('<span class="sep"></span><span class="act" data-a="bind">改</span>' +
         '<span class="sep"></span><span class="act" data-a="no">不是番剧</span>');
-      fallback = showDetails;
+      fallback = (waiting && segCount) ? skipNow : showDetails;
     }
     // 末尾统一挂一个设置入口 —— 胶囊原来只有识别出来才出现，想改设置得去油猴菜单，太绕
     parts.push('<span class="sep"></span><span class="act" data-a="cfg" title="番剧跳过设置">⚙</span>');
     pill.innerHTML = parts.join('');
+    /* 关键样式内联：页面 CSP 拦掉 <style> 注入时（脚本仍能跑，只是样式没了），
+     * 面板早就靠内联活着，胶囊却会变成一个裸 div。这里补上最小可用的外观。 */
+    pill.style.cssText = 'display:inline-flex;align-items:center;gap:6px;' +
+      'background:rgba(20,22,26,.86);color:#fff;border-radius:18px;padding:6px 12px;' +
+      'box-shadow:0 4px 16px rgba(0,0,0,.3);cursor:pointer;user-select:none;' +
+      'font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;';
+    try {
+      var dots = pill.querySelectorAll('.dot');
+      for (var di = 0; di < dots.length; di++) {
+        dots[di].style.cssText = 'display:inline-block;width:7px;height:7px;border-radius:50%;' +
+          'flex:0 0 auto;background:' + (/off/.test(dots[di].className) ? '#8a9099'
+            : (/warn/.test(dots[di].className) ? '#ffb648'
+            : (/err/.test(dots[di].className) ? '#ff5b5b' : '#00d1b2'))) + ';';
+      }
+      var seps = pill.querySelectorAll('.sep');
+      for (var sj = 0; sj < seps.length; sj++) {
+        seps[sj].style.cssText = 'display:inline-block;width:1px;height:12px;background:rgba(255,255,255,.22);';
+      }
+    } catch (e) { /* ignore */ }
 
     function onAct(name, fn) {
       var node = pill.querySelector('[data-a=' + name + ']');
@@ -2215,16 +2387,49 @@
     }
     onAct('bind', openBindPanel);
     onAct('cfg', openSettings);
+    onAct('go', skipNow);
     onAct('no', function () {
       setBlacklist(runtime.ctx);
       runtime.result = null;
       renderPill();
       stopMonitor();
-      showToast('已标记「不是番剧」', '这个视频／合集以后不会再触发');
+      showToast('已标记「不是番剧」', '这个视频以后不会再触发');
     });
     pill.addEventListener('click', function () { fallback(); });
 
     uiRoot.appendChild(pill);
+  }
+
+  /* ---- ask 模式：用户点「跳过」时手动跳一次 ----
+   * 只跳「播放头正在里面」或「马上就要开始」（15 秒内）的那一段。
+   * 不能随便挑「后面最近的一段」——那会让用户点两下就从 OP 直接飞到 ED，
+   * 等于一键跳过整集，和这个按钮的意思完全相反。 */
+  var ASK_LOOKAHEAD = 15;
+
+  function nextSkippableSeg() {
+    var segs = (runtime.result && runtime.result.segments) || [];
+    var en = segs.filter(segmentEnabled);
+    if (!en.length) return null;
+    var v = runtime.video || getVideo();
+    var t = (v && v.currentTime) || 0;
+    for (var i = 0; i < en.length; i++) {
+      if (t >= en[i].start && t < en[i].end - 0.2) return en[i];   // 正落在区间里
+    }
+    var ahead = en.filter(function (s) { return s.start > t; })
+                  .sort(function (a, b) { return a.start - b.start; })[0];
+    if (ahead && ahead.start - t <= ASK_LOOKAHEAD) return ahead;   // 马上就要开始了
+    return null;
+  }
+
+  function skipNow() {
+    // 切过 P 之后 DOM 里可能是另一个 <video>，别对着已经卸载的元素设 currentTime
+    var video = runtime.video;
+    if (!video || !document.body.contains(video)) video = getVideo();
+    runtime.video = video;
+    if (!video) { showToast('没找到播放器', '稍后再试或手动拖一下进度条'); return false; }
+    var seg = nextSkippableSeg();
+    if (!seg) { showDetails(); return false; }    // 现在没有可跳的，把本集时间戳列出来
+    return performSkip(video, seg, true);         // force：用户手点的，跳过冷却
   }
 
   function showDetails() {
@@ -2240,10 +2445,13 @@
     showToast(r.title + ' 第' + r.episode + '集', lines.join('　　') || '本集没有可用时间戳');
   }
 
+  /* 「不是番剧」固定按 BV 粒度落表。
+   * 老实现只写 blacklistKeys(ctx) 的第一个键 —— 有 UGC 合集时那是 s:{seasonId}，
+   * 没有合集时才是 b:{bvid}，同一个按钮在不同稿件上写进不同的表，
+   * 而读取侧又是「命中任意一个键就算拉黑」，行为完全看稿件有没有合集。 */
   function setBlacklist(ctx) {
-    blacklistKeys(ctx).forEach(function (k, i) {
-      if (i === 0) blacklist[k] = { t: Date.now(), title: ctx.mainTitle };
-    });
+    if (!ctx || !ctx.bvid) return;
+    blacklist['b:' + ctx.bvid] = { t: Date.now(), title: ctx.mainTitle };
     persistBlacklist();
   }
 
@@ -2267,11 +2475,6 @@
    * 正确做法：只管「不给焦点」，翻转完全交给浏览器原生行为。
    * （Edge 无头实测：不加 click 监听时 mousedown+preventDefault 不影响原生翻转）
    * ================================================================== */
-  function noFocusAll(root, sel) {
-    var list = [];
-    try { list = root.querySelectorAll(sel); } catch (e) { list = []; }
-    for (var i = 0; i < list.length; i++) noFocus(list[i]);
-  }
 
   var openPanels = [];   // 当前打开的面板节点（给下面的捕获阶段兜底用）
 
@@ -2776,47 +2979,71 @@
    * 16. 入口
    * ================================================================== */
   function rerun() {
+    /* 代际令牌：B 站是单页应用，快速切 P / 切视频时会有多条识别链同时在跑。
+     * 没有它的话，先发出的那条慢链回来得晚，会把新视频的 ctx / result 覆盖掉 ——
+     * 表现就是用上一个视频的番剧时间戳去跳当前视频（最坏情况：跳错正片）。 */
+    var gen = ++runtime.gen;
     runtime.result = null;
     runtime.skipped = {};
     runtime.undo = null;
+    runtime.allowAutoSkip = false;
     stopMonitor();
-    buildContext().then(function (ctx) {
+    return buildContext().then(function (ctx) {
+      if (gen !== runtime.gen) return null;          // 已经切走了，这次结果作废
       runtime.ctx = ctx;
       renderPill();
       return identify(ctx);
     }).then(function (r) {
+      if (gen !== runtime.gen || !r) return;         // 迟到的旧结果不许覆盖新上下文
+      r.autoSkip = shouldAutoSkip(r);
       runtime.result = r;
+      runtime.allowAutoSkip = r.autoSkip;
       renderPill();
-      if (r && r.ok) {
+      if (r.ok && r.autoSkip) {
         runtime.video = getVideo();
         runtime.skipped = {};
         startMonitor();
-        if (config.autoDetect !== 'off' || r.manual) {
-          showToast('已识别：' + r.title, '第 ' + r.episode + ' 集 · ' + (r.segments || []).filter(segmentEnabled).length + ' 段时间戳');
-        }
+      }
+      if (shouldShowIdentifyToast(r)) {
+        showToast('已识别：' + r.title,
+          '第 ' + r.episode + ' 集 · ' + (r.segments || []).filter(segmentEnabled).length + ' 段时间戳');
       }
     }).catch(function (e) {
+      if (gen !== runtime.gen) return;
       console.warn(LOG, 'identify failed', e);
       renderPill();
     });
   }
 
-  // 处于 ask 模式时，识别成功但不自动跳，改为把段信息显示出来供用户查看
+  /* off  = 只认手动绑定；
+   * ask  = 识别出来，但把「跳不跳」留给用户（胶囊上点「跳过」）；
+   * auto = 命中且置信度过门槛才自动跳。 */
   function boot() {
     if (!/\/(video)\//.test(location.pathname)) return;
     ensureUI();
     renderPill();
     setTimeout(rerun, 900);
+    // 防止重复注入（脚本被装两次 / 缓存里跑了两份）叠出多个轮询
+    if (runtime.booted) return;
+    runtime.booted = true;
 
     // B 站是单页应用：换视频 / 换分P 时重新识别
-    var lastKey = '';
-    setInterval(function () {
+    runtime.lastLocKey = currentBvid() + ':' + currentPage();
+    runtime.bootTimer = setInterval(function () {
       var key = currentBvid() + ':' + currentPage();
-      if (key !== lastKey) {
-        lastKey = key;
+      if (key !== runtime.lastLocKey) {
+        runtime.lastLocKey = key;
         rerun();
       }
     }, 1200);
+
+    // 防抖窗口（800ms）里关标签页会丢写，这两处兜一下
+    try { window.addEventListener('pagehide', flushCache); } catch (e) { /* ignore */ }
+    try {
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'hidden') flushCache();
+      });
+    } catch (e) { /* ignore */ }
 
     try { GM_registerMenuCommand('🔍 绑定 / 识别番剧', openBindPanel); } catch (e) { /* ignore */ }
     try { GM_registerMenuCommand('⚙ 番剧跳过设置', openSettings); } catch (e) { /* ignore */ }
@@ -2835,11 +3062,15 @@
       getBinding: getBinding,
       blacklistKeys: blacklistKeys,
       bindingKeys: bindingKeys,
+      setBlacklist: setBlacklist,
       // 调试钩子：便于在控制台排查「为什么没跳」
       _runtime: runtime,
       _checkOnce: checkOnce,
       _startMonitor: startMonitor,
       _stopMonitor: stopMonitor,
+      _skipNow: skipNow,
+      _boot: boot,
+      _flushCache: flushCache,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,
@@ -2857,6 +3088,14 @@
         alignGroupsToSeasons: alignGroupsToSeasons, nameScore: nameScore,
         CHAIN_VERSION: CHAIN_VERSION, isJunkTailPart: isJunkTailPart,
         skipTarget: skipTarget,
+        // 数据层：缓存策略 / 网络失败 / 请求裁剪（排查「为什么没跳」用）
+        applyRelationRules: applyRelationRules, fetchVideoInfo: fetchVideoInfo,
+        trimViewData: trimViewData, fetchSegsFor: fetchSegsFor,
+        ANILIST_REL_Q: ANILIST_REL_Q,
+        _cache: cache, _cacheGet: cacheGet, _cacheSet: cacheSet, _flushCache: flushCache,
+        // 模式策略：off / ask / auto + 置信度门槛
+        shouldAutoSkip: shouldAutoSkip, shouldShowIdentifyToast: shouldShowIdentifyToast,
+        nextSkippableSeg: nextSkippableSeg,
         getConfig: function () { return Object.assign({}, config); }
       }
     };
