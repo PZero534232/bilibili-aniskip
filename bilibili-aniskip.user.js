@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.4.1
+// @version      0.4.2
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -324,13 +324,53 @@
   // 多季连播信号（决定要不要去推季链）
   var MULTI_SEASON_RES = [
     /第\s*[一二三四五六七八九十\d]+\s*[季期部][\s\S]{0,16}?第\s*[一二三四五六七八九十\d]+\s*[季期部]/,
-    /[一二两三四五六七八九十\d]+\s*季\s*(?:连播|合辑|合集|全)/,
-    // 「两季32话全集」这种：季数后面紧跟话数
-    /[一二两三四五六七八九十\d]+\s*季[\s\S]{0,8}?\d{1,3}\s*[话集話]/,
     /[Ss]eason\s*\d\s*[\+＋&和与、]\s*[Ss]?\d?/i,
     /[Ss]\d\s*[\+＋&]\s*[Ss]\d/i,
     /第\s*[一二三四五六七八九十\d]+\s*[-~～至]\s*[一二三四五六七八九十\d]+\s*[季期部]/
   ];
+  /* 「两季32话全集」「三季连播」这类才是"季数"（= 多季）。
+   * 关键在于「季」字前面**不能是「第」** —— 「第三季】全12话」是「第 3 季，共 12 话」，
+   * 是某一季单独投稿，不是多季连播。
+   * 实测 BV1LUTt6fE6K：一部只有第 3 季、共 12 话的稿件被误判成多季连播，
+   * 季链把「合集第 1 话」算成了上一季的第 1 话，绑定整个算错。 */
+  var SEASON_COUNT_RES = [
+    /(?:^|[^第])\s*[一二两三四五六七八九十\d]{1,3}\s*季\s*(?:连播|合辑|合集|全集|全)/,
+    /(?:^|[^第])\s*[一二两三四五六七八九十\d]{1,3}\s*季[\s\S]{0,8}?\d{1,3}\s*[话集話]/
+  ];
+  // 标题里的「第N季」序号。出现 **两个不同的序号** 才是真·多季连播
+  var SEASON_ORD_RE = /第\s*([一二两三四五六七八九十\d]{1,3})\s*[季期部]/g;
+
+  function normalizeOrdinal(raw) {
+    if (/^\d+$/.test(raw)) return parseInt(raw, 10);
+    return CN_NUM[raw] || 0;
+  }
+
+  // 从标题里收集「第N季」的序号（去重、升序）。可能分散在主标题 / 分P标题 / 合集标题里
+  function titleSeasonOrdinals(ctx) {
+    var out = [];
+    [ctx && ctx.mainTitle, ctx && ctx.partTitle, ctx && ctx.seasonTitle, ctx && ctx.seasonEpisodeTitle]
+      .forEach(function (t) {
+        if (!t) return;
+        SEASON_ORD_RE.lastIndex = 0;
+        var m;
+        while ((m = SEASON_ORD_RE.exec(t)) !== null) {
+          var n = normalizeOrdinal(m[1]);
+          if (n >= 1 && n <= 20 && out.indexOf(n) < 0) out.push(n);
+        }
+      });
+    return out.sort(function (a, b) { return a - b; });
+  }
+
+  // 数据库条目自己是第几季：AniList 标题一般写「… 第3期」，第 1 季通常没有标记
+  function entryOrdinal(media, fallback) {
+    var ti = (media && media.title) || {};
+    var t = (ti.native || '') + ' ' + (ti.romaji || '');
+    var m = /第\s*([一二两三四五六七八九十\d]{1,3})\s*[季期部]/.exec(t);
+    if (m) { var n = normalizeOrdinal(m[1]); if (n) return n; }
+    m = /[Ss]eason\s*(\d{1,2})/.exec(t);
+    if (m) return parseInt(m[1], 10);
+    return fallback || 0;
+  }
   // 「全26话」和「32话全集」两种写法都要认
   var TOTAL_EP_RES = [/(?:全|共)\s*(\d{1,3})\s*[话集話]/, /(\d{1,3})\s*[话集話]\s*(?:全集|全季|全)/];
 
@@ -430,11 +470,22 @@
         var m = re.exec(t);
         if (m) { multi = true; if (!hint) hint = m[0]; }
       });
+      SEASON_COUNT_RES.forEach(function (re) {
+        var m = re.exec(t);
+        if (m) { multi = true; if (!hint) hint = m[0].trim(); }
+      });
       TOTAL_EP_RES.forEach(function (re) {
         var em = re.exec(t);
         if (em) total = Math.max(total, parseInt(em[1], 10) || 0);
       });
     });
+
+    // 两个不同的「第N季」= 多季（可能一个在主标题、一个在合集标题里，所以要跨文本收集）
+    var ords = titleSeasonOrdinals(ctx);
+    if (ords.length >= 2) {
+      multi = true;
+      if (!hint) hint = ords.map(function (n) { return '第' + n + '季'; }).join(' + ');
+    }
 
     // 分P标题里的季标记是最硬的证据（比标题里的文字更靠谱）
     var partGroups = seasonGroupsFromParts(ctx);
@@ -442,7 +493,7 @@
       multi = true;
       if (!hint) hint = '分P标题里有第 ' + partGroups[1].season + ' 季标记';
     }
-    return { multi: multi, totalEps: total, hint: hint, partGroups: partGroups };
+    return { multi: multi, totalEps: total, hint: hint, partGroups: partGroups, ords: ords };
   }
 
   /* ==================================================================
@@ -981,6 +1032,11 @@
   }
 
   function pickBestMatch(cands, epNum, ctx) {
+    // 标题点明了「第N季」时按季号纠偏。
+    // 实测 BV1LUTt6fE6K：标题写「第三季」，但「超超超超超喜欢你的100个女朋友」这个基础名
+    // 和第 1 季的条目名一模一样 → 相似度拿满分，不纠偏就会认成第 1 季（时间戳全是错的）。
+    // 只在标题只点名了一季时纠偏；没写季号的条目不奖不罚（无法判断，别乱扣）。
+    var ords = titleSeasonOrdinals(ctx);
     return Promise.resolve(cands.reduce(function (chain, name) {
       return chain.then(function (acc) {
         if (acc && acc.score >= 55) return acc;
@@ -1017,6 +1073,13 @@
 
             // TV / TV 短 形态加分（番剧搬运的原片多数是这个）
             if (m.format === 'TV' || m.format === 'TV_SHORT') score += 6;
+
+            // 标题写明了是第几季 → 季号对得上加分、对不上扣分
+            if (ords.length === 1) {
+              var eo = entryOrdinal(m, 0);
+              if (eo === ords[0]) score += 18;
+              else if (eo > 0) score -= 22;
+            }
 
             // 年年不符扣分（可选：ctx.duration / 上传年份）
             var y = m.startDate && m.startDate.year;
@@ -1186,8 +1249,19 @@
 
   // 组装季链：自身 + 沿 SEQUEL/PREQUEL 展开（最多 3 层，防异常数据无限扩张）
   // 分P标题里带季标记时，以「UP 主自己分的段」为准（更可靠），续季关系只用来取各季 ID
+  /* ==================================================================
+   * 9.1 季链（多季连播合集用）
+   *
+   * CHAIN_VERSION 会一起存进绑定里。老绑定里的季链如果版本对不上，
+   * 说明它是旧算法算出来的（可能算错），识别时会**忽略**它退回单季绑定 ——
+   * 「单独发一季」这类稿件本来就不该有季链，退回单季后反而正确。
+   * 同时也用它给缓存键加后缀，避免读到旧算法留下的错链。
+   * v3：修 expand 漏掉祖父辈（导致绝对集号错位）+ 用标题里的季序号挑选季成员
+   * ================================================================== */
+  var CHAIN_VERSION = 3;
+
   function buildSeasonChain(anilistId, totalEpsFromTitle, ctx, baseName, extraMedia, refTitle) {
-    var ckey = 'chain:' + anilistId + ':' + (totalEpsFromTitle || 0) + ':' + ((ctx && ctx.bvid) || '') + ':' + (baseName || '');
+    var ckey = 'chainv' + CHAIN_VERSION + ':' + anilistId + ':' + (totalEpsFromTitle || 0) + ':' + ((ctx && ctx.bvid) || '') + ':' + (baseName || '');
     var c = cacheGet(ckey, CACHE_TTL.rel);
     if (c !== undefined) return Promise.resolve(c);
 
@@ -1210,23 +1284,25 @@
           .filter(function (n) { return n && n.id; });
       };
 
+      /* 沿 PREQUEL/SEQUEL 把一家子都收进来。
+       * 注意：**不要**在调用前先把 first 标进 seen —— 那样 expand 会认为「都处理过了」
+       * 直接返回，于是只拿到与自己直接相邻的一季，祖父辈永远补不进来。
+       * 实测 BV1LUTt6fE6K（100 个女朋友）：从第 3 期出发只推出「第 2 期 + 第 3 期」，
+       * 缺了第 1 期 → 绝对集号整体错位 12 话 → 合集第 1 话被算成第 2 期第 1 话。 */
       function expand(nodes, depth) {
         if (depth > 3) return Promise.resolve();
-        var todo = nodes.filter(function (n) { return !seen[n.id]; });
+        var todo = (nodes || []).filter(function (n) { return n && n.id && !seen[n.id]; });
         if (!todo.length) return Promise.resolve();
+        todo.forEach(function (n) { seen[n.id] = 1; add(n); });
         return Promise.all(todo.map(function (n) {
-          seen[n.id] = 1;
-          add(n);
           return anilistRelations(n.id).then(function (full) {
             if (full) add(full);
             return expand(kidsOf(full || n), depth + 1);
           });
         })).then(function () {});
       }
-      var first = kidsOf(self).filter(function (n) { return !seen[n.id]; });
-      first.forEach(function (n) { seen[n.id] = 1; add(n); });
 
-      return expand(first, 1).then(function () {
+      return expand(kidsOf(self), 1).then(function () {
         var all = Object.keys(byId).map(function (k) { return byId[k]; })
           .sort(function (a, b) { return (a.year || 9999) - (b.year || 9999) || a.anilistId - b.anilistId; });
         // 续季链顺路会带进剧场版 / 音乐之类的条目 —— 它们不是「季」，
@@ -1263,7 +1339,7 @@
               partial: unresolved.length > 0,
               mismatch: unresolved.length > 0 || !!(totalEpsFromTitle && accp !== totalEpsFromTitle),
               totalEpsFromTitle: totalEpsFromTitle || 0, source: 'parts',
-              groups: segs, unresolved: unresolved.length
+              groups: segs, unresolved: unresolved.length, chainVer: CHAIN_VERSION
             };
             cacheSet(ckey, chainParts);
             return chainParts;
@@ -1271,6 +1347,18 @@
         }
 
         // 路径 B：只能靠续季关系推 —— 话数缺失时用「全N话」反推
+        var ords = titleSeasonOrdinals(ctx);
+        if (ords.length >= 2 && seasons.length > ords.length) {
+          /* 标题写明了是「第二季 + 第三季」这种部分季合集：只留标题里点过名的季。
+           * 否则绝对集号会从家族最早的一季开始数，把没投稿的第 1 季也算进去，
+           * 结果「合集第 1 话」被映射成第 1 季第 1 话（应该是第 2 季第 1 话）。 */
+          var wanted = seasons
+            .map(function (s, i) { return { s: s, ord: entryOrdinal(s, i + 1) }; })
+            .filter(function (x) { return ords.indexOf(x.ord) >= 0; })
+            .map(function (x) { return x.s; });
+          if (wanted.length >= 2) seasons = wanted;
+        }
+
         var unknown = seasons.filter(function (s) { return !s.episodes; });
         if (unknown.length === 1 && totalEpsFromTitle) {
           var known = seasons.reduce(function (a, s) { return a + (s.episodes || 0); }, 0);
@@ -1290,7 +1378,8 @@
           partial: seasons.some(function (s) { return !s.episodes; }),
           mismatch: !!(totalEpsFromTitle && acc && acc !== totalEpsFromTitle),
           totalEpsFromTitle: totalEpsFromTitle || 0,
-          source: 'relations'
+          source: 'relations',
+          chainVer: CHAIN_VERSION
         };
         cacheSet(ckey, chain);
         return chain;
@@ -1548,7 +1637,10 @@
       var chainMiss = false;
 
       // 第 1 优先：季链（「第一季+第二季」装在一个合集里的情况）
-      if (bind.seasonChain && bind.seasonChain.seasons && bind.seasonChain.seasons.length > 1) {
+      // 版本对不上的季链一律不认 —— 那是旧算法算的，可能把季映射错
+      // （实测 BV1LUTt6fE6K：只投了第 3 季的稿件被算出「第 2 期 + 第 3 期」，第 1 话算到第 2 期）
+      if (bind.seasonChain && bind.seasonChain.seasons && bind.seasonChain.seasons.length > 1 &&
+          bind.seasonChain.chainVer === CHAIN_VERSION) {
         var hit = mapBySeasonChain(bind.seasonChain, bindEp.num);
         if (hit && hit.malId) {
           return fetchSegsFor(hit.malId, hit.anilistId, hit.ep).then(function (r) {
@@ -2631,6 +2723,7 @@
         quotedSegments: quotedSegments, progressivePrefixes: progressivePrefixes,
         stripSeasonMarks: stripSeasonMarks, detectMultiSeason: detectMultiSeason,
         seasonGroupsFromParts: seasonGroupsFromParts, partSeasonOf: partSeasonOf,
+        titleSeasonOrdinals: titleSeasonOrdinals, entryOrdinal: entryOrdinal,
         partEpisodeOf: partEpisodeOf, absEpisodeFromPart: absEpisodeFromPart,
         episodeGuess: episodeGuess,
         bgmSearch: bgmSearch, bgmAliases: bgmAliases, bgmResolve: bgmResolve,

@@ -1201,6 +1201,117 @@ function ctxOf(bvid, page) {
     check('P5 没有任何可跳区间', (r5.segments || []).filter(s => s.type === 'op' || s.type === 'ed' || s.type === 'recap'), []);
   }
 
+  /* --- 25. 真实案例：单季投稿被误判成多季连播（BV1LUTt6fE6K） ---
+   * 用户实测：这部稿件「只发了一季」（第 3 季，12 话），
+   *   ① 却弹出了「多季连播 · 季边界」面板
+   *   ② 在候选里选了第 3 期，面板却算成第 2 期
+   * 真实数据（api.bilibili.com + graphql.anilist.co，2026-10-15 抓取）：
+   *   title            = 4K超清【超超超超超喜欢你的100个女朋友 第三季】全12话
+   *   ugc_season.title = 七月新番（41 个视频的杂合合集）
+   *   第1期 162694/MAL 54714（2023，12话）→ 第2期 172258/MAL 57616（2025，12话）→ 第3期 200637/MAL 62811（2026，12话）
+   * 两个独立缺陷：
+   *   ① `N季…N话` 那条多季信号正则没排除「第」——「第三季】全12话」= 第 3 季共 12 话，是单季
+   *   ② buildSeasonChain 里 expand 前先把 first 标进 seen → expand 认为都处理过直接返回，
+   *      祖父辈永远收不进来 → 从第 3 期出发只有「第 2 期 + 第 3 期」→ 绝对集号错位 12 话 */
+  head('25. 真实案例：单季投稿被误判成多季连播（BV1LUTt6fE6K）');
+  {
+    // 真实关系图（注意：AniList 的关系查询不返回 format，所以桩里也不该有 —— 桩要反映现实）
+    const GF = {
+      162694: { id: 162694, idMal: 54714, episodes: 12, startDate: { year: 2023 }, title: { native: '君のことが大大大大大好きな100人の彼女', romaji: 'Kimi no Koto ga Dai Dai Dai Dai Daisuki na 100-nin no Kanojo' },
+        relations: { edges: [{ relationType: 'SEQUEL', node: { id: 172258, idMal: 57616, episodes: 12, startDate: { year: 2025 }, title: { native: '君のことが大大大大大好きな100人の彼女 第2期' } } }] } },
+      172258: { id: 172258, idMal: 57616, episodes: 12, startDate: { year: 2025 }, title: { native: '君のことが大大大大大好きな100人の彼女 第2期', romaji: 'Kimi no Koto ga Dai Dai Dai Dai Daisuki na 100-nin no Kanojo 2nd Season' },
+        relations: { edges: [
+          { relationType: 'ADAPTATION', node: { id: 114416, idMal: 123681, episodes: null, startDate: { year: 2019 }, title: { native: '君のことが大大大大大好きな100人の彼女' } } },
+          { relationType: 'PREQUEL', node: { id: 162694, idMal: 54714, episodes: 12, startDate: { year: 2023 }, title: { native: '君のことが大大大大大好きな100人の彼女' } } },
+          { relationType: 'SEQUEL', node: { id: 200637, idMal: 62811, episodes: 12, startDate: { year: 2026 }, title: { native: '君のことが大大大大大好きな100人の彼女 第3期' } } }] } },
+      200637: { id: 200637, idMal: 62811, episodes: 12, startDate: { year: 2026 }, title: { native: '君のことが大大大大大好きな100人の彼女 第3期', romaji: 'Kimi no Koto ga Dai Dai Dai Dai Daisuki na 100-nin no Kanojo 3rd Season' },
+        relations: { edges: [
+          { relationType: 'ADAPTATION', node: { id: 114416, idMal: 123681, episodes: null, startDate: { year: 2019 }, title: { native: '君のことが大大大大大好きな100人の彼女' } } },
+          { relationType: 'PREQUEL', node: { id: 172258, idMal: 57616, episodes: 12, startDate: { year: 2025 }, title: { native: '君のことが大大大大大好きな100人の彼女 第2期' } } }] } }
+    };
+    const gfNet = () => makeNet({
+      'https://graphql.anilist.co': (req) => {
+        const q = JSON.parse(req.data);
+        if (q.variables && q.variables.id !== undefined) return { data: { Media: GF[q.variables.id] || null } };
+        return { data: { Page: { media: [] } } };
+      }
+    });
+
+    // 稿件：只发第 3 季，12 个分P，分P标题是纯数字（没有季标记）
+    const gfCtx = (opts) => ({
+      bvid: 'BV1LUTt6fE6K', aid: 116000000000001, cid: 9001, page: 1,
+      owner: { mid: 1, name: '搬运' },
+      mainTitle: (opts && opts.title) || '4K超清【超超超超超喜欢你的100个女朋友 第三季】全12话',
+      partTitle: '1', duration: 2038, pubdate: 1783095936, videos: 12,
+      pages: Array.from({ length: 12 }, (_, i) => ({ page: i + 1, part: String(i + 1), duration: 2038, cid: 9001 + i })),
+      season: { id: 9044767, title: '七月新番' }, seasonId: 9044767,
+      // 真实数据：这个 BV 在「七月新番」合集里的单集标题就叫「全12话」
+      seasonTitle: '七月新番', seasonEpisodeTitle: '全12话', incomplete: false
+    });
+
+    const P = makeEnv({ net: gfNet() }).api.api_;
+
+    /* ① 单季投稿不能被当成多季连播 */
+    const ms1 = P.detectMultiSeason(gfCtx());
+    check('单季投稿 multi=false（「第三季】全12话」是第 3 季共 12 话）', ms1.multi, false);
+    check('「全12话」仍被读成总话数', ms1.totalEps, 12);
+    check('标题里的季序号收集到 [3]', P.titleSeasonOrdinals(gfCtx()), [3]);
+
+    /* 反例：真正的多季信号仍然要认出来 */
+    const multiTitle = '【超超超超超喜欢你的100个女朋友 第二季+第三季】全24话';
+    const ms2 = P.detectMultiSeason(gfCtx({ title: multiTitle }));
+    check('「第二季+第三季」仍判为多季', ms2.multi, true);
+    check('多季序号 [2,3]', P.titleSeasonOrdinals(gfCtx({ title: multiTitle })), [2, 3]);
+    check('「两季32话全集」这类季数词仍是多季',
+      P.detectMultiSeason(gfCtx({ title: '想要成为影之实力者 两季32话全集' })).multi, true);
+    check('「第1-3季」区间仍是多季',
+      P.detectMultiSeason(gfCtx({ title: '【无职转生 第1-3季】4K超清未删减完整版' })).multi, true);
+
+    /* ② 季链必须把祖父辈收全（expand 不再被自己的 seen 挡住） */
+    const chainAll = await P.buildSeasonChain(200637, 36, gfCtx(), 'x', [], '君のことが大大大大大好きな100人の彼女 第3期');
+    check('从第 3 期出发能沿 PREQUEL 一路收全三季',
+      chainAll.seasons.map(s => s.malId), [54714, 57616, 62811]);
+    check('三季共 36 话', chainAll.total, 36);
+    check('第 1 话 → 第1期第1话', (h => [h.malId, h.ep])(P.mapBySeasonChain(chainAll, 1)), [54714, 1]);
+    check('第 25 话 → 第3期第1话', (h => [h.malId, h.ep])(P.mapBySeasonChain(chainAll, 25)), [62811, 1]);
+    check('第 13 话 → 第2期第1话', (h => [h.malId, h.ep])(P.mapBySeasonChain(chainAll, 13)), [57616, 1]);
+
+    /* ③ 部分季合集：标题点名了哪几季，绝对集号就从哪一季起算 */
+    const chain23 = await P.buildSeasonChain(200637, 24, gfCtx({ title: multiTitle }), 'x', [], 'x');
+    check('只投了第二季+第三季时，季链只含这两季',
+      chain23.seasons.map(s => s.malId), [57616, 62811]);
+    check('合集第 1 话 → 第2期第1话（不是第1期）', (h => [h.malId, h.ep])(P.mapBySeasonChain(chain23, 1)), [57616, 1]);
+    check('合集第 13 话 → 第3期第1话', (h => [h.malId, h.ep])(P.mapBySeasonChain(chain23, 13)), [62811, 1]);
+
+    /* ④ 端到端：绑第 3 期 + 第 1 话 → 必须取第 3 期的时间戳 */
+    const mkBind = (chain) => ({
+      's:9044767': {
+        anilistId: 200637, malId: 62811, title: '君のことが大大大大大好きな100人の彼女 第3期',
+        episodes: 12, anchorPage: 1, anchorEp: 1, seasonChain: chain, t: Date.now()
+      }
+    });
+    const eNew = makeEnv({ store: { autoDetect: 'off', _bindings: JSON.stringify(mkBind(null)) }, net: gfNet() });
+    const rNew = await eNew.api.identify(gfCtx());
+    check('新绑定（无季链）→ MAL 62811 第 1 话', [rNew.malId, rNew.episode], [62811, 1]);
+
+    // 旧版本算出来的季链（没有 chainVer）必须被忽略，退回单季绑定，而不是继续用错的那条
+    const stale = { seasons: [{ anilistId: 172258, malId: 57616, title: '…第2期', episodes: 12, startAbs: 1, endAbs: 12 },
+                              { anilistId: 200637, malId: 62811, title: '…第3期', episodes: 12, startAbs: 13, endAbs: 24 }],
+                    total: 24, source: 'relations' };
+    const eOld = makeEnv({ store: { autoDetect: 'off', _bindings: JSON.stringify(mkBind(stale)) }, net: gfNet() });
+    const rOld = await eOld.api.identify(gfCtx());
+    check('旧版季链被忽略 → 仍取第 3 期', [rOld.malId, rOld.episode], [62811, 1]);
+
+    // 新版本算出来的季链（chainVer 匹配）才允许覆盖
+    const fresh = Object.assign({}, stale, { chainVer: 3, seasons: [
+      { anilistId: 162694, malId: 54714, title: '…第1期', episodes: 12, startAbs: 1, endAbs: 12 },
+      { anilistId: 172258, malId: 57616, title: '…第2期', episodes: 12, startAbs: 13, endAbs: 24 },
+      { anilistId: 200637, malId: 62811, title: '…第3期', episodes: 12, startAbs: 25, endAbs: 36 }] });
+    const eFresh = makeEnv({ store: { autoDetect: 'off', _bindings: JSON.stringify(mkBind(fresh)) }, net: gfNet() });
+    const rFresh = await eFresh.api.identify(Object.assign(gfCtx(), { page: 1 }));
+    check('新版季链（第 1 话 → 第1期）才被采用', [rFresh.malId, rFresh.episode], [54714, 1]);
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
