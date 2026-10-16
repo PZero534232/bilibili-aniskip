@@ -2445,6 +2445,22 @@
     return !!(usableOp || (localSegs.eds || []).length);
   }
 
+  var frameCanvas = null;
+  /* 抓当前帧 → 8×8 灰度 → aHash。失败（读不到像素 / 没有画面）返回 null。 */
+  function captureFrameHash() {
+    var video = runtime.video || getVideo();
+    if (!video || !video.videoWidth) return null;
+    try {
+      if (!frameCanvas) frameCanvas = document.createElement('canvas');
+      var c = frameCanvas;
+      c.width = 160; c.height = 90;
+      var ctx = c.getContext('2d');
+      ctx.drawImage(video, 0, 0, c.width, c.height);
+      var img = ctx.getImageData(0, 0, c.width, c.height);
+      return aHash(gray8x8(img));
+    } catch (e) { return null; }
+  }
+
   /* ==================================================================
    * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
