@@ -1960,7 +1960,7 @@
         var hit = mapBySeasonChain(bind.seasonChain, bindEp.num);
         if (hit && hit.malId) {
           return fetchSegsFor(hit.malId, hit.anilistId, hit.ep, ctx.duration).then(function (r) {
-            if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: bindEp });
+            if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: bindEp, bindingKey: bind._key });
             var setTitle = hit.group && hit.group.entries && hit.group.entries.length > 1
               ? hit.group.entries.map(function (e) { return e.title; }).join(' + ')
               : (hit.title || bind.title);
@@ -2020,7 +2020,7 @@
       }
 
       return fetchSegsFor(bind.malId, bind.anilistId, bindEp.num, ctx.duration).then(function (r) {
-        if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: bindEp });
+        if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: bindEp, bindingKey: bind._key });
         var reasons = ['手动绑定 · 集号来自 ' + bindEp.from];
         if (chainMiss) reasons.push('第 ' + bindEp.num + ' 话没落在季链范围内，按单季处理');
         return {
@@ -2439,9 +2439,12 @@
     return null;
   }
 
-  /* 本地指纹什么时候参与：已绑定（有 bindingKey）、云端没给段、本地有可用指纹。 */
+  /* 本地指纹什么时候参与：已绑定（有 bindingKey）、云端没给段、本地有可用指纹。
+   * 网络失败（netFailed）也算「云端没给段」——手动绑定的番，云挂了就用本地指纹兜底；
+   * 但自动识别走网络、失败时没有 bindingKey，本来就到不了这里。 */
   function shouldUseLocalSegs(r, localSegs) {
-    if (!r || !r.ok || !r.bindingKey) return false;
+    if (!r || !r.bindingKey) return false;
+    if (!r.ok && !r.netFailed) return false;
     if (r.segments && r.segments.length) return false;
     if (!localSegs) return false;
     var usableOp = (localSegs.ops || []).some(function (o) { return o.end > o.start; });
@@ -2466,7 +2469,7 @@
 
   /* 给定一帧的哈希 + video，走「匹配 → 跳」。从 frameTick 拆出来，方便测试驱动。 */
   function applyFrameHash(hash, video) {
-    if (!runtime.localSegs) return;
+    if (!runtime.localSegs || !runtime.frameMatcher) return;
     var seg = frameStep(runtime.frameMatcher, runtime.localSegs, hash, video.currentTime, video.duration);
     if (seg) performSkip(video, seg);
   }

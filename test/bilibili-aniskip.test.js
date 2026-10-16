@@ -3237,6 +3237,8 @@ function ctxOf(bvid, page) {
       check('本地空 → 不用', shouldUse({ ok: true, bindingKey: 'b:x', segments: [] }, { ops: [], eds: [] }), false);
       check('只有 pending op → 不用', shouldUse({ ok: true, bindingKey: 'b:x', segments: [] }, { ops: [{ hash: 'h', start: 0, end: -1 }], eds: [] }), false);
       check('只有 ED 也够 → 用', shouldUse({ ok: true, bindingKey: 'b:x', segments: [] }, { ops: [], eds: [{ hash: 'e' }] }), true);
+      check('网络失败但已绑定 + 本地有 → 用', shouldUse({ ok: false, netFailed: true, bindingKey: 'b:x' }, good), true);
+      check('网络失败但无绑定 → 不用', shouldUse({ ok: false, netFailed: true, segments: [] }, good), false);
     }
   }
 
@@ -3257,6 +3259,26 @@ function ctxOf(bvid, page) {
       check('第一次命中不跳', Math.round(v.currentTime), 5);
       applyFrameHash('0000', v);          // 第 2 次：认到，跳到 5+90
       check('认到 OP 后跳走', Math.round(v.currentTime), 95);
+    }
+  }
+
+  head('47h. 检测循环：syncFrameMonitor 启停');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const sync = env.api._syncFrameMonitor;
+    const save = hook(env, 'saveLocalSegs');
+    checkTrue('api._syncFrameMonitor 已导出', typeof sync === 'function');
+    if (typeof sync === 'function' && typeof save === 'function') {
+      save('b:x', { ops: [{ hash: 'h', start: 0, end: 90 }], eds: [] });
+      const before = env.intervals.length;
+      sync({ ok: true, bindingKey: 'b:x', segments: [] });
+      check('云端空 + 本地有 → 开抽帧', env.intervals.length, before + 1);
+      check('抽帧间隔 250ms', env.intervals[env.intervals.length - 1].ms, 250);
+      check('localSegs 已挂', !!(env.api._runtime.localSegs && env.api._runtime.localSegs.ops.length), true);
+      const timerId = env.api._runtime.frameTimer;
+      sync({ ok: true, bindingKey: 'b:x', segments: [{ type: 'op' }] });
+      check('云端有段 → 停抽帧', env.cleared.indexOf(timerId) !== -1, true);
+      check('localSegs 清空', env.api._runtime.localSegs, null);
     }
   }
 
