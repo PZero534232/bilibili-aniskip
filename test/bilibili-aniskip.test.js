@@ -3186,6 +3186,42 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('47e. 帧匹配：连续命中 → 产出跳过段');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const frameStep = hook(env, 'frameStep');
+    checkTrue('api_.frameStep 已导出', typeof frameStep === 'function');
+    if (typeof frameStep === 'function') {
+      const segs = { ops: [{ hash: '0000', start: 0, end: 90 }], eds: [{ hash: '1111' }] };
+      const H = '0000';
+      const m = { target: null, hits: 0 };
+      check('第一次命中不跳（未够连续）', frameStep(m, segs, H, 0, 1400), null);
+      check('命中计数 1', m.hits, 1);
+      const seg = frameStep(m, segs, H, 1, 1400);
+      check('连续命中后认到 OP', !!(seg && seg.type === 'op'), true);
+      check('OP 落点 = 检测点 + 时长', seg && seg.end, 91);
+      check('认到后清空目标', m.target, null);
+      // 中途一次不中 → 连续计数归零，重新攒（用长哈希，让 hamming 能 ≥ 阈值）
+      const m2 = { target: null, hits: 0 };
+      const segsLong = { ops: [{ hash: '0000000000000000', start: 0, end: 90 }], eds: [] };
+      frameStep(m2, segsLong, '0000000000000000', 0, 1400);
+      frameStep(m2, segsLong, '1111111111111111', 0, 1400);
+      check('中间一帧不中 → 目标清空', m2.target, null);
+      check('中间一帧不中 → 计数归零', m2.hits, 0);
+      // ED：命中 → 跳到视频结尾（用长哈希，让 OP 与 ED 能靠 hamming 区分开）
+      const m3 = { target: null, hits: 0 };
+      const segsEd = { ops: [{ hash: '0000000000000000', start: 0, end: 90 }], eds: [{ hash: '1111111111111111' }] };
+      frameStep(m3, segsEd, '1111111111111111', 1300, 1400);
+      const edSeg = frameStep(m3, segsEd, '1111111111111111', 1300, 1400);
+      check('认到 ED', !!(edSeg && edSeg.type === 'ed'), true);
+      check('ED 落点 = 时长', edSeg && edSeg.end, 1400);
+      // pending OP（end<start）不参与匹配
+      const segsP = { ops: [{ hash: '0000', start: 0, end: -1 }], eds: [] };
+      const m4 = { target: null, hits: 0 };
+      check('pending OP 不参与匹配', frameStep(m4, segsP, H, 0, 1400), null);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

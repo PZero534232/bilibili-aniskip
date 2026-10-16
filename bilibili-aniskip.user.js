@@ -2399,6 +2399,43 @@
     return out;
   }
 
+  /* 连续命中判定 + 跳过段产出。matcher = { target, hits }，测试直接传对象进来。
+   * 命中 OP：落点 = 检测点 + (end - start)（序幕长度不定也能对）。
+   * 命中 ED：落点 = 视频时长（跳到底）。 */
+  function frameStep(matcher, segs, hash, currentTime, duration) {
+    var cand = matcher.target;
+    if (cand) {
+      if (hamming(hash, cand.hash) < FRAME_THRESHOLD) matcher.hits++;
+      else { matcher.target = null; matcher.hits = 0; }
+    } else {
+      var ops = (segs && segs.ops) || [], eds = (segs && segs.eds) || [], i;
+      for (i = 0; i < ops.length; i++) {
+        var op = ops[i];
+        if (op.end <= op.start) continue;                 // pending，跳过
+        if (hamming(hash, op.hash) < FRAME_THRESHOLD) {
+          matcher.target = { type: 'op', hash: op.hash, start: op.start, end: op.end };
+          matcher.hits = 1; cand = matcher.target; break;
+        }
+      }
+      if (!cand) {
+        for (i = 0; i < eds.length; i++) {
+          if (hamming(hash, eds[i].hash) < FRAME_THRESHOLD) {
+            matcher.target = { type: 'ed', hash: eds[i].hash, start: 0, end: 0 };
+            matcher.hits = 1; cand = matcher.target; break;
+          }
+        }
+      }
+    }
+    if (cand && matcher.hits >= FRAME_CONSECUTIVE) {
+      var seg = cand.type === 'op'
+        ? { type: 'op', start: currentTime, end: currentTime + (cand.end - cand.start) }
+        : { type: 'ed', start: currentTime, end: duration };
+      matcher.target = null; matcher.hits = 0;
+      return seg;
+    }
+    return null;
+  }
+
   /* ==================================================================
    * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
@@ -3817,6 +3854,7 @@
         localSegsKey: localSegsKey, validateLocalSegs: validateLocalSegs,
         loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
         recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
+        frameStep: frameStep,
         getConfig: function () { return Object.assign({}, config); }
       }
     };
