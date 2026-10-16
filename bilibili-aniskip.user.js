@@ -2184,14 +2184,22 @@
     return t;
   }
 
+  /* 去重键：云端段时间戳是稳定的绝对时间，用「类型 + 起点」就够。
+   * 抽帧路径产出的段，起点 = 检测时刻，每认到一次就换一个值 —— 拿它做键等于
+   * 完全没去重，同一帧会被反复认到、连着跳好几次。所以抽帧段必须改用指纹本身做键。 */
+  function skipKeyOf(seg) {
+    return seg.fpKey ? 'fp:' + seg.fpKey : seg.type + ':' + Math.round(seg.start);
+  }
+
   function performSkip(video, seg, force) {
     if (runtime.skipping) return false;
     if (!force && Date.now() - runtime.lastSkipAt < COOLDOWN_MS) return false;
-    if (runtime.skipped[seg.type + ':' + Math.round(seg.start)]) return false;
+    var skey = skipKeyOf(seg);
+    if (runtime.skipped[skey]) return false;
 
     runtime.skipping = true;
     runtime.lastSkipAt = Date.now();
-    runtime.skipped[seg.type + ':' + Math.round(seg.start)] = true;
+    runtime.skipped[skey] = true;
 
     var wasPaused = video.paused;
     var target = skipTarget(video, seg);
@@ -2316,6 +2324,7 @@
   var FRAME_SAMPLE_MS = 250;    // 抽帧间隔
   var FRAME_THRESHOLD = 10;     // Hamming 距离阈值（64 位里差 10 位以内算命中）
   var FRAME_CONSECUTIVE = 2;    // 连续命中几次才算「认到」（防单帧误判）
+  var FRAME_QUIET_MS = 3000;    // 抽帧路径跳完后的静默期，见 applyFrameHash
 
   /* 8×8 灰度（64 个 0-255 亮度值）→ 64 位平均哈希（'0'/'1' 字符串） */
   function aHash(gray) {
@@ -2445,9 +2454,10 @@
     }
     if (cand && matcher.hits >= FRAME_CONSECUTIVE) {
       // OP 一定要有 end；ED 的 end 可选 —— 没标结束时落视频时长（老行为）
+      // fpKey = 命中的指纹，performSkip 拿它做「本集只跳一次」的去重键
       var seg = cand.type === 'op'
-        ? { type: 'op', start: currentTime, end: currentTime + (cand.end - cand.start) }
-        : { type: 'ed', start: currentTime,
+        ? { type: 'op', start: currentTime, end: currentTime + (cand.end - cand.start), fpKey: cand.hash }
+        : { type: 'ed', start: currentTime, fpKey: cand.hash,
             end: (cand.end > cand.start) ? currentTime + (cand.end - cand.start) : duration };
       matcher.target = null; matcher.hits = 0;
       return seg;
@@ -2486,6 +2496,15 @@
   /* 给定一帧的哈希 + video，走「匹配 → 跳」。从 frameTick 拆出来，方便测试驱动。 */
   function applyFrameHash(hash, video) {
     if (!runtime.localSegs || !runtime.frameMatcher) return;
+    /* 刚跳过就先别认帧。落点可能仍落在标记帧附近同一段画面里 —— 相对时长很短、
+     * 或是负的「跳过偏移」把落点推回「起点 + 1 秒」时都会这样；而抽帧周期 250ms
+     * 比冷却 160ms 长，冷却挡不住，于是 500ms 一跳地连跳。
+     * 这是第二道保险；第一道是 performSkip 按指纹去重（同一指纹本集只跳一次）。 */
+    if (Date.now() - runtime.lastSkipAt < FRAME_QUIET_MS) {
+      runtime.frameMatcher.target = null;
+      runtime.frameMatcher.hits = 0;
+      return;
+    }
     var seg = frameStep(runtime.frameMatcher, runtime.localSegs, hash, video.currentTime, video.duration);
     if (seg) performSkip(video, seg);
   }
@@ -2509,8 +2528,17 @@
     runtime.frameMatcher = { target: null, hits: 0 };
   }
 
+  /* 标记（重新）加载 = 重新评估：清掉抽帧路径留下的「已跳指纹」。
+   * 不清的话，改完标记后同一个起始帧还被旧记录挡着不跳。 */
+  function clearFpSkips() {
+    for (var k in runtime.skipped) {
+      if (k.indexOf('fp:') === 0) delete runtime.skipped[k];
+    }
+  }
+
   /* rerun 识别完后调用：云端有段 → 停掉抽帧；云端空且本地有指纹 → 开抽帧。 */
   function syncFrameMonitor(r) {
+    clearFpSkips();
     var key = r && r.bindingKey;
     var segs = key ? loadLocalSegs(key) : null;
     if (shouldUseLocalSegs(r, segs)) {

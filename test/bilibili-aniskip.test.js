@@ -3308,6 +3308,100 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('47i. 抽帧路径：防连跳（同一指纹只跳一次）');
+  {
+    const Z = new Array(65).join('0');          // 64 位全 0：标记帧
+    const O = new Array(65).join('1');          // 与 Z 距离 64 → 一定不命中
+    const Z2 = new Array(64).join('0') + '1';   // 与 Z 距离 1 → 同一帧也算命中
+    const realNow = Date.now;
+
+    /* 驱动抽帧：时钟每次取样 +250ms（= FRAME_SAMPLE_MS）。
+     * 只有 currentTime ∈ [5, windowEnd] 的画面像标记帧，其余帧完全不像。
+     * 关键点：抽帧周期 250ms > 冷却 160ms，所以冷却挡不住连跳。 */
+    const setup = (opts) => {
+      const env = makeEnv({ store: Object.assign({ autoDetect: 'off' }, opts.store || {}) });
+      const apply = hook(env, 'applyFrameHash');
+      const rt = env.api._runtime;
+      let now = 1000000;
+      Date.now = () => (now += 250);
+      const v = { currentTime: 5, duration: 1400, paused: false, ended: false,
+        play() { this.paused = false; }, addEventListener() {} };
+      rt.video = v; rt.result = { ok: true, segments: [] };
+      rt.frameMatcher = { target: null, hits: 0 };
+      rt.lastSkipAt = 0; rt.skipped = {};
+      rt.localSegs = { ops: [{ hash: opts.hash || Z, start: 0, end: opts.opDur }], eds: [] };
+      const feed = (n, windowEnd) => {
+        const seen = [];
+        for (let i = 0; i < n; i++) {
+          const similar = v.currentTime >= 5 && v.currentTime <= windowEnd;
+          apply(similar ? Z : O, v);
+          seen.push(v.currentTime);
+        }
+        return seen;
+      };
+      return {
+        env, rt, v, apply, feed, bump: (ms) => { now += ms; },
+        jumps: (seen) => seen.filter((t, i) => i && t !== seen[i - 1]).length
+      };
+    };
+
+    // 1) 相对时长只有 1 秒（标歪了）：修之前会连跳 5 次
+    {
+      const s = setup({ opDur: 1 });
+      const seen = s.feed(16, 10);
+      check('短标记不再连跳：只跳 1 次', s.jumps(seen), 1);
+      check('短标记落点 = 检测点 + 1s', Math.round(seen[1] * 100) / 100, 6.06);
+      Date.now = realNow;
+    }
+
+    // 2) 相对时长 20 秒 + 跳过偏移 -30（落点被 floor 推回「起点 + 1 秒」）：修之前连跳 6 次
+    {
+      const s = setup({ opDur: 20, store: { skipOffset: -30 } });
+      const seen = s.feed(16, 10);
+      check('负偏移不再连跳：只跳 1 次', s.jumps(seen), 1);
+      Date.now = realNow;
+    }
+
+    // 3) 去重键必须按「指纹」而不是「检测时刻」：隔一分钟同样的画面再出现也不跳
+    {
+      const s = setup({ opDur: 1 });
+      const seen = s.feed(2, 10);
+      check('第一次认到就跳走', Math.round(seen[1] * 100) / 100, 6.06);
+      s.bump(60000);                       // 静默窗口早过了，只剩「指纹去重」在挡
+      s.feed(2, 10);
+      check('同一指纹再次出现不再跳', Math.round(s.v.currentTime * 100) / 100, 6.06);
+      Date.now = realNow;
+    }
+
+    // 4) 静默窗口：刚跳完 3 秒内，连另一个没跳过的指纹也不认
+    {
+      const s = setup({ opDur: 1 });
+      s.feed(2, 10);                       // 先跳一次
+      s.rt.localSegs = { ops: [{ hash: Z2, start: 0, end: 90 }], eds: [] };
+      const held = Math.round(s.v.currentTime * 100) / 100;
+      s.feed(2, 10);                       // 500ms 后：静默窗口内 → 不跳
+      check('静默窗口内不认新指纹', Math.round(s.v.currentTime * 100) / 100, held);
+      s.bump(4000);                        // 窗口过去
+      s.feed(2, 10);
+      check('静默窗口过后才认', s.v.currentTime > held, true);
+      Date.now = realNow;
+    }
+
+    // 5) 标记重新加载 → 指纹去重清掉（改完标记不用重开视频）
+    {
+      const s = setup({ opDur: 1 });
+      const save = hook(s.env, 'saveLocalSegs');
+      save('b:x', { ops: [{ hash: Z, start: 0, end: 1 }], eds: [] });
+      s.feed(2, 10);
+      const first = s.v.currentTime;
+      s.env.api._syncFrameMonitor({ ok: true, bindingKey: 'b:x', segments: [] });
+      s.bump(4000);
+      s.feed(2, 10);
+      check('标记重新加载后指纹可以再跳', s.v.currentTime > first, true);
+      Date.now = realNow;
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
