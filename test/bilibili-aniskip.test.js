@@ -3457,6 +3457,36 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('48c. 工具条 host：全屏挂载点选择');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const ensure = hook(env, '_ensureMarkHost');
+    checkTrue('api._ensureMarkHost 已导出', typeof ensure === 'function');
+    if (typeof ensure === 'function') {
+      const root = ensure();
+      /* 检查的是「挂到了谁下面」：host 自己是 <div>，它的父节点才是 body */
+      check('普通情况挂到 body', root && root.parentNode && root.parentNode.tagName, 'BODY');
+      checkTrue('host 有 shadowRoot', !!(root && root.shadowRoot));
+      check('host 的父节点是 body', root.parentNode, env.body);
+      const before = root._children.length;
+      check('重复调用返回同一个 host', ensure(), root);
+      check('重复调用不会多出子节点', root._children.length, before);
+      /* 桩的 appendChild 不会把节点从旧父节点的 _children 里摘掉（真实 DOM 会），
+       * 所以这里断言 parentNode 而不是「旧父节点里没有了」 */
+      const fsEl = el('div');
+      global.document.fullscreenElement = fsEl;
+      check('真全屏时 host 的父节点换成全屏元素', ensure() && root.parentNode, fsEl);
+      checkTrue('host 出现在全屏元素的子节点里', fsEl._children.indexOf(root) >= 0);
+      global.document.fullscreenElement = null;
+      check('退出全屏挂回 body', ensure() && root.parentNode, env.body);
+      const vid = el('video');
+      global.document.fullscreenElement = vid;
+      check('全屏元素是 video → 退回 body', ensure() && root.parentNode, env.body);
+      global.document.fullscreenElement = null;
+      ensure();
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

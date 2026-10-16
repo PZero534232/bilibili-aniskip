@@ -2139,7 +2139,8 @@
     pillDragged: false,      // 胶囊刚被拖动过：紧跟着的那次 click 不算点击
     frameMatcher: null,      // { target, hits }：抽帧匹配的连续命中状态
     frameTimer: null,        // 抽帧 interval 句柄
-    localSegs: null          // 当前 binding 的本地指纹 { ops, eds }
+    localSegs: null,         // 当前 binding 的本地指纹 { ops, eds }
+    markOn: false            // 是否处于「标记模式」（工具条显示中）
   };
 
   function shouldSkipThisSegment(seg) {
@@ -2650,6 +2651,64 @@
       out.push({ type: 'ed', a: pct(s, dur), b: pct(e, dur) });
     }
     return out;
+  }
+
+  /* ---- 标记工具条：独立 host（不与胶囊共用，见 spec §5） ---- */
+  var MARK_ON_KEY = '_markOn';
+  var MARK_POS_KEY = '_markPos';
+  var markHost = null, markShadow = null, markRoot = null;
+
+  var MARK_BAR_CSS = 'position:absolute;left:16px;bottom:64px;width:300px;pointer-events:auto;' +
+    'background:rgba(20,22,26,.92);color:#fff;border-radius:12px;padding:10px 12px;' +
+    'box-shadow:0 8px 28px rgba(0,0,0,.4);backdrop-filter:blur(6px);' +
+    'font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;';
+
+  var MARK_CSS = [
+    '.mkroot{position:absolute;top:0;left:0;width:100%;height:100%;}',
+    '.mkhead{display:flex;justify-content:space-between;align-items:center;font-weight:600;margin-bottom:8px;}',
+    '.mkclose{cursor:pointer;opacity:.75;padding:0 4px;} .mkclose:hover{opacity:1;}',
+    '.mkbtns{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;}',
+    'button.mkbtn{padding:5px 9px;border-radius:7px;border:1px solid rgba(255,255,255,.22);',
+    '  background:rgba(255,255,255,.08);color:#fff;font-size:12px;cursor:pointer;}',
+    'button.mkbtn:hover{background:rgba(255,255,255,.18);}',
+    'button.mkclr{color:#ff9a9e;border-color:rgba(255,120,120,.35);}',
+    '.mkstat{color:rgba(255,255,255,.72);font-size:12px;line-height:1.6;margin-bottom:6px;word-break:break-all;}',
+    '.mklist{max-height:132px;overflow:auto;margin-bottom:8px;}',
+    '.mkrow{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:12px;}',
+    '.mkrow .mktxt{cursor:pointer;opacity:.9;} .mkrow .mktxt:hover{opacity:1;text-decoration:underline;}',
+    '.mkrow .mkdel{cursor:pointer;opacity:.6;padding:0 4px;} .mkrow .mkdel:hover{opacity:1;color:#ff9a9e;}',
+    '.mkempty,.mkfoot{color:rgba(255,255,255,.55);font-size:12px;}',
+    '.mkfoot{margin-top:2px;}'
+  ].join('');
+
+  /* 工具条该挂在谁下面：真全屏时浏览器只渲染全屏子树，挂在 body 上会看不见。
+   * 但全屏元素是 <video> 时挂不了子节点，只能退回 body —— 用鸭子类型判断，
+   * 不用 instanceof Element（测试桩里没有 Element 构造器）。 */
+  function markHostParent() {
+    var fe = null;
+    try { fe = document.fullscreenElement || null; } catch (e) { fe = null; }
+    if (fe && typeof fe.appendChild === 'function' &&
+        String(fe.tagName || '').toLowerCase() !== 'video') return fe;
+    return document.body || document.documentElement;
+  }
+
+  /* 幂等：host 只建一次，之后每次把位置摆对（全屏进出会换父节点）。返回 host。 */
+  function ensureMarkHost() {
+    if (!markHost) {
+      markHost = document.createElement('div');
+      markHost.id = 'bili-aniskip-mark-host';
+      markHost.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483000;pointer-events:none;';
+      markShadow = markHost.attachShadow({ mode: 'open' });
+      var st = document.createElement('style');
+      st.textContent = MARK_CSS;
+      markShadow.appendChild(st);
+      markRoot = document.createElement('div');
+      markRoot.className = 'mkroot';
+      markShadow.appendChild(markRoot);
+    }
+    var parent = markHostParent();
+    if (markHost.parentNode !== parent) parent.appendChild(markHost);
+    return markHost;
   }
 
   function ensureUI() {
@@ -4100,6 +4159,7 @@
       _applyScreen: applyScreen,
       _syncFrameMonitor: syncFrameMonitor,
       _markEdEnd: markEdEnd,
+      _ensureMarkHost: ensureMarkHost,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,
