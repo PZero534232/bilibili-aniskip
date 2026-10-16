@@ -2622,9 +2622,35 @@
   }
 
   /* ==================================================================
-   * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
+   * 15. UI：状态胶囊 + 标记工具条 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
   var host = null, shadow = null, uiRoot = null, toastRoot = null;
+
+  /* 秒 → 进度条百分比（0~100）。时长非法时一律 0，绝不除零。 */
+  function pct(t, dur) {
+    if (!(dur > 0) || !isFinite(t) || t <= 0) return 0;
+    var v = t / dur * 100;
+    return v > 100 ? 100 : v;
+  }
+
+  /* 本地标记 → 进度条上要画的区间 [{type:'op'|'ed', a:起%, b:终%}]。
+   * · 未标结束的 OP 不画（它本来就不参与匹配）；
+   * · 未标结束的 ED 画到片尾（对应「落视频时长」的语义）。 */
+  function progressMarks(segs, dur) {
+    var out = [];
+    if (!(dur > 0)) return out;
+    var ops = (segs && segs.ops) || [], eds = (segs && segs.eds) || [], i;
+    for (i = 0; i < ops.length; i++) {
+      if (!(ops[i].end > ops[i].start)) continue;
+      out.push({ type: 'op', a: pct(ops[i].start, dur), b: pct(ops[i].end, dur) });
+    }
+    for (i = 0; i < eds.length; i++) {
+      var s = eds[i].start;
+      var e = (eds[i].end > eds[i].start) ? eds[i].end : dur;
+      out.push({ type: 'ed', a: pct(s, dur), b: pct(e, dur) });
+    }
+    return out;
+  }
 
   function ensureUI() {
     if (host) return;
@@ -4108,6 +4134,7 @@
         loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
         recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
         recordEdEnd: recordEdEnd, removeLocalSeg: removeLocalSeg,
+        pct: pct, progressMarks: progressMarks,
         frameStep: frameStep,
         shouldUseLocalSegs: shouldUseLocalSegs,
         applyFrameHash: applyFrameHash,

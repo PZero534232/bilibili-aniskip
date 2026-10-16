@@ -3435,6 +3435,28 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('48b. 进度条标记换算 pct / progressMarks');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const pctF = hook(env, 'pct');
+    const pm = hook(env, 'progressMarks');
+    checkTrue('api_.pct 已导出', typeof pctF === 'function');
+    checkTrue('api_.progressMarks 已导出', typeof pm === 'function');
+    if (typeof pctF === 'function' && typeof pm === 'function') {
+      check('pct 一半', pctF(700, 1400), 50);
+      check('pct 超出时长夹到 100', pctF(2000, 1400), 100);
+      check('pct 负数 → 0', pctF(-5, 1400), 0);
+      check('pct 时长非法 → 0', pctF(10, 0), 0);
+      const ms = pm({ ops: [{ hash: 'a', start: 10, end: 70 }], eds: [{ hash: 'b', start: 1300, end: -1 }] }, 1400);
+      check('两条标记都产出', ms.length, 2);
+      check('op 起点百分比', Math.round(ms[0].a * 100) / 100, 0.71);
+      check('op 终点百分比', Math.round(ms[0].b * 100) / 100, 5);
+      check('ED 未标结束 → 画到片尾', ms[1].b, 100);
+      check('pending 的 OP 不画', pm({ ops: [{ hash: 'p', start: 10, end: -1 }], eds: [] }, 1400).length, 0);
+      check('时长为 0 → 空数组', pm({ ops: [{ hash: 'a', start: 1, end: 2 }], eds: [] }, 0).length, 0);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
