@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.4.6
+// @version      0.4.7
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -391,6 +391,32 @@
     m = /(\d{1,2})\s*(?:st|nd|rd|th)\s*[Ss]eason/.exec(t);
     if (m) return parseInt(m[1], 10);
     return fallback || 0;
+  }
+
+  /* 条目标题里的季序号 —— 专门给「绑定条目 vs 当前分P 是不是同一季」的对拍用。
+   * entryOrdinal 是给「按家族位次对齐」用的，认不出就退回位次（适合排序）；
+   * 这里要的是「认不出就说不知道」，所以不接 fallback、认不出返回 0，调用侧按 0 跳过判断
+   * —— 宁可不跳，也不拿错季的时间戳去跳。
+   * 实测：AniList 用 Ⅱ/Ⅲ 这两个字符（U+2161/U+2162）写无职转生的续季，
+   * 普通「第N季」规则完全认不出来（见用例 37），所以这里单独认罗马数字。 */
+  var ROMAN_SEASON = {
+    'Ⅰ': 1, 'Ⅱ': 2, 'Ⅲ': 3, 'Ⅳ': 4, 'Ⅴ': 5, 'Ⅵ': 6,
+    'Ⅶ': 7, 'Ⅷ': 8, 'Ⅸ': 9, 'Ⅹ': 10, 'Ⅺ': 11, 'Ⅻ': 12
+  };
+  function titleSeasonNo(title) {
+    var t = String(title || '');
+    var m = /第\s*([一二两三四五六七八九十\d]{1,3})\s*[季期部]/.exec(t);
+    if (m) { var n = normalizeOrdinal(m[1]); if (n) return n; }
+    m = /[Ss]eason\s*(\d{1,2})/.exec(t) || /(\d{1,2})\s*(?:st|nd|rd|th)\s*[Ss]eason/.exec(t);
+    if (m) return parseInt(m[1], 10);
+    // 「第2クール」＝同一季的后半，在分P侧也是「第二季」的意思
+    m = /第\s*([一二两三四五六七八九十\d]{1,3})\s*クール/.exec(t);
+    if (m) { n = normalizeOrdinal(m[1]); if (n) return n; }
+    for (var i = 0; i < t.length; i++) {
+      var c = t.charAt(i);
+      if (ROMAN_SEASON[c]) return ROMAN_SEASON[c];
+    }
+    return 0;
   }
   // 「全26话」和「32话全集」两种写法都要认
   var TOTAL_EP_RES = [/(?:全|共)\s*(\d{1,3})\s*[话集話]/, /(\d{1,3})\s*[话集話]\s*(?:全集|全季|全)/];
@@ -1830,6 +1856,28 @@
     return extractEpisode(ctx);
   }
 
+  /* 绑定没有季链时，在后台补算一条并写回 GM。
+   * 为什么需要：0.4.5 及更早「点完没等季链算完就保存」会存下没有季链的绑定，
+   * 而**升级脚本不会改写 GM 里已有的数据** —— 用户报「绑定错误仍未修复」，
+   * 真凶就是那条旧绑定（第一季的 P 去查第二季条目的集号）。
+   * 幂等：同一把键在本次页面生命周期内只算一次，失败也不反复打网络。 */
+  var chainRepairs = {};
+  function repairSeasonChain(ctx, bind, ms) {
+    var key = bind._key || ('b:' + ctx.bvid);
+    if (chainRepairs[key]) return;
+    chainRepairs[key] = 1;
+    buildSeasonChain(bind.anilistId, ms.totalEps, ctx, bind.title, null, bind.title).then(function (chain) {
+      if (!chain || !chain.seasons || chain.seasons.length < 2) { chainRepairs[key] = -1; return; }
+      chain.builtFor = bind.anilistId;
+      chain.baseId = bind.anilistId;
+      // getBinding 返回的是副本，必须写回 bindings[key] 才会落盘
+      var row = bindings[key];
+      if (row) row.seasonChain = chain; else bind.seasonChain = chain;
+      persistBindings();
+      rerun();                        // 立刻用新季链重算一遍，这一轮就跳对
+    }).catch(function () { chainRepairs[key] = -1; });
+  }
+
   function identify(ctx) {
     netErrors = 0;                       // 本次识别周期内累计的网络失败数
     var ms = detectMultiSeason(ctx);
@@ -1850,8 +1898,11 @@
       // 第 1 优先：季链（「第一季+第二季」装在一个合集里的情况）
       // 版本对不上的季链一律不认 —— 那是旧算法算的，可能把季映射错
       // （实测 BV1LUTt6fE6K：只投了第 3 季的稿件被算出「第 2 期 + 第 3 期」，第 1 话算到第 2 期）
-      if (bind.seasonChain && bind.seasonChain.seasons && bind.seasonChain.seasons.length > 1 &&
-          bind.seasonChain.chainVer === CHAIN_VERSION) {
+      var chainUsable = !!(bind.seasonChain && bind.seasonChain.seasons &&
+        bind.seasonChain.seasons.length > 1 && bind.seasonChain.chainVer === CHAIN_VERSION);
+      if (!chainUsable && ms.multi && bind.anilistId) repairSeasonChain(ctx, bind, ms);
+
+      if (chainUsable) {
         var hit = mapBySeasonChain(bind.seasonChain, bindEp.num);
         if (hit && hit.malId) {
           return fetchSegsFor(hit.malId, hit.anilistId, hit.ep, ctx.duration).then(function (r) {
@@ -1891,6 +1942,27 @@
         }
         // 越界、或落在话数未知的季上：不硬猜，退化单季并说明
         chainMiss = true;
+      }
+
+      /* 兜底闸门：没有可用季链时，绑定条目自己是「第几季」必须和当前分P对得上。
+       * 少了这道闸门，一条「第二季、没有季链」的旧绑定会让 P1（第一季第1话）
+       * 直接去查 MAL 51179 第 1 话 —— 第一季用第二季的 OP 跳（用户实测报的
+       * 就是这个）。两边只要有一边认不出季号就不判，只挡「都认得且互相矛盾」。
+       * 后台补链（repairSeasonChain）成功后就不会再走到这里。 */
+      if (!chainUsable && ms && ms.multi) {
+        var partSeasonNo = partSeasonOf(ctx.partTitle || ctx.seasonEpisodeTitle || '');
+        var bindSeasonNo = titleSeasonNo(bind.title);
+        if (partSeasonNo && bindSeasonNo && partSeasonNo !== bindSeasonNo) {
+          return Promise.resolve({
+            ok: false, reason: 'season-mismatch', manual: true, multiSeason: ms, ep: bindEp,
+            seasonChain: null, chainMiss: true,
+            confidence: {
+              score: 0,
+              reasons: ['绑定的「' + bind.title + '」是第 ' + bindSeasonNo + ' 季，' +
+                '但这个分P属于第 ' + partSeasonNo + ' 季：正在补算季链，也可以重新绑定这一季']
+            }
+          });
+        }
       }
 
       return fetchSegsFor(bind.malId, bind.anilistId, bindEp.num, ctx.duration).then(function (r) {
@@ -2194,7 +2266,8 @@
     'button:hover{background:#f5f7fa;}',
     'button.primary{background:#00a1d6;color:#fff;border-color:#00a1d6;} button.primary:hover{background:#0091c2;}',
     'button.danger{color:#e5484d;border-color:#ffd0d1;}',
-    '.cand{max-height:140px;overflow:auto;border:1px solid #eef0f3;border-radius:9px;margin-top:10px;}',
+    '.cand{max-height:215px;overflow:auto;border:1px solid #eef0f3;border-radius:9px;margin-top:10px;}',
+    '.candhint{color:#8a9099;font-size:12px;margin-top:4px;}',
     '.cand-item{padding:8px 11px;border-bottom:1px solid #f4f6f8;cursor:pointer;}',
     '.cand-item:hover{background:#f0fafd;} .cand-item.on{background:#e6f7ff;}',
     '.cand-item .nm{font-weight:600;} .cand-item .meta{color:#8a9099;font-size:12px;}',
@@ -2277,7 +2350,7 @@
     var c = cacheGet(ckey, 6 * 3600000);
     if (c !== undefined) return Promise.resolve(c);
 
-    var seen = {}, out = [];
+    var seen = {}, out = [], directIds = {};
     function addMedia(m, via, bgm) {
       if (!m || !m.id || seen[m.id]) return;
       seen[m.id] = 1;
@@ -2293,7 +2366,10 @@
     var jobs = [];
     queries.forEach(function (qq) {
       jobs.push(anilistSearch(qq).then(function (list) {
-        (list || []).forEach(function (m) { addMedia(m, 'anilist'); });
+        (list || []).forEach(function (m) {
+          if (m && m.id) directIds[m.id] = 1;
+          addMedia(m, 'anilist');
+        });
       }));
       if (hasHan(qq)) {
         jobs.push(bgmResolve(qq).then(function (hit) {
@@ -2305,8 +2381,15 @@
       }
     });
     return Promise.all(jobs).then(function () {
-      // Bangumi 是从中文名精确命中的，排在前面更符合预期
-      out.sort(function (a, b) { return (b.via === 'bangumi' ? 1 : 0) - (a.via === 'bangumi' ? 1 : 0); });
+      /* 直查（用户自己敲的那个词）的结果在前，Bangumi 桥的补充在后。
+       * 老实现反过来把 via:'bangumi' 整体提到最前 —— 中文名经桥解析成哪一季，
+       * 那几季就领跑整个列表，而「默认选中第一条」直接选错季：实测中文名解析到
+       * Ⅰ 时，桥带回来的「第2クール」和「Ⅲ」反而排在直查的 Ⅰ 前面，保存下去
+       * 绑的却是 45576（第2クール）（见用例 38）。
+       * 用 id 集合而不是 via 字段判断，是为了不受「两个请求谁先回来」的影响。 */
+      out.sort(function (a, b) {
+        return (directIds[a.id] ? 0 : 1) - (directIds[b.id] ? 0 : 1);
+      });
       cacheSet(ckey, out);
       return out;
     });
@@ -2317,20 +2400,25 @@
    * 「点第一季」→「再点一次搜索确认一下」→ 选择被悄悄换成搜索排名第一的第二季，
    * 而面板上的季边界三段长得一模一样，用户完全没有察觉的途径
    * （实测 BV1KspF6iELH 就是这么绑错的）。
-   * 规则：用户手动点过的那条还在结果里就保留它；不在（换了关键词）才退回第一条。 */
-  function pickAfterSearch(list, userPickedId) {
-    if (!list || !list.length) return null;
-    var keep = null;
+   * 规则：用户手动点过的那条还在结果里就保留它；不在（换了关键词、或 Bangumi 桥
+   * 把那一次搜索解析到了另一季）也保留他现在的选择 —— 只有他从没点过才退回第一条。
+   * 实测「無職転生Ⅱ …」在 AniList 上只回 2 条，用户选的第一季根本不在结果里，
+   * 老规则「不在就退回第一条」＝把第一季换成第二季。 */
+  function pickAfterSearch(list, userPickedId, current) {
+    var toPick = function (m) {
+      return {
+        id: m.id, idMal: m.idMal, episodes: m.episodes,
+        title: (m.title && (m.title.native || m.title.romaji)) || ''
+      };
+    };
+    if (!list || !list.length) return current || null;     // 搜不到东西也别把选择清掉
     if (userPickedId) {
       for (var i = 0; i < list.length; i++) {
-        if (list[i].id === userPickedId) { keep = list[i]; break; }
+        if (list[i].id === userPickedId) return toPick(list[i]);
       }
+      if (current && current.id === userPickedId) return current;
     }
-    var m = keep || list[0];
-    return {
-      id: m.id, idMal: m.idMal, episodes: m.episodes,
-      title: (m.title && (m.title.native || m.title.romaji)) || ''
-    };
+    return toPick(list[0]);
   }
 
   /* ---- 状态胶囊：所有交互的入口 ---- */
@@ -2363,6 +2451,7 @@
         blacklisted: '已标记「不是番剧」· 不会再跳',
         'no-episode': '没找到集号', 'no-name': '标题无番名',
         'chain-miss': '这一话不跳（OVA／段没对上条目）',
+        'season-mismatch': '绑定的季和这一话对不上',
         // 这三个以前没登记，一律掉进「识别失败」的红点 ——
         // 但「番名没匹配上」「置信度不足」根本不是错误，更不是网络故障
         'no-match': '没匹配到番剧，可点「绑定」',
@@ -2375,9 +2464,9 @@
       parts.push('<span class="dot ' + dotCls + '"></span>' +
         '<span>' + (idleOff ? '番剧跳过 · ' : '') + escapeHtml(why) + '</span>');
       parts.push('<span class="sep"></span><span class="act" data-a="bind">' + (bound ? '改' : '绑定') + '</span>');
-      // 已经拉黑的：给一个「取消标记」出口（老版本只能在胶囊上拉黑，却没有任何入口能取消）
+      // 已经拉黑的：给一个「取消」出口（标记入口在 0.4.7 已按用户要求删掉）
       if (r.reason === 'blacklisted') {
-        parts.push('<span class="sep"></span><span class="act" data-a="unbl">取消标记</span>');
+        parts.push('<span class="sep"></span><span class="act" data-a="unbl">取消</span>');
       }
     } else {
       var segCount = (r.segments || []).filter(segmentEnabled).length;
@@ -2424,8 +2513,9 @@
     onAct('bind', openBindPanel);
     onAct('cfg', openSettings);
     onAct('go', skipNow);
-    /* 「不是番剧」不再放在胶囊上：它是个低频、且误触代价很大的动作（一不小心整条视频
-     * 再也不跳），入口挪进绑定面板，并且做成可来回切换的开关。这里只留「取消标记」。 */
+    /* 「不是番剧」的**标记入口已经整个删掉**（0.4.6 试过挪进绑定面板，用户反馈
+     * 仍然「太突兀」）：它是个低频、误触代价很大的动作（一不小心整条视频再也不跳），
+     * 而价值又低。这里只留「取消」—— 给历史记录（以及调试 API 标记过的）留个出口。 */
     onAct('unbl', function () {
       var c = runtime.ctx;
       var was = clearBlacklist(c);
@@ -2726,6 +2816,7 @@
       '<div class="btns" style="justify-content:flex-start"><button class="search primary">搜索</button>' +
       '<button class="autofill">用标题自动填</button></div>' +
       '<div class="cand"></div>' +
+      '<div class="candhint" hidden></div>' +
       '<div class="willbind" hidden></div>' +
       '<div class="row"><div><div class="lab">当前是第几话</div>' +
       '<div class="tip">填你正在看的这一集在<b>这个合集里</b>的序号。例：合集共 32 话、你在看第 21 个视频，就填 21 —— 多季连播时脚本会自己算出它是第几季第几话。</div></div>' +
@@ -2734,9 +2825,6 @@
       '<div class="row"><div><div class="lab">生效范围</div><div class="tip">这条绑定管到哪儿。搬运番多数是「一个视频装多个分P」，所以默认管全部分P就够</div></div>' +
       '<slot name="scope"></slot></div>' +
       '<div class="chainbox" hidden></div>' +
-      '<div class="row"><div><div class="lab">这个视频不跳（不是番剧）</div>' +
-      '<div class="tip">拉黑后即使绑定过也不会跳。误触了就在这里取消勾选 —— 只在绑定面板里，胶囊上不再放这个按钮。</div></div>' +
-      '<input type="checkbox" class="noanime"></div>' +
       '<div class="btns"><button class="clear danger">清除绑定</button>' +
       '<button class="cancel">取消</button><button class="save primary" disabled>保存</button></div>';
 
@@ -2770,6 +2858,7 @@
     epInput.type = 'number'; epInput.min = '1'; epInput.max = '500'; epInput.value = '1';
 
     var candBox = panel.querySelector('.cand');
+    var candHint = panel.querySelector('.candhint');
     var saveBtn = panel.querySelector('.save');
     var chainBox = panel.querySelector('.chainbox');
     var epMapEl = panel.querySelector('.epmap');
@@ -2883,6 +2972,8 @@
       updateEpMap();
       updateSaveState();
       renderWillBind();
+      // 季链到手 = 整个系列的条目都到手了：补进候选列表（见 mergeChainCands）
+      if (mergeChainCands()) renderCands();
     }
 
     /* 保存按钮能不能点：
@@ -3009,13 +3100,46 @@
       });
     }
 
+    /* 季链里存的是「整个系列」的条目（Ⅰ / 第2クール / Ⅱ / Ⅱ第2クール / Ⅲ …）——
+     * 把它们补进候选列表。中文名直查经常看不到第三季：实测 AniList 对「无职转生」
+     * 只回 3 条（Ⅰ、Ⅱ第2クール、Ⅱ），没有Ⅲ；而这些条目为了算季链本来就拿到了，
+     * 补进候选等于白送（用户抱怨「用无职转生搜索，搜不到第三季」）。
+     * 注意：searchResults 可能是 searchByName 的缓存数组本身，**必须 concat 出新数组** ——
+     * 直接 push 会把补进来的条目污染进 6 小时的搜索缓存里。 */
+    function mergeChainCands() {
+      var ch = chainState.chain;
+      if (!ch || !ch.seasons) return false;
+      var extra = [];
+      ch.seasons.forEach(function (s) {
+        (s.entries || []).forEach(function (e) {
+          if (!e || !e.anilistId) return;
+          if (searchResults.some(function (m) { return m.id === e.anilistId; })) return;
+          if (extra.some(function (m) { return m.id === e.anilistId; })) return;
+          extra.push({
+            id: e.anilistId, idMal: e.malId, episodes: e.episodes, format: e.format || 'TV',
+            title: { native: e.title || '', romaji: '' }, year: e.year || 0,
+            via: 'chain', bgm: null, cn: ''
+          });
+        });
+      });
+      if (!extra.length) return false;
+      searchResults = searchResults.concat(extra);
+      return true;
+    }
+
     function renderCands() {
+      if (mergeChainCands()) { /* 新补进来的条目在下面一起画 */ }
       candBox.innerHTML = '';
       if (!searchResults.length) {
         candBox.innerHTML = '<div class="cand-item"><div class="nm" style="color:#8a9099">没有结果，换个关键词试试</div></div>';
+        candHint.hidden = true;
         updateSaveState();
         return;
       }
+      // 140px 的滚动框里最多露 3 行，第 5 条以后的「第三季」等于藏起来了 —— 报个数
+      candHint.hidden = false;
+      candHint.textContent = '共 ' + searchResults.length + ' 条候选' +
+        (searchResults.length > 3 ? '，框内可上下滚动' : '');
       searchResults.forEach(function (m) {
         var item = document.createElement('div');
         item.className = 'cand-item';
@@ -3024,7 +3148,7 @@
         item.innerHTML = '<div class="nm"></div><div class="meta"></div>';
         item.querySelector('.nm').textContent = titles;
         item.querySelector('.meta').textContent = [
-          m.via === 'bangumi' ? '经 Bangumi 中文库命中' : '',
+          m.via === 'bangumi' ? '经 Bangumi 中文库命中' : (m.via === 'chain' ? '同系列（季链补全）' : ''),
           m.format,
           m.year ? m.year + ' 年' : '',
           m.episodes ? m.episodes + ' 集' : '集数未知',
@@ -3050,9 +3174,11 @@
       candBox.innerHTML = '<div class="cand-item"><div class="nm" style="color:#8a9099">搜索中…</div></div>';
       saveBtn.disabled = true;
       searchByName(q).then(function (list) {
-        searchResults = list || [];
+        // 拷一份：searchByName 可能直接把 6 小时缓存里的数组交出来，
+        // 后面的「季族补全」会往列表里加东西，别把缓存改了
+        searchResults = (list || []).slice();
         // 用户手动点过的那条还在结果里就保留（老实现无条件换成第一条 → 绑错季）
-        if (searchResults.length) picked = pickAfterSearch(searchResults, userPickedId);
+        picked = pickAfterSearch(searchResults, userPickedId, picked);
         renderCands();
         updateSaveState();
         renderWillBind();
@@ -3075,27 +3201,9 @@
       runSearch();
     });
     panel.querySelector('.cancel').addEventListener('click', closePanel);
-    /* 「不是番剧」开关：勾上＝拉黑（固定 BV 粒度），取消勾选＝把 s:/c:/b: 相关记录一起清掉。
-     * 立刻生效、不等「保存」—— 这是「让这个视频别再跳」的紧急出口；
-     * 弹出提示里再给一个「撤销」，双保险。 */
-    var noAnimeBox = panel.querySelector('.noanime');
-    noAnimeBox.checked = isBlacklisted(ctx);
-    noAnimeBox.addEventListener('change', function () {
-      if (noAnimeBox.checked) {
-        setBlacklist(ctx);
-        showToast('已标记「不是番剧」', '这个视频以后不会再触发', function () {
-          clearBlacklist(ctx);
-          runtime.result = null;
-          rerun();
-        });
-      } else {
-        clearBlacklist(ctx);
-        showToast('已取消「不是番剧」', '会照常识别这个视频');
-      }
-      runtime.result = null;
-      stopMonitor();
-      rerun();
-    });
+    /* 「不是番剧」标记入口在 0.4.7 按用户要求**彻底删掉**（胶囊上的按钮、面板里的开关都没了）。
+     * 保留的只有「取消」：已经标记过的视频，胶囊上点一下就能恢复。
+     * setBlacklist/clearBlacklist 仍然留在调试 API 里，历史记录也照旧生效。 */
     panel.querySelector('.clear').addEventListener('click', function () {
       var b = getBinding(ctx);
       if (b && b._key) { delete bindings[b._key]; persistBindings(); }
@@ -3364,6 +3472,7 @@
         candidateMedia: candidateMedia, searchByName: searchByName,
         buildSeasonChain: buildSeasonChain, mapBySeasonChain: mapBySeasonChain,
         chainUsableFor: chainUsableFor, pickAfterSearch: pickAfterSearch,
+        titleSeasonNo: titleSeasonNo,
         alignGroupsToSeasons: alignGroupsToSeasons, nameScore: nameScore,
         CHAIN_VERSION: CHAIN_VERSION, isJunkTailPart: isJunkTailPart,
         skipTarget: skipTarget,

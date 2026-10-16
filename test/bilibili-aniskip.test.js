@@ -2365,17 +2365,29 @@ function ctxOf(bvid, page) {
     check('用户点过第二季时，搜索回来不许换成第一条',
       typeof pickAfter === 'function'
         ? (pickAfter([LZ_II, LZ_I], 108465) || {}).id : 'no-fn', 108465);
-    check('用户点过的那条不在新结果里 → 退回第一条',
+    check('没点过任何候选（没有 current）时，用户点过的 id 不在结果里 → 退回第一条',
       typeof pickAfter === 'function'
         ? (pickAfter([LZ_II, LZ_I], 999999) || {}).id : 'no-fn', 146065);
+    /* 0.4.7：Bangumi 桥可能把中文名解析成「另一季」的日文名，那次搜索的结果里
+     * 根本没有用户选的那条（实测「無職転生Ⅱ …」只回 2 条，没有Ⅰ）。
+     * 老规则「不在结果里就退回第一条」＝把用户明确选的第一季换成第二季。 */
+    check('用户明确选过的那条不在新结果里 → 保留他的选择，不退回首条',
+      typeof pickAfter === 'function'
+        ? (pickAfter([LZ_II, LZ_II2], 108465, { id: 108465, malId: 39535, title: '無職転生 ～異世界行ったら本気だす～' }) || {}).id
+        : 'no-fn', 108465);
+    check('新结果为空时也不清掉用户的选择',
+      typeof pickAfter === 'function'
+        ? (pickAfter([], 108465, { id: 108465 }) || {}).id : 'no-fn', 108465);
   }
 
-  /* --- 35. 「不是番剧」：从胶囊撤掉 → 挪进绑定面板 → 可以取消（v0.4.6） ---
-   * 用户实测的三条抱怨之一：「不是番剧按钮意义不大，且选定后无法取消」。
+  /* --- 35. 「不是番剧」：标记入口彻底删掉，只留「取消」（v0.4.7） ---
+   * 用户实测的三条抱怨之三：「不是番剧按钮太突兀了，删掉吧，在胶囊界面加个取消就好了」。
    * 老实现的问题：① 一个「拉黑」动作摆在日常胶囊上，误触概率高、价值低；
    *              ② 只写 b:{bvid}，而读取侧命中 s:/c:/b: 任意一个就算拉黑 ——
-   *                 老版本写在 s:/c: 上的记录没有任何入口能取消，用户点了「取消」还是不跳。 */
-  head('35. 「不是番剧」：胶囊撤掉 · 面板开关 · 可取消（v0.4.6）');
+   *                 老版本写在 s:/c: 上的记录没有任何入口能取消，用户点了「取消」还是不跳。
+   * 0.4.7 的定案：标记入口（胶囊上的按钮、面板里的开关）全部删掉，
+   * 只在「已经标记过的视频」的胶囊上留一个「取消」，把历史记录清干净。 */
+  head('35. 「不是番剧」：标记入口删掉 · 只留胶囊上的「取消」（v0.4.7）');
   {
     const LOC = { pathname: '/video/BV1TEST00001', search: '?p=1' };
     const e1 = makeEnv({ store: { autoDetect: 'auto' }, location: LOC });
@@ -2384,23 +2396,24 @@ function ctxOf(bvid, page) {
     checkTrue('识别成功后胶囊上有「改」', !!pill.querySelector('[data-a=bind]'));
     check('胶囊上不再有「不是番剧」按钮', pill.querySelector('[data-a=no]'), null);
     check('胶囊文案里也没有「不是番剧」', /不是番剧/.test(pill.textContent), false);
+    check('没被标记时胶囊上没有「取消」', pill.querySelector('[data-a=unbl]'), null);
 
     const panel = openPanelVia(e1, 'bind');
-    // 元素缺失时不崩、造个空壳继续跑完，这样旧代码上能一次看到全部失败
-    const noBox = panel.querySelector('.noanime') || el('input');
-    checkTrue('绑定面板里有「这个视频不跳」开关', !!panel.querySelector('.noanime'));
-    check('默认没勾', noBox.checked, false);
-    noBox.checked = true;
-    noBox.dispatch('change', {});
-    check('勾上 → 立刻按 BV 粒度写黑名单', Object.keys(JSON.parse(e1.store._blacklist || '{}')), ['b:BV1TEST00001']);
+    check('面板里也不再有任何「不是番剧」标记入口', panel.querySelector('.noanime'), null);
+    check('面板里没有「不是番剧」字样', /不是番剧/.test(panel.innerHTML), false);
+    check('面板里也没有 .noanime 这类开关节点', panel.querySelectorAll('.noanime').length, 0);
 
+    /* 拉黑只剩 API 一条路（历史数据的读取侧仍然认 s:/b:/c:），
+     * 但界面上必须给一个「取消」的出口 */
+    e1.api.setBlacklist(e1.api._runtime.ctx);
     await e1.api.rerun();
     const pillB = byClass('pill') || el('div');
     checkTrue('胶囊切成「已标记不是番剧」', /已标记/.test(pillB.textContent), pillB.textContent);
     const unbl = pillB.querySelector('[data-a=unbl]') || el('span');
-    checkTrue('胶囊上给「取消标记」入口', !!pillB.querySelector('[data-a=unbl]'));
+    checkTrue('胶囊上给「取消」入口', !!pillB.querySelector('[data-a=unbl]'));
+    check('「取消」两个字就够（不再写「取消标记」）', (pillB.querySelector('[data-a=unbl]') || { textContent: '' }).textContent, '取消');
     unbl.dispatch('click');
-    check('点「取消标记」→ 黑名单清空', Object.keys(JSON.parse(e1.store._blacklist || '{}')).length, 0);
+    check('点「取消」→ 黑名单清空', Object.keys(JSON.parse(e1.store._blacklist || '{}')).length, 0);
 
     /* 读取侧是「命中 s: / b: / c: 任意一个键就算拉黑」，而历史版本写过不同的键。
      * 取消时三把键都要清 —— 老实现只删 b:，用户「取消了还是不跳」。
@@ -2416,10 +2429,8 @@ function ctxOf(bvid, page) {
     await legacy.api.rerun();
     check('有合集时黑名单键的形态（s:/b:/c:）',
       legacy.api.blacklistKeys({ bvid: 'BVX', seasonId: 9, cid: 8 }), ['s:9', 'b:BVX', 'c:8']);
-    const lBox = openPanelVia(legacy, 'bind').querySelector('.noanime') || el('input');
-    check('已拉黑时开关是勾上的', lBox.checked, true);
-    lBox.checked = false;
-    lBox.dispatch('change', {});
+    checkTrue('历史标记仍在读取侧生效（老记录还能拦住跳转）', /已标记/.test((byClass('pill') || el('div')).textContent));
+    (byClass('pill') || el('div')).querySelector('[data-a=unbl]').dispatch('click');
     check('取消时把 c:/b: 两把键一起清掉', Object.keys(JSON.parse(legacy.store._blacklist || '{}')), []);
   }
 
@@ -2496,6 +2507,256 @@ function ctxOf(bvid, page) {
     check('重置前位置还在', typeof pillPosOf(e2).left, 'number');
     resetBtn.dispatch('click');
     check('重置后位置记录被清掉', e2.store._pillPos, undefined);
+  }
+
+  /* --- 37. 旧版本存下的「没有季链的绑定」：禁止错季跳 + 后台自动补链（v0.4.7） ---
+   * 用户第二次报「绑定错误仍未修复」，并且确认自己跑的就是 0.4.6。
+   * 关键事实：0.4.5 时期写进 GM 的坏绑定，升级脚本本身不会改写它。
+   * 一条「第二季、没有季链」的绑定在多季合集里会被当单季处理 ——
+   * P1（第一季第1话）直接去查 MAL 51179 第 1 话，于是第一季用的是第二季的 OP。 */
+  head('37. 旧绑定没有季链：拒绝错季跳 + 后台自动补链（v0.4.7）');
+  {
+    const tick = async (n) => { for (let i = 0; i < (n || 80); i++) await Promise.resolve(); };
+    const T37 = '【无职转生 第1-3季】4K超清未删减完整版（更至第三季14）';
+    const P37 = [];
+    for (let i = 1; i <= 23; i++) P37.push({ page: i, part: '第一季' + String(i).padStart(2, '0'), duration: 1950, cid: 4000 + i });
+    P37.push({ page: 24, part: '第一季OVA', duration: 1945, cid: 4024 });
+    for (let i = 0; i <= 24; i++) P37.push({ page: 25 + i, part: '第二季' + String(i).padStart(2, '0'), duration: 1950, cid: 4100 + i });
+    for (let i = 1; i <= 14; i++) P37.push({ page: 49 + i, part: '第三季' + String(i).padStart(2, '0'), duration: 1948, cid: 4200 + i });
+    const ctx37 = (page) => ({
+      bvid: 'BV1KspF6iELH', aid: 777, cid: 4000 + page, page: page,
+      owner: { mid: 2, name: '后宫补番' }, mainTitle: T37,
+      partTitle: P37[page - 1].part, duration: P37[page - 1].duration,
+      pubdate: 1791598437, videos: 63, pages: P37, season: null, seasonId: null,
+      seasonTitle: null, seasonEpisodeTitle: '', incomplete: false
+    });
+    const LOC37 = { pathname: '/video/BV1KspF6iELH', search: '?p=1' };
+    const mk = (id, mal, eps, native, year) => ({
+      id, idMal: mal, episodes: eps, format: 'TV', startDate: { year }, synonyms: [],
+      title: { native, romaji: native }
+    });
+    const LZ_I = mk(108465, 39535, 11, '無職転生 ～異世界行ったら本気だす～', 2021);
+    const LZ_I2 = mk(127720, 45576, 12, '無職転生 ～異世界行ったら本気だす～ 第2クール', 2021);
+    const LZ_II = mk(146065, 51179, 13, '無職転生Ⅱ ～異世界行ったら本気だす～', 2023);
+    const LZ_II2 = mk(166873, 55888, 12, '無職転生Ⅱ ～異世界行ったら本気だす～ 第2クール', 2024);
+    const LZ_III = mk(178789, 59193, 14, '無職転生Ⅲ ～異世界行ったら本気だす～', 2026);
+    const FAM = [LZ_I, LZ_I2, LZ_III, LZ_II, LZ_II2];
+    // 真实关系的形状：178789(Ⅲ) 的 PREQUEL 是 166873(Ⅱ第2クール)，反向也连得上
+    const node = (m) => ({ id: m.id, idMal: m.idMal, episodes: m.episodes, format: 'TV', startDate: m.startDate, title: m.title });
+    const edge = (type, m) => ({ relationType: type, node: node(m) });
+    const withRel = (m, edges) => Object.assign({}, node(m), { relations: { edges: edges } });
+    const REL37 = {
+      108465: withRel(LZ_I, [edge('SEQUEL', LZ_I2)]),
+      127720: withRel(LZ_I2, [edge('PREQUEL', LZ_I), edge('SEQUEL', LZ_II)]),
+      146065: withRel(LZ_II, [edge('PREQUEL', LZ_I2), edge('SEQUEL', LZ_II2)]),
+      166873: withRel(LZ_II2, [edge('PREQUEL', LZ_II), edge('SEQUEL', LZ_III)]),
+      178789: withRel(LZ_III, [edge('PREQUEL', LZ_II2)])
+    };
+    const net37 = () => makeNet({
+      'https://graphql.anilist.co': (req) => {
+        const q = JSON.parse(req.data);
+        if (q.variables && q.variables.id !== undefined) return { data: { Media: REL37[q.variables.id] || null } };
+        return { data: { Page: { media: FAM } } };
+      },
+      'https://api.aniskip.com/v2/skip-times': (req) => {
+        const m = /skip-times\/(\d+)\/(\d+)/.exec(req.url);
+        return /^(39535|45576|51179|55888|59193)\//.test(m[1] + '/' + m[2])
+          ? { found: true, results: [{ interval: { startTime: 70, endTime: 160 }, skipType: 'op', episodeLength: 1950 }] }
+          : { found: false, results: [] };
+      }
+    });
+    /* 0.4.5 存下的坏绑定：第二季、没有季链 */
+    const stale = makeEnv({
+      store: {
+        autoDetect: 'off',
+        _bindings: JSON.stringify({
+          'b:BV1KspF6iELH': {
+            anilistId: 146065, malId: 51179, title: '無職転生Ⅱ ～異世界行ったら本気だす～',
+            episodes: 13, anchorPage: 1, anchorEp: 1, seasonChain: null, t: 1
+          }
+        })
+      },
+      net: net37(), location: LOC37
+    });
+    await stale.api.rerun();
+
+    const r1 = await stale.api.identify(ctx37(1));
+    checkTrue('第一季的分P不许用第二季的时间戳跳', !r1.ok,
+      JSON.stringify([r1.malId, r1.episode, r1.reason, r1.title]));
+    check('不跳的理由是「绑定的季和这个分P对不上」', r1.reason, 'season-mismatch');
+
+    await tick(200);
+    const r2 = await stale.api.identify(ctx37(1));
+    check('后台补算季链之后：P1 → Ⅰ 第1话', [r2.malId, r2.episode], [39535, 1]);
+    const r26 = await stale.api.identify(ctx37(26));
+    check('同一合集 P26 → Ⅱ 第1话', [r26.malId, r26.episode], [51179, 1]);
+    const r50 = await stale.api.identify(ctx37(50));
+    check('第三季 P50 → Ⅲ 第1话', [r50.malId, r50.episode], [59193, 1]);
+    const savedStale = JSON.parse(stale.store._bindings || '{}')['b:BV1KspF6iELH'] || {};
+    checkTrue('补算出来的季链写回了 GM 存储（下次开页面就正常）',
+      !!(savedStale.seasonChain && savedStale.seasonChain.seasons && savedStale.seasonChain.seasons.length === 3),
+      savedStale.seasonChain && savedStale.seasonChain.seasons && savedStale.seasonChain.seasons.length);
+
+    /* 季链是「按分P标题的季标记 + 累计话数」对齐的，跟拿哪一条当锚点无关 ——
+     * 这正是自动补链能救回一条「绑错的旧绑定」的原因。 */
+    const chainFromII = await stale.api.api_.buildSeasonChain(
+      146065, 63, ctx37(1), '無職転生Ⅱ ～異世界行ったら本気だす～', null, '無職転生Ⅱ ～異世界行ったら本気だす～');
+    const hitII = chainFromII ? stale.api.api_.mapBySeasonChain(chainFromII, 1) : null;
+    check('拿第二季当锚点算出来的季链，P1 照样落在 Ⅰ',
+      hitII ? [hitII.malId, hitII.ep] : 'no-chain', [39535, 1]);
+
+    /* 绑定第一季、正在看第一季 —— 没有季链也必须照常跳（不能误伤） */
+    const fine = makeEnv({
+      store: {
+        autoDetect: 'off',
+        _bindings: JSON.stringify({
+          'b:BV1KspF6iELH': {
+            anilistId: 108465, malId: 39535, title: '無職転生 ～異世界行ったら本気だす～',
+            episodes: 11, anchorPage: 1, anchorEp: 1, seasonChain: null, t: 1
+          }
+        })
+      },
+      net: net37(), location: LOC37
+    });
+    await fine.api.rerun();
+    const rOk = await fine.api.identify(ctx37(1));
+    check('绑定第一季、正在看第一季第1话 → 照常跳（不许误判成错季）', [rOk.malId, rOk.episode], [39535, 1]);
+
+    /* 纯函数：条目标题里的季序号 */
+    const tsn = stale.api.api_.titleSeasonNo;
+    check('条目标题季号：Ⅲ → 3',
+      typeof tsn === 'function' ? tsn('無職転生Ⅲ ～異世界行ったら本気だす～') : 'no-fn', 3);
+    check('条目标题季号：Ⅱ → 2',
+      typeof tsn === 'function' ? tsn('無職転生Ⅱ ～異世界行ったら本気だす～') : 'no-fn', 2);
+    check('条目标题季号：第2クール → 2',
+      typeof tsn === 'function' ? tsn('無職転生 ～異世界行ったら本気だす～ 第2クール') : 'no-fn', 2);
+    check('条目标题季号：第一季没有标记 → 0（认不出就不判，宁可不跳也不错跳）',
+      typeof tsn === 'function' ? tsn('無職転生 ～異世界行ったら本気だす～') : 'no-fn', 0);
+  }
+
+  /* --- 38. 搜索列表：别让 Bangumi 桥的条目领跑，也别让第三季藏在滚动条下面（v0.4.7） ---
+   * 用户第二条抱怨：「用无职转生搜索，搜不到第三季」。
+   * 实测（2026-10 真实响应）：
+   *   · AniList 直查「无职转生」只回 3 条 —— Ⅰ / Ⅱ第2クール / Ⅱ，**没有Ⅲ**；
+   *   · 而「無職転生 ～異世界行ったら本気だす～」（Ⅰ 的标题）回 7 条，含Ⅲ；
+   *   · 「無職転生Ⅱ ～…～」只回 2 条（Ⅱ 和 Ⅱ第2クール），Ⅰ 都不在里面。
+   * 老实现把 via:'bangumi' 的条目整体排到最前，于是：
+   *   ① 中文名经桥解析成Ⅰ时，桥带回来的 Ⅰ第2クール/Ⅲ… 反而排在直查第一条前面，
+   *      「默认选中第一条」就选中了别的季；② 候选框 max-height:140px，
+   *      Ⅲ 这类第 5 条以后的行要滚动才看得到 —— 用户直接认为「搜不到」。 */
+  head('38. 搜索列表：直查在前 · 季族补全 · 候选条数提示（v0.4.7）');
+  {
+    const tick = async (n) => { for (let i = 0; i < (n || 80); i++) await Promise.resolve(); };
+    const T38 = '【无职转生 第1-3季】4K超清未删减完整版（更至第三季14）';
+    const P38 = [];
+    for (let i = 1; i <= 23; i++) P38.push({ page: i, part: '第一季' + String(i).padStart(2, '0'), duration: 1950, cid: 5000 + i });
+    P38.push({ page: 24, part: '第一季OVA', duration: 1945, cid: 5024 });
+    for (let i = 0; i <= 24; i++) P38.push({ page: 25 + i, part: '第二季' + String(i).padStart(2, '0'), duration: 1950, cid: 5100 + i });
+    for (let i = 1; i <= 14; i++) P38.push({ page: 49 + i, part: '第三季' + String(i).padStart(2, '0'), duration: 1948, cid: 5200 + i });
+    const ctx38 = (page) => ({
+      bvid: 'BV1KspF6iELH', aid: 778, cid: 5000 + page, page: page,
+      owner: { mid: 2, name: '后宫补番' }, mainTitle: T38,
+      partTitle: P38[page - 1].part, duration: P38[page - 1].duration,
+      pubdate: 1791598437, videos: 63, pages: P38, season: null, seasonId: null,
+      seasonTitle: null, seasonEpisodeTitle: '', incomplete: false
+    });
+    const mk = (id, mal, eps, native, year) => ({
+      id, idMal: mal, episodes: eps, format: 'TV', startDate: { year }, synonyms: [],
+      title: { native, romaji: native }
+    });
+    const LZ_I = mk(108465, 39535, 11, '無職転生 ～異世界行ったら本気だす～', 2021);
+    const LZ_I2 = mk(127720, 45576, 12, '無職転生 ～異世界行ったら本気だす～ 第2クール', 2021);
+    const LZ_II = mk(146065, 51179, 13, '無職転生Ⅱ ～異世界行ったら本気だす～', 2023);
+    const LZ_II2 = mk(166873, 55888, 12, '無職転生Ⅱ ～異世界行ったら本気だす～ 第2クール', 2024);
+    const LZ_III = mk(178789, 59193, 14, '無職転生Ⅲ ～異世界行ったら本気だす～', 2026);
+    const node = (m) => ({ id: m.id, idMal: m.idMal, episodes: m.episodes, format: 'TV', startDate: m.startDate, title: m.title });
+    const edge = (type, m) => ({ relationType: type, node: node(m) });
+    const withRel = (m, edges) => Object.assign({}, node(m), { relations: { edges: edges } });
+    const REL38 = {
+      108465: withRel(LZ_I, [edge('SEQUEL', LZ_I2)]),
+      127720: withRel(LZ_I2, [edge('PREQUEL', LZ_I), edge('SEQUEL', LZ_II)]),
+      146065: withRel(LZ_II, [edge('PREQUEL', LZ_I2), edge('SEQUEL', LZ_II2)]),
+      166873: withRel(LZ_II2, [edge('PREQUEL', LZ_II), edge('SEQUEL', LZ_III)]),
+      178789: withRel(LZ_III, [edge('PREQUEL', LZ_II2)])
+    };
+    /* AniList 对几个关键词的真实响应（顺序都是实测的原始顺序）。
+     * 第二个关键词跟第一个不同是刻意的：脚本的搜索结果带 6 小时缓存，
+     * 换一个没搜过的词才不会吃到上一个 env 的缓存。 */
+    const AL_BY_Q = {
+      '无职转生': [LZ_I, LZ_II2, LZ_II],
+      '无职转生 第一季': [LZ_I, LZ_II2, LZ_II],
+      '無職転生 ～異世界行ったら本気だす～': [LZ_I, LZ_I2, LZ_III, LZ_II, LZ_II2],
+      '無職転生Ⅱ ～異世界行ったら本気だす～': [LZ_II, LZ_II2]
+    };
+    const BGM38 = {
+      '无职转生': [{ id: 289094, name: '無職転生 ～異世界行ったら本気だす～', name_cn: '无职转生', date: '2021-01-11', eps: 11, platform: 'TV' }]
+    };
+    const net38 = (bridgeUp) => makeNet({
+      'https://api.bgm.tv/v0/search/subjects': (req) => ({
+        data: bridgeUp ? (BGM38[JSON.parse(req.data).keyword] || []) : []
+      }),
+      'https://graphql.anilist.co': (req) => {
+        const q = JSON.parse(req.data);
+        if (q.variables && q.variables.id !== undefined) return { data: { Media: REL38[q.variables.id] || null } };
+        return { data: { Page: { media: AL_BY_Q[q.variables.q] || [] } } };
+      },
+      'https://api.aniskip.com/v2/skip-times': (req) => {
+        const m = /skip-times\/(\d+)\/(\d+)/.exec(req.url);
+        return /^(39535|45576|51179|55888|59193)\//.test(m[1] + '/' + m[2])
+          ? { found: true, results: [{ interval: { startTime: 70, endTime: 160 }, skipType: 'op', episodeLength: 1950 }] }
+          : { found: false, results: [] };
+      }
+    });
+    const LOC38 = { pathname: '/video/BV1KspF6iELH', search: '?p=1' };
+    const openAndSearch = async (bridgeUp, q) => {
+      const env = makeEnv({ store: { autoDetect: 'off' }, net: net38(bridgeUp), location: LOC38 });
+      await env.api.rerun();
+      const panel = openPanelVia(env, 'bind');
+      const input = orNode(byClass('q'), 'input');
+      input.value = q;
+      orNode(panel.querySelector('.search'), 'button').dispatch('click');
+      return { env, panel, input };
+    };
+    const rowsOf = (panel) => panel.querySelectorAll('.cand-item');
+    const hasRow = (rows, mal) => rows.some((r) => r.textContent.indexOf('MAL ' + mal) >= 0);
+
+    /* ① 桥活着、而且解析到了正确的第一季：直查结果必须领跑 */
+    const up = await openAndSearch(true, '无职转生');
+    await tick(60);
+    const rowsUp = rowsOf(up.panel);
+    checkTrue('候选第一条是用户搜的那个词的直查第一条（Ⅰ）',
+      !!rowsUp[0] && rowsUp[0].textContent.indexOf('AniList 108465') >= 0,
+      rowsUp.map((r) => (r.querySelector('.meta') || { textContent: '' }).textContent).join(' | ').slice(0, 160));
+    checkTrue('桥带回来的条目仍然在（只是不领跑）', hasRow(rowsUp, 45576), rowsUp.length);
+    const hint = up.panel.querySelector('.candhint');
+    checkTrue('候选框给出「共几条」的提示（140px 的滚动框不提示就等于藏起来）',
+      !!(hint && /共\s*\d+\s*条/.test(hint.textContent)), (hint && hint.textContent) || '(没有 .candhint)');
+    await tick(200);
+    orNode(up.panel.querySelector('.save'), 'button').dispatch('click');
+    const savedUp = JSON.parse(up.env.store._bindings || '{}');
+    const bindUp = savedUp[Object.keys(savedUp)[0]] || {};
+    check('不点候选直接保存 → 绑的是第一季（不是被桥领跑的别的季）', bindUp.malId, 39535);
+
+    /* ② 桥挂了（真机上 api.bgm.tv 常常拿不到）：直查只有 3 条、没有Ⅲ，
+     *    季链算完必须把「同系列」的条目补进候选 —— 这才是「搜不到第三季」的解药 */
+    const down = await openAndSearch(false, '无职转生 第一季');
+    await tick(60);
+    /* 这条同时是缓存回归：searchByName 会把结果放进 6 小时缓存，
+     * 面板里的「季族补全」如果直接 push 同一个数组，缓存就被污染了
+     * （实测发现过一次：第二次搜索返回的列表里混进了 via:'chain' 的条目）。 */
+    const rawDown = await down.env.api.api_.searchByName('无职转生 第一季');
+    checkTrue('直查本身只有 3 条（Ⅰ/Ⅱ第2クール/Ⅱ），没被季族补全污染缓存',
+      rawDown.length === 3 && rawDown.every((m) => m.via !== 'chain'), rawDown.map((m) => [m.id, m.via]));
+    check('直查里确实没有第三季 —— 这就是用户说「搜不到第三季」的来源',
+      rawDown.some((m) => m.id === 178789), false);
+    await tick(240);
+    const rowsAfter = rowsOf(down.panel);
+    checkTrue('季链算完后候选里补上了第三季（Ⅲ）', hasRow(rowsAfter, 59193),
+      rowsAfter.map((r) => (r.querySelector('.meta') || { textContent: '' }).textContent).join(' | ').slice(0, 200));
+    checkTrue('第三季是靠「同系列（季链补全）」进来的，不是直查结果',
+      rowsAfter.some((r) => r.textContent.indexOf('MAL 59193') >= 0 && /同系列/.test(r.textContent)),
+      rowsAfter.length + ' 条');
+    checkTrue('候选里也补上了第一季第2クール', hasRow(rowsAfter, 45576), rowsAfter.length);
   }
 
   /* --- 汇总 --- */
