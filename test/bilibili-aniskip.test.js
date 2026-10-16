@@ -3402,6 +3402,27 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('48a. 删掉单条标记 removeLocalSeg');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const rm = hook(env, 'removeLocalSeg');
+    checkTrue('api_.removeLocalSeg 已导出', typeof rm === 'function');
+    if (typeof rm === 'function') {
+      const src = {
+        ops: [{ hash: 'a', start: 0, end: 90 }, { hash: 'b', start: 100, end: 190 }],
+        eds: [{ hash: 'c', start: 1300, end: 1400 }]
+      };
+      const r1 = rm(src, 'ops', 0);
+      check('删 ops 第 0 条后剩 1 条', r1.ops.length, 1);
+      check('剩下的是原来第 1 条', r1.ops[0].hash, 'b');
+      check('入参没被改（返回新对象）', src.ops.length, 2);
+      check('eds 不受影响', r1.eds.length, 1);
+      check('删 eds 越界不动', rm(src, 'eds', 9).eds.length, 1);
+      check('listKey 非法不动', rm(src, 'nope', 0).ops.length, 2);
+      check('空值不抛错', rm(null, 'ops', 0).ops.length, 0);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

@@ -2425,6 +2425,16 @@
     return out;
   }
 
+  /* 删掉指定的那一条（工具条列表里的 ✕）。listKey = 'ops' | 'eds'。
+   * 先过 validateLocalSegs：拿到的永远是干净的副本，不会改到调用方的对象。 */
+  function removeLocalSeg(segs, listKey, index) {
+    var out = validateLocalSegs(segs);
+    var list = out[listKey];
+    if (!list || typeof index !== 'number' || index < 0 || index >= list.length) return out;
+    list.splice(index, 1);
+    return out;
+  }
+
   /* 连续命中判定 + 跳过段产出。matcher = { target, hits }，测试直接传对象进来。
    * 命中 OP：落点 = 检测点 + (end - start)（序幕长度不定也能对）。
    * 命中 ED：标了结束就同上；没标结束（end < start）落视频时长。 */
@@ -4094,7 +4104,7 @@
         localSegsKey: localSegsKey, validateLocalSegs: validateLocalSegs,
         loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
         recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
-        recordEdEnd: recordEdEnd,
+        recordEdEnd: recordEdEnd, removeLocalSeg: removeLocalSeg,
         frameStep: frameStep,
         shouldUseLocalSegs: shouldUseLocalSegs,
         applyFrameHash: applyFrameHash,
