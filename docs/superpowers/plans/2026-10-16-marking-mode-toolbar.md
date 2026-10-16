@@ -259,9 +259,16 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
     const env = makeEnv({ store: { autoDetect: 'off' } });
     const ensure = hook(env, '_ensureMarkHost');
     checkTrue('api._ensureMarkHost 已导出', typeof ensure === 'function');
-    if (typeof ensure === 'function') {
-      const root = ensure();
-      checkTrue('ensure 返回 host 本身（tagName=DIV）', !!root && root.tagName === 'DIV');
+    const root = typeof ensure === 'function' ? ensure() : null;
+    checkTrue('ensure 返回 host 本身（tagName=DIV）', !!root && root.tagName === 'DIV');
+    if (root) {
+      /* host 必须是「铺满视口」的容器：它 0×0 时 .mkroot 的 100% 会解析成 0，
+       * MARK_BAR_CSS 的 bottom:64px 就会把工具条顶到屏幕外 —— 桩没有排版引擎，
+       * 只能这样守住几何前提。 */
+      const hostCss = String(root.style.cssText || '');
+      checkTrue('host 铺满视口（fixed + right/bottom:0）',
+        /position:fixed/.test(hostCss) && /right:0/.test(hostCss) && /bottom:0/.test(hostCss));
+      checkTrue('host 不挡鼠标（pointer-events:none）', /pointer-events:none/.test(hostCss));
       checkTrue('host 的父节点是 body', root.parentNode === env.body);
       checkTrue('host 有 shadowRoot', !!root.shadowRoot);
       const kids = root.shadowRoot ? root.shadowRoot._children.length : -1;
@@ -366,7 +373,7 @@ Expected: 有失败，含 `api._ensureMarkHost 已导出`（未导出）。
     if (!markHost) {
       markHost = document.createElement('div');
       markHost.id = 'bili-aniskip-mark-host';
-      markHost.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483000;pointer-events:none;';
+      markHost.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483000;pointer-events:none;';
       markShadow = markHost.attachShadow({ mode: 'open' });
       var st = document.createElement('style');
       st.textContent = MARK_CSS;
@@ -398,7 +405,7 @@ Expected: 有失败，含 `api._ensureMarkHost 已导出`（未导出）。
 
 Run: `node test/bilibili-aniskip.test.js -q`
 
-Expected: `0 失败`（通过数 ≈ 624；以实际为准）。
+Expected: `0 失败`（通过数 ≈ 626；以实际为准）。
 
 - [ ] **Step 5: 语法检查**
 
@@ -471,6 +478,13 @@ Expected: 有失败，含 `api._markToggle 已导出`（未导出）。
 - [ ] **Step 3: 实现**
 
 在 §15 里 `ensureMarkHost` 之后插入：
+
+**⓪ 先做一件前置事：把 `fmtSec` 提到模块作用域。** 它现在定义在 `openSettings()` 内部（缩进 4 空格的 `function fmtSec(n) {...}`，函数体是 `if (!isFinite(n) || n < 0) return '——'; return Math.round(n * 10) / 10 + 's';`）。工具条在模块作用域要用它，所以：
+
+- 在下面的 `seekTo` **之前**，按原样插入同样函数体的模块级 `fmtSec`（缩进 2 空格），前面加注释 `/* 工具条与设置面板共用的秒数显示 */`；
+- 删掉 `openSettings()` 里那份局部定义（函数体一字不改）。`openSettings` 里剩下的 `refreshMark()` 等调用会自动解析到模块级那份，行为不变。
+
+然后再插入：
 
 ```js
   /* 把秒跳到某个位置（工具条列表点行用）。不改变播放状态。 */
@@ -1155,15 +1169,9 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
 
 - [ ] **Step 2: 删掉对应的 JS**
 
-在同一函数里找到 `/* ---- 本地标记一节：按钮即时生效（不参与「保存」），状态行就地刷新 ---- */` 开始、到 `refreshMark();` 为止的整段（含 `fmtSec` / `refreshMark` / 样式内联 / 4 个按钮绑定 / `mkClrBtn` / 收尾的 `refreshMark();`），**整段删除** —— 但**保留 `fmtSec` 函数本身**（工具条要用），把它挪到该段之外（紧跟 `var resetPosBtn = panel.querySelector('.resetpos'); noFocus(resetPosBtn);` 之后即可）：
+在同一函数里找到 `/* ---- 本地标记一节：按钮即时生效（不参与「保存」），状态行就地刷新 ---- */` 开始、到 `refreshMark();` 为止的整段（含 `refreshMark` / 样式内联 / 4 个按钮绑定 / `mkClrBtn` / 收尾的 `refreshMark();`），**整段删除**。
 
-```js
-    /* 工具条与设置面板共用的秒数显示 */
-    function fmtSec(n) {
-      if (!isFinite(n) || n < 0) return '——';
-      return Math.round(n * 10) / 10 + 's';
-    }
-```
+注意：`fmtSec` 已在 Task 4 提到模块作用域（`openSettings` 里那份局部定义那时就删掉了），所以这里**不用也不能**再动它 —— 删完这段后 `openSettings` 里不应再有 `fmtSec` 的定义。
 
 - [ ] **Step 3: 跑回归确认没删坏**
 
