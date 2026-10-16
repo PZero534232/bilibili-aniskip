@@ -563,7 +563,12 @@ function makeEnv(opts) {
     title: '', documentElement: el('html'),
     createElement: el, body, getElementById: () => null,
     // opts.video：给「真的跑一遍跳过/撤回」的用例准备的假播放器
-    querySelectorAll: (sel) => (sel === 'video' && opts.video) ? [opts.video] : [],
+    // opts.bars：给「进度条标记」用例准备的假进度条容器
+    querySelectorAll: (sel) => {
+      if (sel === 'video' && opts.video) return [opts.video];
+      if (sel === '.bpx-player-progress-wrap') return opts.bars || [];
+      return [];
+    },
     querySelector: (sel) => body.querySelector(sel),
     addEventListener: () => {}, removeEventListener: () => {}
   };
@@ -3639,6 +3644,41 @@ function ctxOf(bvid, page) {
       act.dispatch('click', {});
       check('再点一下退出', env.api._runtime.markOn, false);
       check('退出后状态也落盘', env.store._markOn, false);
+    }
+  }
+
+  head('48g. 进度条标记叠加');
+  {
+    const bar1 = el('div');
+    bar1.className = 'bpx-player-progress-wrap';
+    const env = makeEnv({
+      store: { autoDetect: 'off', _bindings: JSON.stringify({ 'b:BV_TEST000001': { title: 'T', episodes: 28, anchorPage: 1 } }) },
+      bars: [bar1]
+    });
+    env.api._runtime.ctx = ctxOf('BV_TEST000001', 1);
+    env.api._runtime.video = { currentTime: 0, duration: 1400, paused: true, ended: false, play() {}, addEventListener() {} };
+    const hookFn = hook(env, 'saveLocalSegs');
+    const paint = env.api._paintProgressMarks;
+    checkTrue('api._paintProgressMarks 已导出', typeof paint === 'function');
+    if (typeof paint === 'function' && typeof hookFn === 'function') {
+      hookFn('b:BV_TEST000001', { ops: [{ hash: 'a', start: 0, end: 90 }], eds: [] });
+      paint();
+      const layer = bar1.querySelector('[data-aniskip-marks]');
+      check('进度条里插了覆盖层', !!layer, true);
+      check('容器被设为 relative（否则绝对定位会跑偏）', bar1.style.position, 'relative');
+      check('画了 2 个元素（区间条 + 起点刻度）', layer ? layer._children.length : 0, 2);
+      // 内容没变 → 不重复写 DOM
+      const before = layer._children.slice();
+      paint();
+      check('签名没变时不重写 DOM', layer._children[0] === before[0], true);
+      // 清掉标记 → 覆盖层被清空
+      hookFn('b:BV_TEST000001', { ops: [], eds: [] });
+      paint();
+      check('没标记时覆盖层清空', layer._children.length, 0);
+      // 找不到容器也不能抛错
+      env.api._runtime.ctx = null;
+      paint();
+      checkTrue('没绑定时不抛错', true, true);
     }
   }
 

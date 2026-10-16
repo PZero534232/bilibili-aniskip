@@ -2578,7 +2578,7 @@
   function afterMark() {
     syncFrameMonitor(runtime.result);
     if (runtime.markOn && markRoot) refreshMarkBar();
-    // Task 7 打开：paintProgressMarks();
+    paintProgressMarks();
   }
   function hasPendingOp(segs) {
     return (segs.ops || []).some(function (o) { return o.end < 0; });
@@ -2768,7 +2768,7 @@
         node.addEventListener('click', function () {
           fn();
           refreshMarkBar();
-          // Task 7 打开：paintProgressMarks();
+          paintProgressMarks();
         });
       })(mkPairs[mi][0], mkPairs[mi][1]);
     }
@@ -2781,7 +2781,7 @@
         try { GM_deleteValue(localSegsKey(bind._key)); } catch (e) { /* ignore */ }
         syncFrameMonitor(runtime.result);
         refreshMarkBar();
-        // Task 7 打开：paintProgressMarks();
+        paintProgressMarks();
         showToast('清空本番标记', '已删掉这个番的本地指纹');
       });
     }
@@ -2799,7 +2799,7 @@
     attachMarkDrag(bar);
     markRoot.appendChild(bar);
     refreshMarkBar();
-    // Task 7 打开：paintProgressMarks();
+    paintProgressMarks();
   }
 
   /* 状态行 + 列表。只更新这两块，不重建整个工具条。 */
@@ -2866,7 +2866,7 @@
     saveLocalSegs(bind._key, removeLocalSeg(segs, listKey, index));
     syncFrameMonitor(runtime.result);
     refreshMarkBar();
-    // Task 7 打开：paintProgressMarks();
+    paintProgressMarks();
     showToast('已删掉这条标记', (row && row.label ? row.label : '') + ' 第 ' + (index + 1) + ' 条');
   }
 
@@ -2928,6 +2928,57 @@
       markDrag = { bar: bar, moved: false, x: e.clientX || 0, y: e.clientY || 0, l: r.left, t: r.top };
       if (e.preventDefault) e.preventDefault();
     });
+  }
+
+  /* ---- 进度条标记叠加：把本地标记画在 B 站自己的进度条上 ---- */
+
+  /* 把标记画到一个进度条容器上。找不到父容器 / 写不进 DOM 都静默放弃。
+   * 用 dataset 上的签名避免反复无谓重排；换容器（全屏）时新容器没有签名 → 会重画。 */
+  function paintOneBar(bar, marks, sig) {
+    try {
+      var layer = bar.querySelector('[data-aniskip-marks]');
+      if (!layer) {
+        var pos = '';
+        try {
+          var cs = window.getComputedStyle ? window.getComputedStyle(bar) : null;
+          pos = (cs && cs.position) || '';
+        } catch (e0) { pos = ''; }
+        if (pos !== 'relative' && pos !== 'absolute' && pos !== 'fixed') bar.style.position = 'relative';
+        layer = document.createElement('div');
+        layer.setAttribute('data-aniskip-marks', '1');
+        layer.style.cssText = 'position:absolute;top:0;bottom:0;left:0;right:0;pointer-events:none;overflow:hidden;';
+        bar.appendChild(layer);
+      }
+      if (bar.dataset.aniskipSig === sig) return;
+      bar.dataset.aniskipSig = sig;
+      layer.innerHTML = '';
+      for (var i = 0; i < marks.length; i++) {
+        var m = marks[i];
+        var color = m.type === 'op' ? '#00a1d6' : '#ffb648';
+        var span = document.createElement('span');
+        span.style.cssText = 'position:absolute;top:0;bottom:0;left:' + m.a + '%;width:' +
+          Math.max(0, m.b - m.a) + '%;background:' + color + ';opacity:.55;border-radius:2px;';
+        layer.appendChild(span);
+        var tick = document.createElement('span');
+        tick.style.cssText = 'position:absolute;top:0;bottom:0;left:' + m.a + '%;width:2px;background:' + color + ';';
+        layer.appendChild(tick);
+      }
+    } catch (e) { /* 进度条 DOM 变了就放弃这一条，不影响别的功能 */ }
+  }
+
+  /* 在所有能找到的进度条容器上刷新标记。不需要处于标记模式。 */
+  function paintProgressMarks() {
+    var bars = [];
+    try { bars = document.querySelectorAll('.bpx-player-progress-wrap'); } catch (e) { bars = []; }
+    if (!bars || !bars.length) return;
+    var bind = currentBinding();
+    var segs = bind ? loadLocalSegs(bind._key) : null;
+    var v = runtime.video || getVideo();
+    var dur = (v && v.duration) || 0;
+    var marks = progressMarks(segs, dur);
+    var sig = '';
+    for (var i = 0; i < marks.length; i++) sig += marks[i].type + ':' + marks[i].a + '-' + marks[i].b + ';';
+    for (var j = 0; j < bars.length; j++) paintOneBar(bars[j], marks, sig);
   }
 
   function ensureUI() {
@@ -4333,6 +4384,9 @@
         runtime.lastLocKey = key;
         rerun();
       }
+      /* 兜底：B 站会重排控制栏（换清晰度 / 进出全屏），进度条节点会换成新的，
+       * 新的没有签名 → 这里把它补画上。签名没变时不写 DOM。 */
+      paintProgressMarks();
     }, 1200);
 
     // 防抖窗口（800ms）里关标签页会丢写，这两处兜一下
@@ -4392,6 +4446,7 @@
       _ensureMarkHost: ensureMarkHost,
       _markToggle: markToggle, _renderMark: renderMark, _refreshMarkBar: refreshMarkBar,
       _markHost: function () { return markHost; },
+      _paintProgressMarks: paintProgressMarks,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,
