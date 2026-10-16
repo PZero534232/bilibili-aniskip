@@ -3086,6 +3086,31 @@ function ctxOf(bvid, page) {
     checkTrue('普通视频 + 隐藏胶囊 + 收起 → 连圆点都不显示', !(root.querySelector('.pill')));
   }
 
+  /* ==================================================================
+   * 47. 本地手动标记 OP/ED 帧：指纹纯函数
+   * ================================================================== */
+  head('47. 帧指纹：aHash / hamming');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const aHash = hook(env, 'aHash');
+    const hamming = hook(env, 'hamming');
+    checkTrue('api_.aHash 已导出', typeof aHash === 'function');
+    checkTrue('api_.hamming 已导出', typeof hamming === 'function');
+    if (typeof aHash === 'function') {
+      const gray64 = [];
+      for (let i = 0; i < 64; i++) gray64.push(i < 32 ? 0 : 255);
+      const h = aHash(gray64);
+      check('aHash 输出 64 位', h && h.length, 64);
+      check('暗的一半 → 0', h && h.charAt(0), '0');
+      check('亮的一半 → 1', h && h.charAt(63), '1');
+    }
+    if (typeof hamming === 'function') {
+      check('hamming 相同 = 0', hamming('0000', '0000'), 0);
+      check('hamming 全异 = 4', hamming('0000', '1111'), 4);
+      check('hamming 长度不等补差值', hamming('0000', '00'), 2);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

@@ -2308,6 +2308,33 @@
   }
 
   /* ==================================================================
+   * 14.1 本地「手动标记 OP/ED 帧」：指纹 / 匹配 / 检测循环
+   * ================================================================== */
+  var FRAME_SAMPLE_MS = 250;    // 抽帧间隔
+  var FRAME_THRESHOLD = 10;     // Hamming 距离阈值（64 位里差 10 位以内算命中）
+  var FRAME_CONSECUTIVE = 2;    // 连续命中几次才算「认到」（防单帧误判）
+
+  /* 8×8 灰度（64 个 0-255 亮度值）→ 64 位平均哈希（'0'/'1' 字符串） */
+  function aHash(gray) {
+    var n = (gray && gray.length) || 0;
+    var sum = 0, i;
+    for (i = 0; i < n; i++) sum += gray[i];
+    var avg = n ? sum / n : 0;
+    var out = '';
+    for (i = 0; i < n; i++) out += gray[i] >= avg ? '1' : '0';
+    return out;
+  }
+
+  /* 两个等长（或不同长）位串的 Hamming 距离：不同位个数 + 长度差 */
+  function hamming(a, b) {
+    a = String(a || ''); b = String(b || '');
+    var n = Math.min(a.length, b.length);
+    var d = Math.abs(a.length - b.length), i;
+    for (i = 0; i < n; i++) if (a.charAt(i) !== b.charAt(i)) d++;
+    return d;
+  }
+
+  /* ==================================================================
    * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
   var host = null, shadow = null, uiRoot = null, toastRoot = null;
@@ -3720,6 +3747,7 @@
         // 模式策略：off / ask / auto + 置信度门槛
         shouldAutoSkip: shouldAutoSkip, shouldShowIdentifyToast: shouldShowIdentifyToast,
         nextSkippableSeg: nextSkippableSeg,
+        aHash: aHash, hamming: hamming,
         getConfig: function () { return Object.assign({}, config); }
       }
     };
