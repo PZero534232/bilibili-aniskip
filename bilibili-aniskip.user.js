@@ -2711,6 +2711,125 @@
     return markHost;
   }
 
+  /* 工具条与设置面板共用的秒数显示 */
+  function fmtSec(n) {
+    if (!isFinite(n) || n < 0) return '——';
+    return Math.round(n * 10) / 10 + 's';
+  }
+
+  /* 把秒跳到某个位置（工具条列表点行用）。不改变播放状态。 */
+  function seekTo(t) {
+    var v = runtime.video || getVideo();
+    if (!v || !isFinite(t)) return;
+    try { v.currentTime = t; } catch (e) { /* ignore */ }
+  }
+
+  /* 标记模式开关：落盘 + 重画工具条 + 重画胶囊（🎯 高亮态）。 */
+  function markToggle() {
+    runtime.markOn = !runtime.markOn;
+    gmSet(MARK_ON_KEY, runtime.markOn);
+    renderMark();
+    renderPill();
+  }
+
+  /* 画工具条。markOn 为假时清空并隐藏（host 保留，全屏进出还要用）。 */
+  function renderMark() {
+    if (!runtime.markOn) {
+      if (markRoot) { markRoot.innerHTML = ''; markRoot.style.display = 'none'; }
+      return;
+    }
+    ensureMarkHost();
+    markRoot.style.display = '';
+    markRoot.innerHTML = '';
+    var bar = document.createElement('div');
+    bar.className = 'mkbar';
+    bar.style.cssText = MARK_BAR_CSS;
+    bar.innerHTML =
+      '<div class="mkhead"><span>标记 OP / ED</span><button class="mkclose" title="退出标记模式">✕</button></div>' +
+      '<div class="mkbtns">' +
+      '<button class="mkbtn" data-mk="op-s">标 OP 开始</button>' +
+      '<button class="mkbtn" data-mk="op-e">标 OP 结束</button>' +
+      '<button class="mkbtn" data-mk="ed-s">标 ED 开始</button>' +
+      '<button class="mkbtn" data-mk="ed-e">标 ED 结束</button>' +
+      '</div>' +
+      '<div class="mkstat"></div>' +
+      '<div class="mklist"></div>' +
+      '<div class="mkfoot"><button class="mkbtn mkclr" data-mk="clr">清空本番标记</button></div>';
+    var closeBtn = bar.querySelector('.mkclose');
+    if (closeBtn) {
+      noFocus(closeBtn);
+      closeBtn.addEventListener('click', function () {
+        runtime.markOn = false;
+        gmSet(MARK_ON_KEY, false);
+        renderMark();
+        renderPill();
+      });
+    }
+    // Task 6 打开：applyMarkPos(bar); attachMarkDrag(bar);
+    markRoot.appendChild(bar);
+    refreshMarkBar();
+    // Task 7 打开：paintProgressMarks();
+  }
+
+  /* 状态行 + 列表。只更新这两块，不重建整个工具条。 */
+  function refreshMarkBar() {
+    if (!markRoot) return;
+    var stat = markRoot.querySelector('.mkstat');
+    var list = markRoot.querySelector('.mklist');
+    if (!stat || !list) return;
+    var bind = currentBinding();
+    if (!bind) {
+      stat.textContent = '当前：未绑定 —— 先去胶囊点「绑定」';
+      list.textContent = '';
+      return;
+    }
+    var segs = loadLocalSegs(bind._key);
+    var ops = segs.ops || [], eds = segs.eds || [];
+    stat.textContent = '当前：' + (bind.title || bind._key) +
+      '   已标 OP ' + ops.length + ' 套 / ED ' + eds.length + ' 套';
+    list.textContent = '';
+    var rows = [], i;
+    for (i = 0; i < ops.length; i++) rows.push({ listKey: 'ops', i: i, label: 'OP', s: ops[i].start, e: ops[i].end });
+    for (i = 0; i < eds.length; i++) rows.push({ listKey: 'eds', i: i, label: 'ED', s: eds[i].start, e: eds[i].end });
+    if (!rows.length) { list.textContent = '还没标过'; return; }
+    for (i = 0; i < rows.length; i++) list.appendChild(buildMarkRow(rows[i]));
+  }
+
+  /* 一行：`OP  0:12 → 1:42` + 行尾 ✕。点击正文跳过去，点击 ✕ 删这一条。 */
+  function buildMarkRow(row) {
+    var wrap = document.createElement('div');
+    wrap.className = 'mkrow';
+    var txt = document.createElement('span');
+    txt.className = 'mktxt';
+    txt.textContent = row.label + '  ' + fmtSec(row.s) + ' → ' + (row.e > row.s ? fmtSec(row.e) : '——');
+    txt.title = '跳到这个标记点';
+    noFocus(txt);
+    txt.addEventListener('click', function () { seekTo(row.s); });
+    var del = document.createElement('span');
+    del.className = 'mkdel';
+    del.textContent = '✕';
+    del.title = '删掉这一条';
+    noFocus(del);
+    del.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      delLocalSeg(row.listKey, row.i, row.label);
+    });
+    wrap.appendChild(txt);
+    wrap.appendChild(del);
+    return wrap;
+  }
+
+  /* 删单条：落盘 → 重新同步抽帧（顺带清掉已跳指纹）→ 重画工具条与进度条。 */
+  function delLocalSeg(listKey, index, label) {
+    var bind = currentBinding();
+    if (!bind) return;
+    saveLocalSegs(bind._key, removeLocalSeg(loadLocalSegs(bind._key), listKey, index));
+    syncFrameMonitor(runtime.result);
+    renderMark();
+    // Task 7 打开：paintProgressMarks();
+    showToast('已删掉这条标记', label + ' 第 ' + (index + 1) + ' 条');
+  }
+
   function ensureUI() {
     if (host) return;
     host = document.createElement('div');
@@ -3947,10 +4066,6 @@
     panel.querySelector('.mkstat').style.cssText = 'margin:0 0 8px;padding:8px 10px;border-radius:8px;' +
       'background:#f4f7fb;color:#2b3a4a;font-size:12.5px;line-height:1.7;';
 
-    function fmtSec(n) {
-      if (!isFinite(n) || n < 0) return '——';
-      return Math.round(n * 10) / 10 + 's';
-    }
     function refreshMark() {
       var bind = currentBinding();
       if (!bind) {
@@ -4160,6 +4275,8 @@
       _syncFrameMonitor: syncFrameMonitor,
       _markEdEnd: markEdEnd,
       _ensureMarkHost: ensureMarkHost,
+      _markToggle: markToggle, _renderMark: renderMark, _refreshMarkBar: refreshMarkBar,
+      _markHost: function () { return markHost; },
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,

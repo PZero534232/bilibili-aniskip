@@ -3501,6 +3501,40 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('48d. 工具条渲染：标记模式进出 + 结构');
+  {
+    const BIND = { title: '葬送のフリーレン', episodes: 28, anchorPage: 1 };
+    const env = makeEnv({
+      store: { autoDetect: 'off', _bindings: JSON.stringify({ 'b:BV_TEST000001': BIND }) }
+    });
+    const toggle = env.api._markToggle;
+    const save = hook(env, 'saveLocalSegs');
+    checkTrue('api._markToggle 已导出', typeof toggle === 'function');
+    if (typeof toggle === 'function' && typeof save === 'function') {
+      env.api._runtime.ctx = ctxOf('BV_TEST000001', 1);
+      save('b:BV_TEST000001', {
+        ops: [{ hash: 'aaaa', start: 12, end: 102 }],
+        eds: [{ hash: 'bbbb', start: 1300, end: -1 }]
+      });
+      check('初始不在标记模式', env.api._runtime.markOn, false);
+      toggle();
+      check('进入标记模式', env.api._runtime.markOn, true);
+      const host = env.api._markHost ? env.api._markHost() : null;
+      const root = (host && host.shadowRoot) || null;
+      const rootOk = !!(root && root.querySelector('.mkbar'));
+      checkTrue('工具条已画出', rootOk, true);
+      const bar = rootOk ? root.querySelector('.mkbar') : el('div');
+      check('标记按钮至少 4 个（含清空是 5 个）', bar.querySelectorAll('.mkbtn').length >= 4, true);
+      check('状态行显示套数', /已标 OP 1 套 \/ ED 1 套/.test((rootOk ? root.querySelector('.mkstat') : el('div')).textContent), true);
+      check('列表 2 行', rootOk ? root.querySelectorAll('.mkrow').length : -1, 2);
+      check('ED 未标结束显示 ——', /ED.*——/.test((rootOk ? root.querySelector('.mklist') : el('div')).textContent), true);
+      toggle();
+      check('退出标记模式', env.api._runtime.markOn, false);
+      checkTrue('退出后工具条清空', !(rootOk ? root.querySelector('.mkbar') : null));
+      check('标记模式状态落盘', env.store._markOn, false);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
