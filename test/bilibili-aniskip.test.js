@@ -3510,6 +3510,7 @@ function ctxOf(bvid, page) {
     const toggle = env.api._markToggle;
     const save = hook(env, 'saveLocalSegs');
     checkTrue('api._markToggle 已导出', typeof toggle === 'function');
+    checkTrue('api_.saveLocalSegs 已导出', typeof save === 'function');
     if (typeof toggle === 'function' && typeof save === 'function') {
       env.api._runtime.ctx = ctxOf('BV_TEST000001', 1);
       save('b:BV_TEST000001', {
@@ -3525,6 +3526,7 @@ function ctxOf(bvid, page) {
       checkTrue('工具条已画出', rootOk, true);
       const bar = rootOk ? root.querySelector('.mkbar') : el('div');
       check('标记按钮至少 4 个（含清空是 5 个）', bar.querySelectorAll('.mkbtn').length >= 4, true);
+      checkTrue('有「清空本番标记」按钮', !!bar.querySelector('[data-mk=clr]'));
       check('状态行显示套数', /已标 OP 1 套 \/ ED 1 套/.test((rootOk ? root.querySelector('.mkstat') : el('div')).textContent), true);
       check('列表 2 行', rootOk ? root.querySelectorAll('.mkrow').length : -1, 2);
       check('ED 未标结束显示 ——', /ED.*——/.test((rootOk ? root.querySelector('.mklist') : el('div')).textContent), true);
@@ -3532,6 +3534,49 @@ function ctxOf(bvid, page) {
       check('退出标记模式', env.api._runtime.markOn, false);
       checkTrue('退出后工具条清空', !(rootOk ? root.querySelector('.mkbar') : null));
       check('标记模式状态落盘', env.store._markOn, false);
+    }
+  }
+
+  head('48d2. 工具条点 ✕ 删单条（含过期节点防护）');
+  {
+    const env = makeEnv({
+      store: { autoDetect: 'off', _bindings: JSON.stringify({ 'b:BV_TEST000001': { title: 'T', episodes: 28, anchorPage: 1 } }) }
+    });
+    env.api._runtime.ctx = ctxOf('BV_TEST000001', 1);
+    const save = hook(env, 'saveLocalSegs');
+    const toastN = () => CREATED.filter((n) => String(n._attrs.class || '').split(/\s+/).indexOf('toast') >= 0).length;
+    /* 存的值可能是对象也可能是字符串（真机上 GM_setValue 自己序列化，harness 里是裸对象） */
+    const opsOf = () => {
+      const v = env.store['aniskip.localSegs.b:BV_TEST000001'];
+      const segs = !v ? {} : (typeof v === 'string' ? JSON.parse(v) : v);
+      return segs.ops || [];
+    };
+    const toggle = env.api._markToggle;
+    checkTrue('api._markToggle 已导出', typeof toggle === 'function');
+    checkTrue('api_.saveLocalSegs 已导出', typeof save === 'function');
+    if (typeof toggle === 'function' && typeof save === 'function') {
+      save('b:BV_TEST000001', {
+        ops: [{ hash: 'h1', start: 10, end: 90 }, { hash: 'h2', start: 100, end: 190 }],
+        eds: []
+      });
+      toggle();
+      const root = env.api._markHost().shadowRoot;
+      const rows = root.querySelectorAll('.mkrow');
+      check('两行标记', rows.length, 2);
+      const staleDel = rows[0].querySelector('.mkdel');
+      const t0 = toastN();
+      staleDel.click();
+      check('点 ✕ 删掉一条', opsOf().length, 1);
+      check('删掉的是第一行那条', opsOf()[0].hash, 'h2');
+      check('列表就地刷新为 1 行', root.querySelectorAll('.mkrow').length, 1);
+      checkTrue('正常删除会提示', toastN() > t0);
+      /* 列表已重画，这个 ✕ 节点已经过期：索引仍指向第 0 条，但那里的标记已经换成 h2。
+       * 必须什么都不做 —— 既不误删别的标记，也不假报「已删掉」。 */
+      const t1 = toastN();
+      staleDel.click();
+      check('过期 ✕ 不误删别的标记', opsOf().length, 1);
+      check('过期 ✕ 不误报成功', toastN(), t1);
+      toggle();
     }
   }
 

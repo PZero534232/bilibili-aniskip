@@ -2789,8 +2789,8 @@
       '   已标 OP ' + ops.length + ' 套 / ED ' + eds.length + ' 套';
     list.textContent = '';
     var rows = [], i;
-    for (i = 0; i < ops.length; i++) rows.push({ listKey: 'ops', i: i, label: 'OP', s: ops[i].start, e: ops[i].end });
-    for (i = 0; i < eds.length; i++) rows.push({ listKey: 'eds', i: i, label: 'ED', s: eds[i].start, e: eds[i].end });
+    for (i = 0; i < ops.length; i++) rows.push({ listKey: 'ops', i: i, label: 'OP', hash: ops[i].hash, s: ops[i].start, e: ops[i].end });
+    for (i = 0; i < eds.length; i++) rows.push({ listKey: 'eds', i: i, label: 'ED', hash: eds[i].hash, s: eds[i].start, e: eds[i].end });
     if (!rows.length) { list.textContent = '还没标过'; return; }
     for (i = 0; i < rows.length; i++) list.appendChild(buildMarkRow(rows[i]));
   }
@@ -2812,22 +2812,31 @@
     noFocus(del);
     del.addEventListener('click', function (ev) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
-      delLocalSeg(row.listKey, row.i, row.label);
+      delLocalSeg(row.listKey, row.i, row);
     });
     wrap.appendChild(txt);
     wrap.appendChild(del);
     return wrap;
   }
 
-  /* 删单条：落盘 → 重新同步抽帧（顺带清掉已跳指纹）→ 重画工具条与进度条。 */
-  function delLocalSeg(listKey, index, label) {
+  /* 删单条：落盘 → 重新同步抽帧（顺带清掉已跳指纹）→ 就地刷新列表与进度条。
+   * 用指纹核对目标：列表可能已经重画过，光靠 index 会删到别的标记上。
+   * 对不上就什么都不做 —— 不误删，也不假报成功。
+   * 只用 refreshMarkBar 局部刷新，不整树重建，免得列表滚动位置被顶回顶部。 */
+  function delLocalSeg(listKey, index, row) {
     var bind = currentBinding();
     if (!bind) return;
-    saveLocalSegs(bind._key, removeLocalSeg(loadLocalSegs(bind._key), listKey, index));
+    var segs = loadLocalSegs(bind._key);
+    var list = segs[listKey] || [];
+    var cur = list[index];
+    if (!cur) return;
+    if (row && row.hash && cur.hash !== row.hash) return;
+    if (row && isFinite(row.s) && cur.start !== row.s) return;
+    saveLocalSegs(bind._key, removeLocalSeg(segs, listKey, index));
     syncFrameMonitor(runtime.result);
-    renderMark();
+    refreshMarkBar();
     // Task 7 打开：paintProgressMarks();
-    showToast('已删掉这条标记', label + ' 第 ' + (index + 1) + ' 条');
+    showToast('已删掉这条标记', (row && row.label ? row.label : '') + ' 第 ' + (index + 1) + ' 条');
   }
 
   function ensureUI() {
