@@ -1254,3 +1254,64 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
 - **占位符扫描**：无 TBD/TODO；每个改代码的步骤都给了完整代码与锚点。
 - **命名一致性**：`removeLocalSeg(segs, listKey, index)` / `pct(t, dur)` / `progressMarks(segs, dur)` / `ensureMarkHost()` / `markHostParent()` / `renderMark()` / `refreshMarkBar()` / `buildMarkRow(row)` / `delLocalSeg(listKey, index, label)` / `seekTo(t)` / `paintOneBar(bar, marks, sig)` / `paintProgressMarks()` / `markToggle()` / `applyMarkPos(bar)` / `attachMarkDrag(bar)` / `MARK_ON_KEY='_markOn'` / `MARK_POS_KEY='_markPos'` —— 全计划与 spec 一致。
 - **已知取舍**：Task 4/5/6 里对 `applyMarkPos`/`attachMarkDrag`/`paintProgressMarks` 的调用用注释分步打开，是为让每个任务都能独立跑绿；Task 6 与 Task 7 分别明确写出「把注释打开」的替换动作。
+
+---
+
+## 附录：实施期对计划的修正（**与正文冲突时以本附录为准**）
+
+计划正文写于实施之前。下面这些点在实施/审查中被证明有问题并已修正：
+
+### A1. `ensureMarkHost` 的 host 必须铺满视口（Task 3）
+`width:0;height:0` 会让 `.mkroot` 的 `width/height:100%` 解析成 0，`MARK_BAR_CSS` 的 `bottom:64px` 于是把工具条顶到屏幕外（只有拖过一次、存下 `_markPos` 之后才看得见）。已改为：
+
+```js
+      markHost.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483000;pointer-events:none;';
+```
+
+### A2. 48c 的断言必须用恒等比较（Task 3）
+`check()` 走 `brief()` 字符串化，两个裸 `<div>` 都是 `"<div>"` —— 凡是「同一个对象」「没多挂一次」这类断言必须用 `checkTrue`，否则永远通过。48c 已定型为 **14** 条断言，并加了两条 host 几何断言（`position:fixed` + `right:0`/`bottom:0`、`pointer-events:none`）。
+
+### A3. `fmtSec` 必须先提到模块作用域（Task 4 前面）
+它原先定义在 `openSettings()` 内部，工具条在模块作用域调用会 ReferenceError。Task 4 已把模块级副本插在 `seekTo` 之前、并删掉 `openSettings` 里那份局部定义（函数体一字未改）。
+
+### A4. 删单条要按指纹核对目标，并且只局部刷新列表（Task 4）
+`delLocalSeg` 定型为（**替换**正文 Task 4 里的同名函数）：
+
+```js
+  /* 删单条：落盘 → 重新同步抽帧（顺带清掉已跳指纹）→ 就地刷新列表与进度条。
+   * 用指纹核对目标：列表可能已经重画过，光靠 index 会删到别的标记上。
+   * 对不上就什么都不做 —— 不误删，也不假报成功。
+   * 只用 refreshMarkBar 局部刷新，不整树重建，免得列表滚动位置被顶回顶部。 */
+  function delLocalSeg(listKey, index, row) {
+    var bind = currentBinding();
+    if (!bind) return;
+    var segs = loadLocalSegs(bind._key);
+    var list = segs[listKey] || [];
+    var cur = list[index];
+    if (!cur) return;
+    if (row && row.hash && cur.hash !== row.hash) return;
+    if (row && isFinite(row.s) && cur.start !== row.s) return;
+    saveLocalSegs(bind._key, removeLocalSeg(segs, listKey, index));
+    syncFrameMonitor(runtime.result);
+    refreshMarkBar();
+    // Task 7 打开：paintProgressMarks();
+    showToast('已删掉这条标记', (row && row.label ? row.label : '') + ' 第 ' + (index + 1) + ' 条');
+  }
+```
+
+配套：`refreshMarkBar` 的 `rows.push` 要带上 `hash: ops[i].hash` / `hash: eds[i].hash`；`buildMarkRow` 里改成 `delLocalSeg(row.listKey, row.i, row);`。
+
+### A5. 测试读 GM 存储要兼容「裸对象」（Task 4 起）
+harness 的 `GM_setValue` 直接把对象塞进 `store`（真机由油猴自己序列化），所以 `JSON.parse(env.store['aniskip.localSegs.xxx'])` 会因 `"[object Object]"` 直接崩掉整个用例文件。统一用：
+
+```js
+    const segsOf = () => {
+      const v = env.store['aniskip.localSegs.b:BV_TEST000001'];
+      return !v ? {} : (typeof v === 'string' ? JSON.parse(v) : v);
+    };
+```
+
+正文 Task 5 的 `48e` 里三处 `JSON.parse(env.store[...])` 都按这个改（其余不变），并且 `opsOf()[0].end` 要写成 `opsOf().length ? opsOf()[0].end : -1`，免得未实现时抛异常把整个用例文件带崩。
+
+### A6. 断言条数（以实际为准）
+600（Task 1b 后）→ Task 2 +12 = 612 → Task 3/3b/3c 合计 +14 = 626 → Task 4 +11 = 637 → Task 4b +11 = 648。后续照此累加，**硬要求始终是 0 失败**。
