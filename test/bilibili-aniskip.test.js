@@ -3462,9 +3462,16 @@ function ctxOf(bvid, page) {
     const env = makeEnv({ store: { autoDetect: 'off' } });
     const ensure = hook(env, '_ensureMarkHost');
     checkTrue('api._ensureMarkHost 已导出', typeof ensure === 'function');
-    if (typeof ensure === 'function') {
-      const root = ensure();
-      checkTrue('ensure 返回 host 本身（tagName=DIV）', !!root && root.tagName === 'DIV');
+    const root = typeof ensure === 'function' ? ensure() : null;
+    checkTrue('ensure 返回 host 本身（tagName=DIV）', !!root && root.tagName === 'DIV');
+    if (root) {
+      /* host 必须是「铺满视口」的容器：它 0×0 时 .mkroot 的 100% 会解析成 0，
+       * MARK_BAR_CSS 的 bottom:64px 就会把工具条顶到屏幕外 —— 桩没有排版引擎，
+       * 只能这样守住几何前提。 */
+      const hostCss = String(root.style.cssText || '');
+      checkTrue('host 铺满视口（fixed + right/bottom:0）',
+        /position:fixed/.test(hostCss) && /right:0/.test(hostCss) && /bottom:0/.test(hostCss));
+      checkTrue('host 不挡鼠标（pointer-events:none）', /pointer-events:none/.test(hostCss));
       checkTrue('host 的父节点是 body', root.parentNode === env.body);
       checkTrue('host 有 shadowRoot', !!root.shadowRoot);
       const kids = root.shadowRoot ? root.shadowRoot._children.length : -1;

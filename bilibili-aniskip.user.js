@@ -2697,7 +2697,7 @@
     if (!markHost) {
       markHost = document.createElement('div');
       markHost.id = 'bili-aniskip-mark-host';
-      markHost.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483000;pointer-events:none;';
+      markHost.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483000;pointer-events:none;';
       markShadow = markHost.attachShadow({ mode: 'open' });
       var st = document.createElement('style');
       st.textContent = MARK_CSS;
