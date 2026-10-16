@@ -14,14 +14,23 @@ const SRC = fs.readFileSync(SRCS.find(function (p) { return fs.existsSync(p); })
 let pass = 0, fail = 0;
 // -q / --quiet：只打失败与汇总（改代码时反复跑用，输出短）
 const QUIET = process.argv.indexOf('-q') >= 0 || process.argv.indexOf('--quiet') >= 0;
+/* 桩节点是带 _parent 的环状结构，直接 JSON.stringify 会炸；断言里又经常要比较
+ * 「querySelector 拿到什么」，所以失败信息统一走这里，顺手把节点印成 <div class="x"> */
+function brief(v) {
+  if (v && typeof v === 'object' && v._tag) {
+    return '<' + v._tag + (v._attrs && v._attrs.class ? ' class="' + v._attrs.class + '"' : '') + '>' +
+      String(v.textContent || '').slice(0, 40);
+  }
+  try { return JSON.stringify(v); } catch (e) { return String(v); }
+}
 function check(name, got, want) {
-  const g = JSON.stringify(got), w = JSON.stringify(want);
+  const g = brief(got), w = brief(want);
   if (g === w) { pass++; if (!QUIET) console.log('  ✓ ' + name); }
   else { fail++; console.log('  ✗ ' + name + '\n      期望 ' + w + '\n      实际 ' + g); }
 }
 function checkTrue(name, cond, extra) {
   if (cond) { pass++; if (!QUIET) console.log('  ✓ ' + name); }
-  else { fail++; console.log('  ✗ ' + name + (extra !== undefined ? '  -> ' + JSON.stringify(extra) : '')); }
+  else { fail++; console.log('  ✗ ' + name + (extra !== undefined ? '  -> ' + brief(extra) : '')); }
 }
 function head(t) { if (!QUIET) console.log('\n── ' + t + ' ' + '─'.repeat(Math.max(0, 52 - t.length))); }
 
@@ -271,20 +280,250 @@ function makeNet(over) {
 }
 
 /* ---------------- 环境桩 ---------------- */
+/* ---------------- 环境桩：可驱动的极简 DOM ----------------
+ * 面板走的是「innerHTML 设内容 → querySelector 取节点 → addEventListener」这条路，
+ * 老桩每次 querySelector 都返回一个全新的假节点，等于整个面板 UI 测不到 —— 这正是
+ * 「测试全绿但面板真的会绑错季」的原因。这里实现脚本真正用到的那一小撮 DOM 语义：
+ *   标签/属性/文本 → 树；.class / tag / [attr=v] / 后代选择器；事件注册与派发
+ * 不做 Shadow DOM 的隔离（真实浏览器里从 light DOM 查不到影子内容，桩里不做这层），
+ * 所有 createElement 出来的节点都记进 CREATED，测试按 class 就能找回来。 */
+const CREATED = [];
+const VOID_TAGS = { input: 1, br: 1, img: 1, hr: 1, meta: 1, link: 1 };
+const HTML_ENT = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", '#x27': "'", nbsp: ' ' };
+const unesc = (s) => String(s).replace(/&(#[xX]?[0-9a-fA-F]+|[a-zA-Z]+);/g,
+  (m, k) => (HTML_ENT[k] !== undefined ? HTML_ENT[k] : m));
+/* 浏览器在「文本节点」上序列化 innerHTML 时只转义 & < >，引号保持原样 ——
+ * escapeHtml() 走的正是 textContent→innerHTML，这里必须一致，否则
+ * currentCid() 里 /"cid":(\d+)/ 这种正则会被 `&quot;` 打断。 */
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function parseAttrs(raw) {
+  const out = {};
+  const re = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+  let m;
+  while ((m = re.exec(String(raw || '')))) {
+    const v = m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] !== undefined ? m[4] : '';
+    out[m[1].toLowerCase()] = unesc(v);
+  }
+  return out;
+}
+
+function applyAttrs(n, attrs) {
+  Object.keys(attrs).forEach((k) => {
+    n._attrs[k] = attrs[k];
+    if (k === 'class') n._attrs.class = attrs[k];
+    else if (k === 'value') n._value = attrs[k];
+    else if (k === 'checked') n._checked = true;
+    else if (k === 'hidden') n._hidden = true;
+    else if (k === 'disabled') n._disabled = true;
+    else if (k === 'selected') n._selected = true;
+    else if (k.indexOf('data-') === 0) {
+      n.dataset[k.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = attrs[k];
+    }
+  });
+}
+
+/* 只解析「标签 + 属性 + 纯文本」，够用就行 —— 没有注释、CDATA、自闭合脚本这些花活。
+ * 文本也当作子节点存进 _children（_textNode 标记），这样 textContent 的**顺序**和
+ * 浏览器一致（「将绑定：<b>名字</b>（11 集）」不会把括号里的字排到名字前面）。 */
+function fillHtml(parent, html) {
+  parent._children = [];
+  parent._text = '';
+  const s = String(html === undefined || html === null ? '' : html);
+  const re = /<\/?([a-zA-Z][\w-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)>/g;
+  const stack = [parent];
+  const top = () => stack[stack.length - 1];
+  const addText = (t) => { const v = unesc(t); if (v) top().appendChild({ _textNode: true, _text: v, _children: [] }); };
+  let last = 0, m;
+  while ((m = re.exec(s))) {
+    if (m.index > last) addText(s.slice(last, m.index));
+    last = re.lastIndex;
+    const tag = m[1].toLowerCase();
+    if (m[0][1] === '/') {
+      for (let i = stack.length - 1; i > 0; i--) { if (stack[i]._tag === tag) { stack.length = i; break; } }
+      continue;
+    }
+    const node = el(tag);
+    applyAttrs(node, parseAttrs(m[2]));
+    top().appendChild(node);
+    if (!VOID_TAGS[tag] && m[3] !== '/') stack.push(node);
+  }
+  if (last < s.length) addText(s.slice(last));
+}
+
+function selectorCompounds(sel) {
+  const out = [];
+  let cur = '', depth = 0;
+  for (const ch of String(sel).trim()) {
+    if (ch === '[' || ch === '(') depth++;
+    else if (ch === ']' || ch === ')') depth--;
+    if (/\s/.test(ch) && depth === 0) { if (cur) { out.push(cur); cur = ''; } continue; }
+    cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function matchesCompound(n, comp) {
+  if (!n || !n._tag) return false;    // 文本伪节点不参与选择器匹配
+  const re = /\[([^\]]+)\]|\.([A-Za-z0-9_-]+)|([A-Za-z][A-Za-z0-9-]*)/g;
+  let m;
+  const cls = String(n._attrs.class || '').split(/\s+/).filter(Boolean);
+  while ((m = re.exec(comp))) {
+    if (m[1]) {
+      const eq = m[1].indexOf('=');
+      const key = (eq < 0 ? m[1] : m[1].slice(0, eq)).trim().toLowerCase();
+      const want = eq < 0 ? null : m[1].slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+      let have;
+      if (key.indexOf('data-') === 0) {
+        have = n.dataset[key.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())];
+      } else have = n._attrs[key];
+      if (want === null) { if (have === undefined) return false; }
+      else if (String(have === undefined ? '' : have) !== want) return false;
+    } else if (m[2]) {
+      if (cls.indexOf(m[2]) < 0) return false;
+    } else if (m[3]) {
+      if (n._tag !== m[3].toLowerCase()) return false;
+    }
+  }
+  return true;
+}
+
 function el(tag) {
-  return {
-    tagName: (tag || 'div').toUpperCase(),
-    style: { cssText: '' }, dataset: {}, children: [], _text: '', value: '', checked: false,
-    classList: { add() {}, remove() {}, contains: () => false },
-    appendChild(c) { this.children.push(c); return c; },
-    remove() {}, addEventListener() {}, focus() {}, select() {}, contains: () => true,
-    getBoundingClientRect: () => ({ width: 800, height: 450 }),
-    querySelector: () => el('div'), querySelectorAll: () => [],
-    attachShadow: () => el('shadowroot'),
-    set innerHTML(v) { this._html = v; }, get innerHTML() { return this._html || ''; },
-    set textContent(v) { this._text = String(v); }, get textContent() { return this._text; },
-    get options() { return [{ textContent: '作用域' }]; }, get selectedIndex() { return 0; }
+  const n = {
+    tagName: String(tag || 'div').toUpperCase(),
+    _tag: String(tag || 'div').toLowerCase(),
+    _attrs: {}, _children: [], _listeners: {}, _parent: null,
+    _text: '', _value: undefined, _checked: false, _hidden: false, _disabled: false,
+    _removed: false, _selected: false,
+    style: { cssText: '' }, dataset: {}, shadowRoot: null,
+    get className() { return this._attrs.class || ''; },
+    set className(v) { this._attrs.class = String(v); },
+    get id() { return this._attrs.id || ''; },
+    set id(v) { this._attrs.id = String(v); },
+    get parentNode() { return this._parent; },
+    /* 浏览器里没显式赋过值的 <select>，value 会反映当前选中项 —— 桩必须一致，
+     * 否则 selScope.value 是空串，绑定会被存到一个不存在的 key 上 */
+    get value() {
+      if (this._value !== undefined) return this._value;
+      if (this._tag === 'select') {
+        const o = this.options[this.selectedIndex];
+        return o ? o.value : '';
+      }
+      return '';
+    },
+    set value(v) { this._value = String(v); },
+    get checked() { return !!this._checked; },
+    set checked(v) { this._checked = !!v; },
+    get hidden() { return !!this._hidden; },
+    set hidden(v) { this._hidden = !!v; },
+    get disabled() { return !!this._disabled; },
+    set disabled(v) { this._disabled = !!v; },
+    get children() { return this._children; },
+    get options() { return this._tag === 'select' ? this._children.filter((c) => c._tag === 'option') : []; },
+    get selectedIndex() {
+      const os = this.options;
+      const i = os.findIndex((o) => o._selected);
+      return i >= 0 ? i : (os.length ? 0 : -1);
+    },
+    classList: {
+      add(c) { const l = String(n._attrs.class || '').split(/\s+/).filter(Boolean); if (l.indexOf(c) < 0) l.push(c); n._attrs.class = l.join(' '); },
+      remove(c) { n._attrs.class = String(n._attrs.class || '').split(/\s+/).filter((x) => x && x !== c).join(' '); },
+      contains(c) { return String(n._attrs.class || '').split(/\s+/).indexOf(c) >= 0; },
+      toggle(c, on) { const has = this.contains(c); if (on === undefined ? !has : on) this.add(c); else this.remove(c); }
+    },
+    appendChild(c) { c._parent = this; c._removed = false; this._children.push(c); return c; },
+    removeChild(c) {
+      const i = this._children.indexOf(c);
+      if (i >= 0) { this._children.splice(i, 1); c._parent = null; }
+      return c;
+    },
+    remove() {
+      if (this._parent) this._parent.removeChild(this);
+      this._removed = true;
+    },
+    setAttribute(k, v) { applyAttrs(this, { [String(k).toLowerCase()]: String(v) }); },
+    getAttribute(k) { return this._attrs[String(k).toLowerCase()]; },
+    addEventListener(ev, fn) { (this._listeners[ev] = this._listeners[ev] || []).push(fn); },
+    removeEventListener(ev, fn) {
+      const l = this._listeners[ev] || [];
+      const i = l.indexOf(fn);
+      if (i >= 0) l.splice(i, 1);
+    },
+    /* 测试驱动用：把注册的监听真正叫起来（返回事件对象，方便断言 preventDefault 之类） */
+    dispatch(ev, props) {
+      const e = Object.assign({
+        type: ev, target: this, currentTarget: this,
+        preventDefault() { e.defaultPrevented = true; }, stopPropagation() { e.propagationStopped = true; },
+        stopImmediatePropagation() { e.propagationStopped = true; e.immediateStopped = true; }
+      }, props || {});
+      (this._listeners[ev] || []).slice().forEach((fn) => fn.call(this, e));
+      return e;
+    },
+    focus() {}, select() {}, blur() {}, click() { this.dispatch('click', {}); },
+    contains: () => true,
+    getBoundingClientRect: () => ({ width: 800, height: 450, left: 0, top: 0 }),
+    attachShadow() { const r = el('shadowroot'); this.shadowRoot = r; r._host = this; return r; },
+    querySelectorAll(sel) {
+      const comps = selectorCompounds(sel);
+      if (!comps.length) return [];
+      const lastComp = comps[comps.length - 1];
+      const out = [];
+      /* 后代选择器：先按最后一个复合选择器收候选，再要求祖先链依次匹配前面的 */
+      const collect = (node) => {
+        node._children.forEach((c) => {
+          if (matchesCompound(c, lastComp)) {
+            let need = comps.length - 2, anc = c._parent;
+            while (need >= 0 && anc) {
+              if (matchesCompound(anc, comps[need])) need--;
+              anc = anc._parent;
+            }
+            if (need < 0) out.push(c);
+          }
+          collect(c);
+        });
+      };
+      collect(this);
+      return out;
+    },
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    set innerHTML(v) { this._htmlRaw = String(v === undefined || v === null ? '' : v); fillHtml(this, this._htmlRaw); },
+    get innerHTML() {
+      if (!this._children.length) return esc(this._text);
+      return this._children.map((c) => {
+        if (c._textNode) return esc(c._text);
+        const cls = c._attrs.class ? ' class="' + c._attrs.class + '"' : '';
+        if (VOID_TAGS[c._tag]) return '<' + c._tag + cls + '>';
+        return '<' + c._tag + cls + '>' + c.innerHTML + '</' + c._tag + '>';
+      }).join('');
+    },
+    set textContent(v) { this._children = []; this._text = String(v === undefined || v === null ? '' : v); },
+    get textContent() {
+      return this._text + this._children.map((c) => (c._textNode ? c._text : c.textContent)).join('');
+    }
   };
+  CREATED.push(n);
+  return n;
+}
+
+/* 按 class 找回节点（桩里 shadow 内容不隔离，所以直接全局找最近创建的那个） */
+function byClass(cls, nth) {
+  const hit = CREATED.filter((n) => String(n._attrs.class || '').split(/\s+/).indexOf(cls) >= 0);
+  if (nth === undefined) return hit[hit.length - 1] || null;
+  return hit[nth] || null;
+}
+
+/* 界面上「应该有」的节点：拿不到就给个空壳，让断言自己报失败。
+ * 新用例拿去跑旧版本时，能看到完整失败清单而不是在第一处崩掉。 */
+function orNode(n, tag) { return n || el(tag || 'div'); }
+
+/* 面板入口：旧版本没有这两个调试钩子 → 报告失败并返回空壳面板 */
+function openPanelVia(env, kind) {
+  const fn = hook(env, kind === 'bind' ? '_openBindPanel' : '_openSettings');
+  checkTrue('调试入口 _open' + (kind === 'bind' ? 'BindPanel' : 'Settings') + ' 能用', typeof fn === 'function');
+  if (typeof fn !== 'function') return el('div');
+  fn();
+  return orNode(byClass('panel'));
 }
 
 function makeEnv(opts) {
@@ -309,15 +548,37 @@ function makeEnv(opts) {
     });
   };
 
+  CREATED.length = 0;                   // 每个 env 一套全新的 DOM 树，别串味
+
+  const body = el('body');
   global.document = {
     readyState: 'complete',
-    title: '', documentElement: { innerHTML: '', contains: () => true, appendChild() {} },
-    createElement: el, body: el('body'), getElementById: () => null,
+    title: '', documentElement: el('html'),
+    createElement: el, body, getElementById: () => null,
     // opts.video：给「真的跑一遍跳过/撤回」的用例准备的假播放器
     querySelectorAll: (sel) => (sel === 'video' && opts.video) ? [opts.video] : [],
-    addEventListener() {}
+    querySelector: (sel) => body.querySelector(sel),
+    addEventListener: () => {}, removeEventListener: () => {}
   };
-  global.window = {};
+  const win = {
+    _listeners: {},
+    innerWidth: opts.innerWidth || 1280, innerHeight: opts.innerHeight || 800,
+    addEventListener(ev, fn) { (this._listeners[ev] = this._listeners[ev] || []).push(fn); },
+    removeEventListener(ev, fn) {
+      const l = this._listeners[ev] || [];
+      const i = l.indexOf(fn);
+      if (i >= 0) l.splice(i, 1);
+    },
+    dispatch(ev, props) {
+      const e = Object.assign({
+        type: ev, target: this,
+        preventDefault() { e.defaultPrevented = true; }, stopPropagation() { e.propagationStopped = true; }
+      }, props || {});
+      (this._listeners[ev] || []).slice().forEach((fn) => fn.call(this, e));
+      return e;
+    }
+  };
+  global.window = win;
   global.unsafeWindow = {};
   global.location = opts.location || { pathname: '/video/BV_TEST000001', search: '?p=1' };
   global.setTimeout = () => 0;
@@ -326,7 +587,7 @@ function makeEnv(opts) {
   global.setInterval = (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; };
 
   eval(SRC);
-  return { api: global.unsafeWindow.__biliAniskip, store, intervals, cleared };
+  return { api: global.unsafeWindow.__biliAniskip, store, intervals, cleared, win, body, doc: global.document };
 }
 
 function ctxOf(bvid, page) {
@@ -1958,8 +2219,13 @@ function ctxOf(bvid, page) {
       .map((p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null))
       .find((x) => x) || '';
 
-    checkTrue('版本号升到 0.4.5', /@version\s+0\.4\.5/.test(SRC));
+    /* 版本号跟 README 的更新日志必须对得上 —— 写死成某个版本的话每次发版都要改测试，
+     * 而且很容易「升了脚本忘了写日志」（或反过来）。 */
+    const ver = (/@version\s+([0-9]+\.[0-9]+\.[0-9]+)/.exec(SRC) || [])[1];
+    checkTrue('脚本版本号与 README 更新日志一致（' + ver + '）',
+      !!ver && new RegExp('###\\s*' + ver.replace(/\./g, '\\.')).test(README));
     checkTrue('README 有 0.4.5 更新日志', /###\s*0\.4\.5/.test(README));
+    checkTrue('README 有 0.4.6 更新日志', /###\s*0\.4\.6/.test(README));
     checkTrue('README 的「撤回提示秒数」默认值是 4（不再是 8）',
       /\|\s*撤回提示秒数\s*\|\s*`4`\s*\|/.test(README));
     checkTrue('README 设置表补上了「跳过偏移」', /跳过偏移/.test(README));
@@ -1967,6 +2233,269 @@ function ctxOf(bvid, page) {
     checkTrue('README 写清了 ask = 点了才跳', /`ask`[\s\S]{0,200}点了才跳/.test(README));
     checkTrue('README 写清了 auto 的置信度门槛', /置信度 ≥ 60/.test(README));
     checkTrue('README 提到了网络失败态', /网络请求失败/.test(README));
+  }
+
+  /* --- 34. 绑定面板：多季合集不许存成「没季链的单季绑定」（v0.4.6） ---
+   * 用户实测 BV1KspF6iELH（无职转生 第1-3季）：
+   *   「明明选定第一季并绑定，却绑定到了第二季」
+   * 季链算法本身是对的（第 22 组把 P1→Ⅰ 钉死了），问题全在面板：
+   *   ① 搜索回来会无条件把 picked 换成 searchResults[0] —— 用户点过的行被悄悄换掉；
+   *   ② 季链是异步算的，点完就保存时 chain 还是 null → 绑定存成「单季」，
+   *      识别时不再走季链，直接拿 picked 那条的集号去查 → 得到第二季的时间戳；
+   *   ③ 面板上看不出「到底会绑定哪一条」：三段季边界跟你选了哪季无关，
+   *      所以选择被换掉时用户完全没有察觉的途径。
+   * 老桩每次 querySelector 都返回新节点，这块一直测不到 —— 这组用例把面板拉进覆盖。 */
+  head('34. 绑定面板：多季合集必须存成「带季链的绑定」（v0.4.6）');
+  {
+    const TITLE_LZ = '【无职转生 第1-3季】4K超清未删减完整版（更至第三季14）';
+    const pagesLZ = [];
+    for (let i = 1; i <= 23; i++) pagesLZ.push({ page: i, part: '第一季' + String(i).padStart(2, '0'), duration: 1950, cid: 4000 + i });
+    pagesLZ.push({ page: 24, part: '第一季OVA', duration: 1945, cid: 4024 });
+    for (let i = 0; i <= 24; i++) pagesLZ.push({ page: 25 + i, part: '第二季' + String(i).padStart(2, '0'), duration: 1950, cid: 4100 + i });
+    for (let i = 1; i <= 14; i++) pagesLZ.push({ page: 49 + i, part: '第三季' + String(i).padStart(2, '0'), duration: 1948, cid: 4200 + i });
+    VIDEOS.BV1KspF6iELH = {
+      bvid: 'BV1KspF6iELH', aid: 777, cid: 4001, title: TITLE_LZ, pubdate: 1791598437,
+      videos: 63, duration: 1950, owner: { mid: 2, name: '后宫补番' }, pages: pagesLZ, ugc_season: null
+    };
+    const lzCtxOf = (page) => ({
+      bvid: 'BV1KspF6iELH', aid: 777, cid: 4000 + page, page: page,
+      owner: { mid: 2, name: '后宫补番' }, mainTitle: TITLE_LZ,
+      partTitle: pagesLZ[page - 1].part, duration: pagesLZ[page - 1].duration,
+      pubdate: 1791598437, videos: 63, pages: pagesLZ, season: null, seasonId: null,
+      seasonTitle: null, seasonEpisodeTitle: '', incomplete: false
+    });
+
+    /* 搜索结果刻意把「第二季」排在第一条 —— 真机上 AniList 就是这么排的，
+     * 所以「自动选第一条」会直接踩到用户的雷 */
+    const lzMedia = (id, mal, eps, native, year) => ({
+      id, idMal: mal, episodes: eps, format: 'TV', startDate: { year }, synonyms: [],
+      title: { native, romaji: native }
+    });
+    const LZ_II = lzMedia(146065, 51179, 13, '無職転生Ⅱ ～異世界行ったら本気だす～', 2023);
+    const LZ_I = lzMedia(108465, 39535, 11, '無職転生 ～異世界行ったら本気だす～', 2021);
+    const LZ_I2 = lzMedia(127720, 45576, 12, '無職転生 ～異世界行ったら本気だす～ 第2クール', 2021);
+    const LZ_II2 = lzMedia(166873, 55888, 12, '無職転生Ⅱ ～異世界行ったら本気だす～ 第2クール', 2024);
+    const LZ_III = lzMedia(178789, 59193, 14, '無職転生Ⅲ ～異世界行ったら本気だす～', 2026);
+    const rel = (node, edges) => Object.assign({}, node, {
+      relations: { edges: (edges || []).map((n) => ({ relationType: 'SEQUEL', node: n })) }
+    });
+    const relNode = (m) => ({ id: m.id, idMal: m.idMal, episodes: m.episodes, format: 'TV', startDate: m.startDate, title: m.title });
+    const LZ_REL = {
+      108465: rel(relNode(LZ_I), [relNode(LZ_I2)]),
+      127720: rel(relNode(LZ_I2), [relNode(LZ_II)]),
+      146065: rel(relNode(LZ_II), [relNode(LZ_II2)]),
+      166873: rel(relNode(LZ_II2), []),
+      178789: rel(relNode(LZ_III), [])
+    };
+    const netLZ = () => makeNet({
+      'https://graphql.anilist.co': (req) => {
+        const q = JSON.parse(req.data);
+        if (q.variables && q.variables.id !== undefined) return { data: { Media: LZ_REL[q.variables.id] || null } };
+        if (q.variables && q.variables.q === '無職転生 ～異世界行ったら本気だす～') {
+          return { data: { Page: { media: [LZ_II, LZ_I, LZ_I2, LZ_II2, LZ_III] } } };
+        }
+        return { data: { Page: { media: [] } } };
+      },
+      'https://api.aniskip.com/v2/skip-times': (req) => {
+        const m = /skip-times\/(\d+)\/(\d+)/.exec(req.url);
+        if (/^(39535|45576|51179|55888|59193)\//.test(m[1] + '/' + m[2])) {
+          return { found: true, results: [{ interval: { startTime: 70, endTime: 160 }, skipType: 'op', episodeLength: 1950 }] };
+        }
+        return { found: false, results: [] };
+      }
+    });
+
+    const tick = async (n) => { for (let i = 0; i < (n || 80); i++) await Promise.resolve(); };
+    const env = makeEnv({
+      store: { autoDetect: 'off' }, net: netLZ(),
+      location: { pathname: '/video/BV1KspF6iELH', search: '?p=1' }
+    });
+    await env.api.rerun();
+    const panel = openPanelVia(env, 'bind');
+
+    orNode(byClass('q'), 'input').value = '無職転生 ～異世界行ったら本気だす～';
+    orNode(panel.querySelector('.search'), 'button').dispatch('click');
+    await tick();
+    const rows = panel.querySelectorAll('.cand-item');
+    const rowOf = (id) => rows.find((r) => r.textContent.indexOf('AniList ' + id) >= 0);
+    checkTrue('候选里能查到无职转生（5 条）', rows.length >= 5, rows.length);
+    checkTrue('候选里有第一季', !!rowOf(108465));
+
+    /* ① 点「第一季」——用户明确的那一次点击 */
+    orNode(rowOf(108465)).dispatch('click');
+    check('季链没算完时不许保存（否则存成单季绑定 → 拿错季的时间戳）',
+      orNode(panel.querySelector('.save'), 'button').disabled, true);
+    const willBind = panel.querySelector('.willbind');
+    checkTrue('面板写明「将绑定哪一条」',
+      ((willBind && willBind.textContent) || '').indexOf('無職転生 ～異世界行ったら本気だす～') >= 0 &&
+      ((willBind && willBind.textContent) || '').indexOf('無職転生Ⅱ') < 0, (willBind && willBind.textContent) || '(没有 .willbind)');
+
+    /* ② 季链算完 → 保存可用，并且季边界要标出「你选的那条落在这一段」 */
+    await tick();
+    check('季链算完后保存可用', orNode(panel.querySelector('.save'), 'button').disabled, false);
+    checkTrue('季边界里标出「你选的是这一段」', !!panel.querySelector('.chainrow.on'),
+      panel.querySelectorAll('.chainrow').length + ' 行');
+
+    /* ③ 用户再点一次「搜索」（很多人会这样确认一下）——不许把选择换掉 */
+    orNode(panel.querySelector('.search'), 'button').dispatch('click');
+    await tick();
+    orNode(panel.querySelector('.save'), 'button').dispatch('click');
+    const savedAll = JSON.parse(env.store._bindings || '{}');
+    const savedBind = savedAll[Object.keys(savedAll)[0]] || {};
+    check('再搜一次也不会把用户选的季换掉', savedBind.malId, 39535);
+    checkTrue('存下来的绑定带着三段季链',
+      !!(savedBind.seasonChain && savedBind.seasonChain.seasons && savedBind.seasonChain.seasons.length === 3),
+      savedBind.seasonChain && savedBind.seasonChain.seasons && savedBind.seasonChain.seasons.length);
+
+    /* ④ 端到端：绑完之后，第一季的 P 用第一季的时间戳，第二季的 P 用第二季的 */
+    const rP1 = await env.api.identify(lzCtxOf(1));
+    check('绑定后 P1 → Ⅰ 第1话（不是第二季）', [rP1.malId, rP1.episode], [39535, 1]);
+    const rP26 = await env.api.identify(lzCtxOf(26));
+    check('同一合集 P26 → Ⅱ 第1话', [rP26.malId, rP26.episode], [51179, 1]);
+
+    /* ⑤ 只为当前条目算出来的季链才可以复用（否则等于给 Ⅰ 套 Ⅱ 的季链） */
+    const usable = env.api.api_.chainUsableFor;
+    check('别的条目算出来的季链不能被当前选择复用',
+      typeof usable === 'function' ? usable({ builtFor: 146065, seasons: [1, 2] }, 108465) : 'no-fn', false);
+    check('为当前条目算出来的季链可用',
+      typeof usable === 'function' ? usable({ builtFor: 108465, seasons: [1, 2] }, 108465) : 'no-fn', true);
+
+    /* ⑥ 纯函数：搜索回来该选谁 */
+    const pickAfter = env.api.api_.pickAfterSearch;
+    check('用户点过第二季时，搜索回来不许换成第一条',
+      typeof pickAfter === 'function'
+        ? (pickAfter([LZ_II, LZ_I], 108465) || {}).id : 'no-fn', 108465);
+    check('用户点过的那条不在新结果里 → 退回第一条',
+      typeof pickAfter === 'function'
+        ? (pickAfter([LZ_II, LZ_I], 999999) || {}).id : 'no-fn', 146065);
+  }
+
+  /* --- 35. 「不是番剧」：从胶囊撤掉 → 挪进绑定面板 → 可以取消（v0.4.6） ---
+   * 用户实测的三条抱怨之一：「不是番剧按钮意义不大，且选定后无法取消」。
+   * 老实现的问题：① 一个「拉黑」动作摆在日常胶囊上，误触概率高、价值低；
+   *              ② 只写 b:{bvid}，而读取侧命中 s:/c:/b: 任意一个就算拉黑 ——
+   *                 老版本写在 s:/c: 上的记录没有任何入口能取消，用户点了「取消」还是不跳。 */
+  head('35. 「不是番剧」：胶囊撤掉 · 面板开关 · 可取消（v0.4.6）');
+  {
+    const LOC = { pathname: '/video/BV1TEST00001', search: '?p=1' };
+    const e1 = makeEnv({ store: { autoDetect: 'auto' }, location: LOC });
+    await e1.api.rerun();
+    const pill = byClass('pill');
+    checkTrue('识别成功后胶囊上有「改」', !!pill.querySelector('[data-a=bind]'));
+    check('胶囊上不再有「不是番剧」按钮', pill.querySelector('[data-a=no]'), null);
+    check('胶囊文案里也没有「不是番剧」', /不是番剧/.test(pill.textContent), false);
+
+    const panel = openPanelVia(e1, 'bind');
+    // 元素缺失时不崩、造个空壳继续跑完，这样旧代码上能一次看到全部失败
+    const noBox = panel.querySelector('.noanime') || el('input');
+    checkTrue('绑定面板里有「这个视频不跳」开关', !!panel.querySelector('.noanime'));
+    check('默认没勾', noBox.checked, false);
+    noBox.checked = true;
+    noBox.dispatch('change', {});
+    check('勾上 → 立刻按 BV 粒度写黑名单', Object.keys(JSON.parse(e1.store._blacklist || '{}')), ['b:BV1TEST00001']);
+
+    await e1.api.rerun();
+    const pillB = byClass('pill') || el('div');
+    checkTrue('胶囊切成「已标记不是番剧」', /已标记/.test(pillB.textContent), pillB.textContent);
+    const unbl = pillB.querySelector('[data-a=unbl]') || el('span');
+    checkTrue('胶囊上给「取消标记」入口', !!pillB.querySelector('[data-a=unbl]'));
+    unbl.dispatch('click');
+    check('点「取消标记」→ 黑名单清空', Object.keys(JSON.parse(e1.store._blacklist || '{}')).length, 0);
+
+    /* 读取侧是「命中 s: / b: / c: 任意一个键就算拉黑」，而历史版本写过不同的键。
+     * 取消时三把键都要清 —— 老实现只删 b:，用户「取消了还是不跳」。
+     * 这里按 BV1TEST00001 真实的两把键造数据（无合集 → 没有 s:），
+     * 再单独核对有合集时键的形态里确实带 s:。 */
+    const legacy = makeEnv({
+      store: {
+        autoDetect: 'auto',
+        _blacklist: JSON.stringify({ 'c:1001': { t: 1 }, 'b:BV1TEST00001': { t: 1 } })
+      },
+      location: LOC
+    });
+    await legacy.api.rerun();
+    check('有合集时黑名单键的形态（s:/b:/c:）',
+      legacy.api.blacklistKeys({ bvid: 'BVX', seasonId: 9, cid: 8 }), ['s:9', 'b:BVX', 'c:8']);
+    const lBox = openPanelVia(legacy, 'bind').querySelector('.noanime') || el('input');
+    check('已拉黑时开关是勾上的', lBox.checked, true);
+    lBox.checked = false;
+    lBox.dispatch('change', {});
+    check('取消时把 c:/b: 两把键一起清掉', Object.keys(JSON.parse(legacy.store._blacklist || '{}')), []);
+  }
+
+  /* --- 36. 胶囊可以拖到任意位置（v0.4.6）---
+   * 用户实测的三条抱怨之二：「胶囊界面不可移动」——
+   * 原来 .root 是 position:fixed; top:64px; right:20px，写死的，
+   * B站自己的右上角控件、弹幕开关都可能跟它打架。 */
+  head('36. 胶囊可拖动 · 位置记住 · 可重置（v0.4.6）');
+  {
+    const LOC = { pathname: '/video/BV1TEST00001', search: '?p=1' };
+    const mkVideoEl = (t, dur) => {
+      const v = el('video');
+      v.currentTime = t;
+      v.duration = dur;
+      v.paused = false;
+      v.seeking = false;
+      v.readyState = 4;
+      v.addEventListener = () => {};
+      return v;
+    };
+    const e = makeEnv({ store: { autoDetect: 'ask' }, location: LOC, video: mkVideoEl(50, 1440) });
+    await e.api.rerun();
+    // GM 存的值可能是对象也可能是字符串（真机上 GM_setValue 自己序列化）
+    const pillPosOf = (env) => {
+      const v = env.store._pillPos;
+      if (!v) return {};
+      return typeof v === 'string' ? (JSON.parse(v) || {}) : v;
+    };
+    const root = byClass('root');
+    const pill = byClass('pill');
+    const drag = (from, to) => {
+      pill.dispatch('pointerdown', { clientX: from[0], clientY: from[1], pointerId: 1, button: 0 });
+      e.win.dispatch('pointermove', { clientX: to[0], clientY: to[1], pointerId: 1 });
+      e.win.dispatch('pointerup', { clientX: to[0], clientY: to[1], pointerId: 1 });
+    };
+
+    checkTrue('胶囊接了 pointerdown', typeof pill.dispatch === 'function');
+    // 抖动 2px：不算拖动，也不写盘
+    drag([300, 100], [302, 101]);
+    check('位移小于阈值 → 不写位置', e.store._pillPos, undefined);
+    check('位移小于阈值 → 不算拖动', e.api._runtime.pillDragged, false);
+
+    // 真拖动
+    drag([300, 100], [420, 260]);
+    const pos = pillPosOf(e);
+    checkTrue('拖动后位置落盘（left/top 都是数字）',
+      typeof pos.left === 'number' && typeof pos.top === 'number', e.store._pillPos);
+    checkTrue('拖动后写了内联位置（CSP 拦样式也生效）', /left:/.test(root.style.cssText), root.style.cssText);
+    checkTrue('位置在视口内', pos.left >= 0 && pos.top >= 0 && pos.left <= 1280 && pos.top <= 800, pos);
+
+    // 拖到屏幕外 → 夹回视口
+    drag([420, 260], [9999, 9999]);
+    const pos2 = pillPosOf(e);
+    checkTrue('拖出视口会被夹回来', pos2.left <= 1280 && pos2.top <= 800 && pos2.left >= 0 && pos2.top >= 0, pos2);
+
+    /* 拖完手上那一下 click 不能当作点击，否则「拖一下胶囊」会顺手触发跳过。
+     * 注意：GM_* 全局是「最后一次 makeEnv 装的」，所以下面要用当前这个 env 验证。 */
+    const v2 = mkVideoEl(50, 1440);
+    const e2 = makeEnv({ store: { autoDetect: 'ask' }, location: LOC, video: v2 });
+    await e2.api.rerun();
+    const pill2 = byClass('pill');
+    pill2.dispatch('pointerdown', { clientX: 300, clientY: 100, pointerId: 1, button: 0 });
+    e2.win.dispatch('pointermove', { clientX: 430, clientY: 200, pointerId: 1 });
+    e2.win.dispatch('pointerup', { clientX: 430, clientY: 200, pointerId: 1 });
+    pill2.dispatch('click', {});
+    check('拖完那一下不算点击（不会误跳）', v2.currentTime, 50);
+    pill2.dispatch('click', {});
+    checkTrue('正常点击仍然跳（按钮没被拖拽功能吃掉）', v2.currentTime > 50, v2.currentTime);
+
+    // 设置面板里能重置（在 e2 上做：它是最后一个 env，GM_* 全局归它）
+    const sp = openPanelVia(e2, 'settings');
+    const resetBtn = sp.querySelector('.resetpos') || el('button');
+    checkTrue('设置面板有「重置胶囊位置」', !!sp.querySelector('.resetpos'));
+    check('重置前位置还在', typeof pillPosOf(e2).left, 'number');
+    resetBtn.dispatch('click');
+    check('重置后位置记录被清掉', e2.store._pillPos, undefined);
   }
 
   /* --- 汇总 --- */

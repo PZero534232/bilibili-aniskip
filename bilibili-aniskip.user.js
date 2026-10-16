@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.4.5
+// @version      0.4.6
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -1535,6 +1535,17 @@
     });
   }
 
+  /* 这条季链是「为当前选中的条目」算出来的吗？
+   * 季链是异步算的，算完时 picked 可能已经换成另一条番剧了。
+   * 老实现在回调里写 chain.baseId = picked.id（用的是回调那一刻的 picked），
+   * 于是从第一季算出来的季链会被盖上第二季的章，重推守卫还认为「已经算好了」——
+   * 实测 BV1KspF6iELH：选了第一季，季链却是第二季的。
+   * 改成在**发起构建时**记住 id 并盖 builtFor 章，只有章对得上才认。 */
+  function chainUsableFor(chain, pickedId) {
+    if (!chain || !chain.seasons || chain.seasons.length < 2) return false;
+    return chain.builtFor === pickedId;
+  }
+
   // 绝对集号 → (哪一季, 季内第几话)
   function mapBySeasonChain(chain, absEp) {
     if (!chain || !chain.seasons || !chain.seasons.length) return null;
@@ -1996,7 +2007,8 @@
     videoListeners: null,      // 挂在 video 上的监听（stopMonitor 要摘掉，否则切 P 叠加）
     booted: false,             // SPA 定位轮询是否已经挂上（防重复注入）
     bootTimer: null,
-    lastLocKey: ''
+    lastLocKey: '',
+    pillDragged: false       // 胶囊刚被拖动过：紧跟着的那次 click 不算点击
   };
 
   function shouldSkipThisSegment(seg) {
@@ -2300,6 +2312,27 @@
     });
   }
 
+  /* 搜索结果回来后该选中哪一条？
+   * 老实现在每个搜索入口都无条件 `picked = searchResults[0]`，于是：
+   * 「点第一季」→「再点一次搜索确认一下」→ 选择被悄悄换成搜索排名第一的第二季，
+   * 而面板上的季边界三段长得一模一样，用户完全没有察觉的途径
+   * （实测 BV1KspF6iELH 就是这么绑错的）。
+   * 规则：用户手动点过的那条还在结果里就保留它；不在（换了关键词）才退回第一条。 */
+  function pickAfterSearch(list, userPickedId) {
+    if (!list || !list.length) return null;
+    var keep = null;
+    if (userPickedId) {
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].id === userPickedId) { keep = list[i]; break; }
+      }
+    }
+    var m = keep || list[0];
+    return {
+      id: m.id, idMal: m.idMal, episodes: m.episodes,
+      title: (m.title && (m.title.native || m.title.romaji)) || ''
+    };
+  }
+
   /* ---- 状态胶囊：所有交互的入口 ---- */
   function renderPill() {
     ensureUI();
@@ -2327,7 +2360,7 @@
       if (idleOff && !config.showIdlePill && !bound) return;
       var why = {
         'autodetect-off': '未识别',
-        blacklisted: '已加入「不是番剧」名单',
+        blacklisted: '已标记「不是番剧」· 不会再跳',
         'no-episode': '没找到集号', 'no-name': '标题无番名',
         'chain-miss': '这一话不跳（OVA／段没对上条目）',
         // 这三个以前没登记，一律掉进「识别失败」的红点 ——
@@ -2342,6 +2375,10 @@
       parts.push('<span class="dot ' + dotCls + '"></span>' +
         '<span>' + (idleOff ? '番剧跳过 · ' : '') + escapeHtml(why) + '</span>');
       parts.push('<span class="sep"></span><span class="act" data-a="bind">' + (bound ? '改' : '绑定') + '</span>');
+      // 已经拉黑的：给一个「取消标记」出口（老版本只能在胶囊上拉黑，却没有任何入口能取消）
+      if (r.reason === 'blacklisted') {
+        parts.push('<span class="sep"></span><span class="act" data-a="unbl">取消标记</span>');
+      }
     } else {
       var segCount = (r.segments || []).filter(segmentEnabled).length;
       var dotClass = segCount ? '' : 'warn';
@@ -2353,8 +2390,7 @@
       if (waiting && segCount) {
         parts.push('<span class="sep"></span><span class="act" data-a="go">跳过</span>');
       }
-      parts.push('<span class="sep"></span><span class="act" data-a="bind">改</span>' +
-        '<span class="sep"></span><span class="act" data-a="no">不是番剧</span>');
+      parts.push('<span class="sep"></span><span class="act" data-a="bind">改</span>');
       fallback = (waiting && segCount) ? skipNow : showDetails;
     }
     // 末尾统一挂一个设置入口 —— 胶囊原来只有识别出来才出现，想改设置得去油猴菜单，太绕
@@ -2364,7 +2400,7 @@
      * 面板早就靠内联活着，胶囊却会变成一个裸 div。这里补上最小可用的外观。 */
     pill.style.cssText = 'display:inline-flex;align-items:center;gap:6px;' +
       'background:rgba(20,22,26,.86);color:#fff;border-radius:18px;padding:6px 12px;' +
-      'box-shadow:0 4px 16px rgba(0,0,0,.3);cursor:pointer;user-select:none;' +
+      'box-shadow:0 4px 16px rgba(0,0,0,.3);cursor:pointer;user-select:none;touch-action:none;' +
       'font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;';
     try {
       var dots = pill.querySelectorAll('.dot');
@@ -2388,16 +2424,130 @@
     onAct('bind', openBindPanel);
     onAct('cfg', openSettings);
     onAct('go', skipNow);
-    onAct('no', function () {
-      setBlacklist(runtime.ctx);
+    /* 「不是番剧」不再放在胶囊上：它是个低频、且误触代价很大的动作（一不小心整条视频
+     * 再也不跳），入口挪进绑定面板，并且做成可来回切换的开关。这里只留「取消标记」。 */
+    onAct('unbl', function () {
+      var c = runtime.ctx;
+      var was = clearBlacklist(c);
       runtime.result = null;
       renderPill();
-      stopMonitor();
-      showToast('已标记「不是番剧」', '这个视频以后不会再触发');
+      showToast('已取消「不是番剧」', was ? '会照常识别这个视频' : '这个视频本来就没被标记');
+      rerun();
     });
-    pill.addEventListener('click', function () { fallback(); });
+    /* 拖动：位移小于 4px 当作点击，别把「点一下跳过」变成「拖了一下没反应」。
+     * 位置存进 GM 存储，刷新页面还在。 */
+    attachPillDrag(pill);
+    /* 拖完手松开那一下的 click 要吃掉 —— 否则「拖一下胶囊」会顺手触发跳过／打开面板。
+     * 注意同节点上的多个 click 监听之间 stopPropagation 是拦不住的（只有
+     * stopImmediatePropagation 可以），所以捕获阶段掐掉之后，还得用旗子让下面那个
+     * 监听自己让路；捕获这一层同时负责拦住子节点（「跳过」等 span）上的动作。 */
+    var clickSwallowed = false;
+    pill.addEventListener('click', function (e) {
+      if (!runtime.pillDragged) return;
+      runtime.pillDragged = false;
+      clickSwallowed = true;
+      if (e && e.stopPropagation) e.stopPropagation();
+      if (e && e.preventDefault) e.preventDefault();
+    }, true);
+    pill.addEventListener('click', function () {
+      if (clickSwallowed) { clickSwallowed = false; return; }
+      fallback();
+    });
 
+    applyPillPos();
     uiRoot.appendChild(pill);
+  }
+
+  /* ---- 胶囊拖动 ---- */
+  var PILL_POS_KEY = '_pillPos';
+  var PILL_DRAG_MIN = 4;          // 位移小于这个数算点击（手指/鼠标都会抖）
+
+  function readPillPos() {
+    var p = gmGet(PILL_POS_KEY, null);
+    if (p && typeof p.left === 'number' && typeof p.top === 'number') return p;
+    return null;
+  }
+
+  // 内联写死：页面 CSP 拦掉 <style> 时胶囊也要能被定位（.root 的样式表规则会失效）
+  function setPillRootPos(left, top) {
+    try {
+      uiRoot.style.cssText = 'position:fixed;left:' + Math.round(left) + 'px;top:' + Math.round(top) +
+        'px;right:auto;z-index:2147483000;pointer-events:auto;';
+    } catch (e) { /* ignore */ }
+  }
+
+  function clampPillPos(left, top) {
+    var w = 0, h = 0;
+    try {
+      var rect = uiRoot.getBoundingClientRect();
+      w = rect.width || 0;
+      h = rect.height || 0;
+    } catch (e) { /* ignore */ }
+    var vw = (typeof window !== 'undefined' && window.innerWidth) || 1024;
+    var vh = (typeof window !== 'undefined' && window.innerHeight) || 768;
+    return {
+      left: Math.max(0, Math.min(left, Math.max(0, vw - w))),
+      top: Math.max(0, Math.min(top, Math.max(0, vh - h)))
+    };
+  }
+
+  function applyPillPos() {
+    var p = readPillPos();
+    if (!p) return;
+    var c = clampPillPos(p.left, p.top);
+    setPillRootPos(c.left, c.top);
+  }
+
+  function attachPillDrag(pill) {
+    var start = null, last = null, listening = false;
+
+    function onMove(e) {
+      if (!start) return;
+      var dx = (e.clientX || 0) - start.x, dy = (e.clientY || 0) - start.y;
+      if (!runtime.pillDragged && Math.abs(dx) + Math.abs(dy) < PILL_DRAG_MIN) return;
+      runtime.pillDragged = true;
+      last = clampPillPos(start.left + dx, start.top + dy);
+      setPillRootPos(last.left, last.top);
+    }
+
+    function stopListening() {
+      if (!listening) return;
+      listening = false;
+      try {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+      } catch (e) { /* ignore */ }
+    }
+
+    function onUp() {
+      var dragged = runtime.pillDragged;
+      start = null;
+      stopListening();
+      if (!dragged || !last) return;
+      gmSet(PILL_POS_KEY, { left: Math.round(last.left), top: Math.round(last.top) });
+    }
+
+    pill.addEventListener('pointerdown', function (e) {
+      if (e && e.button !== undefined && e.button !== 0) return;   // 只认主键
+      runtime.pillDragged = false;
+      var rect = { left: 0, top: 0 };
+      try { rect = uiRoot.getBoundingClientRect() || rect; } catch (err) { /* ignore */ }
+      start = {
+        x: e && e.clientX || 0, y: e && e.clientY || 0,
+        left: (last ? last.left : (rect.left || 0)),
+        top: (last ? last.top : (rect.top || 0))
+      };
+      last = { left: start.left, top: start.top };
+      if (!listening) {
+        listening = true;
+        try {
+          window.addEventListener('pointermove', onMove);
+          window.addEventListener('pointerup', onUp);
+          window.addEventListener('pointercancel', onUp);
+        } catch (err) { /* ignore */ }
+      }
+    });
   }
 
   /* ---- ask 模式：用户点「跳过」时手动跳一次 ----
@@ -2453,6 +2603,22 @@
     if (!ctx || !ctx.bvid) return;
     blacklist['b:' + ctx.bvid] = { t: Date.now(), title: ctx.mainTitle };
     persistBlacklist();
+  }
+
+  /* 取消「不是番剧」。
+   * 读取侧是「命中 blacklistKeys 里任意一个键就算拉黑」（s: / b: / c:），
+   * 而历史上这个按钮不同版本写进过不同的键 —— 只删 b: 的话，
+   * 老版本写在 s:/c: 上的记录永远取消不掉，用户点「取消」还是不跳。
+   * 所以这里把三个键都清一遍。 */
+  function clearBlacklist(ctx) {
+    if (!ctx) return;
+    var keys = blacklistKeys(ctx);
+    var hit = false;
+    keys.forEach(function (k) {
+      if (blacklist[k]) { delete blacklist[k]; hit = true; }
+    });
+    if (hit) persistBlacklist();
+    return hit;
   }
 
   // 按钮 / 复选框不给焦点：它们一旦被聚焦，按空格、回车就会在触发自身的同时
@@ -2560,6 +2726,7 @@
       '<div class="btns" style="justify-content:flex-start"><button class="search primary">搜索</button>' +
       '<button class="autofill">用标题自动填</button></div>' +
       '<div class="cand"></div>' +
+      '<div class="willbind" hidden></div>' +
       '<div class="row"><div><div class="lab">当前是第几话</div>' +
       '<div class="tip">填你正在看的这一集在<b>这个合集里</b>的序号。例：合集共 32 话、你在看第 21 个视频，就填 21 —— 多季连播时脚本会自己算出它是第几季第几话。</div></div>' +
       '<slot name="ep"></slot></div>' +
@@ -2567,6 +2734,9 @@
       '<div class="row"><div><div class="lab">生效范围</div><div class="tip">这条绑定管到哪儿。搬运番多数是「一个视频装多个分P」，所以默认管全部分P就够</div></div>' +
       '<slot name="scope"></slot></div>' +
       '<div class="chainbox" hidden></div>' +
+      '<div class="row"><div><div class="lab">这个视频不跳（不是番剧）</div>' +
+      '<div class="tip">拉黑后即使绑定过也不会跳。误触了就在这里取消勾选 —— 只在绑定面板里，胶囊上不再放这个按钮。</div></div>' +
+      '<input type="checkbox" class="noanime"></div>' +
       '<div class="btns"><button class="clear danger">清除绑定</button>' +
       '<button class="cancel">取消</button><button class="save primary" disabled>保存</button></div>';
 
@@ -2603,6 +2773,12 @@
     var saveBtn = panel.querySelector('.save');
     var chainBox = panel.querySelector('.chainbox');
     var epMapEl = panel.querySelector('.epmap');
+    var willBindEl = panel.querySelector('.willbind');
+    // 关键样式内联：CSP 拦掉 <style> 时这块提示仍然看得见
+    willBindEl.style.cssText = 'margin:8px 0 2px;padding:8px 10px;border-radius:8px;' +
+      'background:#f4f7fb;color:#2b3a4a;font-size:12.5px;line-height:1.6;';
+    // 用户手动点过的条目 id：搜索回来不许把它换掉（见 pickAfterSearch）
+    var userPickedId = null;
 
     // 预填：已有绑定 / 上次识别结果 / 从标题抽到的集号
     var exist = getBinding(ctx);
@@ -2624,11 +2800,13 @@
     /* ---- 多季连播：季链推导 + 可见可改 ---- */
     var ms = detectMultiSeason(ctx);
     var chainState = { chain: (exist && exist.seasonChain) || null, loading: false };
+    // 已存下来的季链就是为这条绑定算的 —— 补上 builtFor 章，守卫才认它
+    if (exist && exist.seasonChain && exist.anilistId) exist.seasonChain.builtFor = exist.anilistId;
     var seasonInput = null;
 
     function renderChain() {
       var chain = chainState.chain;
-      if (!chain && !ms.multi) { chainBox.hidden = true; updateEpMap(); return; }
+      if (!chain && !ms.multi) { chainBox.hidden = true; updateEpMap(); updateSaveState(); return; }
       chainBox.hidden = false;
 
       if (!chain || !chain.seasons || chain.seasons.length < 2) {
@@ -2639,6 +2817,8 @@
             : '。选中上面某一条番剧后会自动推算季边界；推算不出来也没关系，脚本会退回单季处理。') +
           '</div>';
         updateEpMap();
+        updateSaveState();
+        renderWillBind();
         return;
       }
 
@@ -2659,10 +2839,15 @@
         if (s.aligned === false) warn = ' <b style="color:#d97706">这一段不会跳</b>';
         else if (s.diff) warn = ' <span class="cn">（比段内 P 数少 ' + Math.abs(s.diff) + ' 话，多半是 OVA／特别篇）</span>';
 
-        return '<div class="chainrow"><b>第 ' + (s.season || (i + 1)) + ' 段</b>' +
+        // 标出「你选的那条番剧落在这一段」——
+        // 三段季边界跟选了哪季无关，不标的话选错条目用户根本看不出来
+        var isPicked = !!(picked && (s.entries || []).some(function (e) { return e.anilistId === picked.id; }));
+        var mark = isPicked ? ' <b style="color:#0a7d63">← 你选的是这一段</b>' : '';
+
+        return '<div class="chainrow' + (isPicked ? ' on' : '') + '"><b>第 ' + (s.season || (i + 1)) + ' 段</b>' +
                (s.startPage ? ' P' + s.startPage + '–P' + s.endPage : '') +
                ' <span class="cn">' + (s.episodes ? s.episodes + ' 个视频 · 合集第 ' + s.startAbs + '–' + s.endAbs + ' 话' : '话数未知') + '</span>' +
-               '<div class="cn">→ ' + entryTxt + warn + '</div></div>';
+               '<div class="cn">→ ' + entryTxt + warn + mark + '</div></div>';
       }).join('');
 
       var tip = fromParts
@@ -2696,6 +2881,40 @@
         btn.addEventListener('click', applySeasonEps);
       }
       updateEpMap();
+      updateSaveState();
+      renderWillBind();
+    }
+
+    /* 保存按钮能不能点：
+     * 多季合集的季链还在算时一律不许存 —— 存成「没季链的单季绑定」后识别不会再走
+     * 季链，直接拿 picked 那条的集号去查，实测就是「选了第一季、跳的是第二季」。 */
+    function updateSaveState() {
+      if (!picked) { saveBtn.disabled = true; return; }
+      var loading = ms.multi && chainState.loading && !chainUsableFor(chainState.chain, picked.id);
+      saveBtn.disabled = !!loading;
+    }
+
+    /* 面板必须写明「到底会绑定哪一条」——
+     * 三段季边界跟选了哪季无关，光看它分不出 Ⅰ/Ⅱ/Ⅲ。 */
+    function renderWillBind() {
+      if (!picked) { willBindEl.hidden = true; return; }
+      willBindEl.hidden = false;
+      var txt = '将绑定：<b>' + escapeHtml(picked.title || '') + '</b>' +
+        (picked.episodes ? '（' + picked.episodes + ' 集）' : '') +
+        '<span style="color:#8a9099"> · AniList ' + picked.id + (picked.idMal ? ' / MAL ' + picked.idMal : '') + '</span>';
+
+      var segNo = 0;
+      if (chainUsableFor(chainState.chain, picked.id)) {
+        chainState.chain.seasons.forEach(function (s, i) {
+          if (!segNo && (s.entries || []).some(function (e) { return e.anilistId === picked.id; })) segNo = i + 1;
+        });
+      }
+      if (segNo) txt += '<br>它对应上面的<b>第 ' + segNo + ' 段</b>：保存后这一段里的分P都用它的时间戳。';
+      else if (ms.multi && chainState.loading) txt += '<br><span style="color:#d97706">正在推算季边界…</span>';
+      else if (ms.multi && !chainUsableFor(chainState.chain, picked.id)) {
+        txt += '<br><span style="color:#d97706">季边界没算出来：保存后会按单季处理（合集里只有这一季就没问题）。</span>';
+      }
+      willBindEl.innerHTML = txt;
     }
 
     /* 集号到底换算成哪一季第几话 —— 直接把结果写在输入框下面，省得用户猜 */
@@ -2764,14 +2983,27 @@
     // 选中番剧（或打开面板时已有绑定）后，推一次季链
     function refreshChain() {
       if (!picked || !picked.id) { renderChain(); return; }
-      if (chainState.chain && chainState.chain.baseId === picked.id) { renderChain(); return; }
+      // 已经有一条「为这条番剧算出来的」季链就不再重算
+      if (chainUsableFor(chainState.chain, picked.id)) { renderChain(); return; }
       if (!ms.multi) { renderChain(); return; }
+      var forId = picked.id;          // 发起构建时记住是谁的季链（回调里 picked 可能已经变了）
       chainState.loading = true;
       renderChain();
-      // ctx 必须传进去 —— 有了分P标题里的季标记，边界才能按 UP 主自己分的段来算
-      buildSeasonChain(picked.id, ms.totalEps, ctx, qInput.value.trim() || picked.title, searchResults, picked.title).then(function (chain) {
+      /* 看门狗：万一请求既不回也不报错，别让「保存」永远灰着（宁可让用户存单季+提示） */
+      var watchdog = setTimeout(function () {
+        if (!chainState.loading) return;
         chainState.loading = false;
-        if (chain) chain.baseId = picked.id;
+        renderChain();
+      }, 12000);
+      // ctx 必须传进去 —— 有了分P标题里的季标记，边界才能按 UP 主自己分的段来算
+      buildSeasonChain(forId, ms.totalEps, ctx, qInput.value.trim() || picked.title, searchResults, picked.title).then(function (chain) {
+        try { clearTimeout(watchdog); } catch (e) { /* ignore */ }
+        chainState.loading = false;
+        if (chain) {
+          // 章要盖在「为谁算的」上，不能盖在回调那一刻的 picked 上
+          chain.builtFor = forId;
+          chain.baseId = forId;
+        }
         chainState.chain = chain;
         renderChain();
       });
@@ -2781,7 +3013,7 @@
       candBox.innerHTML = '';
       if (!searchResults.length) {
         candBox.innerHTML = '<div class="cand-item"><div class="nm" style="color:#8a9099">没有结果，换个关键词试试</div></div>';
-        saveBtn.disabled = true;
+        updateSaveState();
         return;
       }
       searchResults.forEach(function (m) {
@@ -2801,8 +3033,9 @@
         ].filter(Boolean).join(' · ');
         item.addEventListener('click', function () {
           picked = { id: m.id, idMal: m.idMal, title: (m.title.native || m.title.romaji || ''), episodes: m.episodes };
+          userPickedId = m.id;         // 用户明确点过 —— 之后搜索回来不许换掉
           // MAL 缺失时 AniSkip 查不了，但 Anime Skip 仍可用
-          saveBtn.disabled = false;
+          updateSaveState();
           chainState.chain = null;      // 换番了，季链重推
           renderCands();
           refreshChain();
@@ -2818,14 +3051,12 @@
       saveBtn.disabled = true;
       searchByName(q).then(function (list) {
         searchResults = list || [];
+        // 用户手动点过的那条还在结果里就保留（老实现无条件换成第一条 → 绑错季）
+        if (searchResults.length) picked = pickAfterSearch(searchResults, userPickedId);
         renderCands();
-        if (searchResults.length) {
-          var m0 = searchResults[0];
-          picked = { id: m0.id, idMal: m0.idMal, title: (m0.title.native || m0.title.romaji || ''), episodes: m0.episodes };
-          saveBtn.disabled = false;
-          renderCands();
-          refreshChain();
-        }
+        updateSaveState();
+        renderWillBind();
+        if (picked) refreshChain();
       });
     }
 
@@ -2844,6 +3075,27 @@
       runSearch();
     });
     panel.querySelector('.cancel').addEventListener('click', closePanel);
+    /* 「不是番剧」开关：勾上＝拉黑（固定 BV 粒度），取消勾选＝把 s:/c:/b: 相关记录一起清掉。
+     * 立刻生效、不等「保存」—— 这是「让这个视频别再跳」的紧急出口；
+     * 弹出提示里再给一个「撤销」，双保险。 */
+    var noAnimeBox = panel.querySelector('.noanime');
+    noAnimeBox.checked = isBlacklisted(ctx);
+    noAnimeBox.addEventListener('change', function () {
+      if (noAnimeBox.checked) {
+        setBlacklist(ctx);
+        showToast('已标记「不是番剧」', '这个视频以后不会再触发', function () {
+          clearBlacklist(ctx);
+          runtime.result = null;
+          rerun();
+        });
+      } else {
+        clearBlacklist(ctx);
+        showToast('已取消「不是番剧」', '会照常识别这个视频');
+      }
+      runtime.result = null;
+      stopMonitor();
+      rerun();
+    });
     panel.querySelector('.clear').addEventListener('click', function () {
       var b = getBinding(ctx);
       if (b && b._key) { delete bindings[b._key]; persistBindings(); }
@@ -2852,6 +3104,16 @@
     });
     saveBtn.addEventListener('click', function () {
       if (!picked) return;
+      /* 多季合集的季链还在算时不许保存。
+       * 存成「没季链的单季绑定」后 identify 不再走季链，直接拿 picked 那条的集号去查 ——
+       * 实测 BV1KspF6iELH（无职转生 第1-3季）：选了第一季、跳的却是第二季。
+       * 按钮上已经置灰，这里再挡一道（键盘回车 / 状态竞态）。 */
+      if (ms.multi && chainState.loading) {
+        showToast('正在推算季边界', '稍等一下再保存，免得绑到错的一季');
+        return;
+      }
+      // 只认「为当前这条番剧算出来的」季链，别的条目算出来的一律不带
+      var chain = chainUsableFor(chainState.chain, picked.id) ? chainState.chain : null;
       bindings[selScope.value] = {
         anilistId: picked.id,
         malId: picked.idMal,
@@ -2862,23 +3124,26 @@
         anchorPage: ctx.page,
         anchorEp: parseInt(epInput.value, 10) || 1,
         // 多季连播合集的季链（含用户手改过的话数），一起存下来
-        seasonChain: (chainState.chain && chainState.chain.seasons && chainState.chain.seasons.length > 1)
-          ? chainState.chain : null,
+        seasonChain: chain,
         t: Date.now()
       };
       persistBindings();
       runtime.result = null;
       closePanel();
-      var chain = bindings[selScope.value].seasonChain;
-      showToast('已绑定：' + picked.title,
-        chain ? (chain.seasons.length + ' 季 / 共 ' + chain.total + ' 话') 
-              : ('作用域：' + (selScope.options[selScope.selectedIndex] || {}).textContent));
+      if (ms.multi && !chain) {
+        // 算不出来也别拦着用户 —— 但要说清后果
+        showToast('已绑定：' + picked.title, '这次没算出季边界，先按单季处理；合集里只有这一季就没问题');
+      } else {
+        showToast('已绑定：' + picked.title,
+          chain ? (chain.seasons.length + ' 季 / 共 ' + chain.total + ' 话')
+                : ('作用域：' + (selScope.options[selScope.selectedIndex] || {}).textContent));
+      }
       rerun();
     });
 
     renderCands();
     renderChain();
-    if (picked) { saveBtn.disabled = false; refreshChain(); }
+    if (picked) { updateSaveState(); refreshChain(); }
     setTimeout(function () { qInput.focus(); qInput.select(); }, 50);
   }
 
@@ -2904,6 +3169,8 @@
       '<div class="row"><div><div class="lab">显示跳转提示</div></div><input type="checkbox" class="toast"></div>' +
       '<div class="row"><div><div class="lab">优先用合集单集标题</div><div class="tip">UP 主在合集里改过的标题往往比原始标题干净</div></div><input type="checkbox" class="seasonT"></div>' +
       '<div class="row"><div><div class="lab">未识别时也显示胶囊</div><div class="tip">关掉则普通视频上完全无痕，入口在油猴菜单</div></div><input type="checkbox" class="idle"></div>' +
+      '<div class="row"><div><div class="lab">胶囊位置</div><div class="tip">胶囊可以直接用鼠标／手指拖到任意位置，位置会记住；拖累了就点这里回到右上角</div></div>' +
+      '<button class="resetpos">重置位置</button></div>' +
       '<div class="btns"><button class="clr">清空缓存</button>' +
       '<button class="cancel">取消</button><button class="save primary">保存</button></div>';
 
@@ -2935,6 +3202,8 @@
     noFocus(panel.querySelector('.clr'));
     noFocus(panel.querySelector('.cancel'));
     noFocus(panel.querySelector('.save'));
+    var resetPosBtn = panel.querySelector('.resetpos');
+    noFocus(resetPosBtn);
 
     modeSel.value = config.autoDetect;
     panel.querySelector('.op').checked = config.jumpOp;
@@ -2951,6 +3220,12 @@
     panel.querySelector('.clr').addEventListener('click', function () {
       cache = {}; persistCache();
       showToast('缓存已清空', '下次识别会重新联网查询');
+    });
+    // 重置胶囊位置：清掉记录 + 抹掉内联定位，回到样式表里的右上角
+    resetPosBtn.addEventListener('click', function () {
+      try { GM_deleteValue(PILL_POS_KEY); } catch (e) { /* ignore */ }
+      try { uiRoot.style.cssText = ''; } catch (e) { /* ignore */ }
+      showToast('胶囊位置已重置', '回到右上角');
     });
     panel.querySelector('.save').addEventListener('click', function () {
       var patch = {
@@ -3063,6 +3338,7 @@
       blacklistKeys: blacklistKeys,
       bindingKeys: bindingKeys,
       setBlacklist: setBlacklist,
+      clearBlacklist: clearBlacklist,
       // 调试钩子：便于在控制台排查「为什么没跳」
       _runtime: runtime,
       _checkOnce: checkOnce,
@@ -3071,6 +3347,8 @@
       _skipNow: skipNow,
       _boot: boot,
       _flushCache: flushCache,
+      _openBindPanel: openBindPanel,
+      _openSettings: openSettings,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,
@@ -3085,6 +3363,7 @@
         bgmSearch: bgmSearch, bgmAliases: bgmAliases, bgmResolve: bgmResolve,
         candidateMedia: candidateMedia, searchByName: searchByName,
         buildSeasonChain: buildSeasonChain, mapBySeasonChain: mapBySeasonChain,
+        chainUsableFor: chainUsableFor, pickAfterSearch: pickAfterSearch,
         alignGroupsToSeasons: alignGroupsToSeasons, nameScore: nameScore,
         CHAIN_VERSION: CHAIN_VERSION, isJunkTailPart: isJunkTailPart,
         skipTarget: skipTarget,
