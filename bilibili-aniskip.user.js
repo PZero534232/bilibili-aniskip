@@ -4168,17 +4168,6 @@
       '<div class="row"><div><div class="lab">自动切下一集</div><div class="tip">ED 跳完直接切下一个 P／下一话（依次退化：播放器的下一集按钮 → 同 BV 分P → UGC 合集下一话）。只给「ED 后面没有彩蛋」的番用，默认关</div></div><input type="checkbox" class="autonext"></div>' +
       '<div class="row"><div><div class="lab">胶囊位置</div><div class="tip">胶囊可以直接用鼠标／手指拖到任意位置，位置会记住；拖累了就点这里回到右上角</div></div>' +
       '<button class="resetpos">重置位置</button></div>' +
-      '<div class="mksec">' +
-      '<div class="mkhead">本地标记 OP / ED（冷番兜底）</div>' +
-      '<div class="mktip">云端没时间戳的番：暂停到画面，点下面按钮标记。脚本靠画面指纹自动识别，同番跨集复用。标记即时生效，不用点「保存」。</div>' +
-      '<div class="mkstat"><div class="mknow">—</div><div class="mkop">—</div><div class="mked">—</div></div>' +
-      '<div class="btns" style="justify-content:flex-start">' +
-      '<button class="mk-op-s">标 OP 开始</button>' +
-      '<button class="mk-op-e">标 OP 结束</button>' +
-      '<button class="mk-ed-s">标 ED 开始</button>' +
-      '<button class="mk-ed-e">标 ED 结束</button>' +
-      '<button class="mk-clr danger">清空本番标记</button>' +
-      '</div></div>' +
       '<div class="btns"><button class="clr">清空缓存</button>' +
       '<button class="cancel">取消</button><button class="save primary">保存</button></div>';
 
@@ -4216,55 +4205,6 @@
     noFocus(panel.querySelector('.save'));
     var resetPosBtn = panel.querySelector('.resetpos');
     noFocus(resetPosBtn);
-
-    /* ---- 本地标记一节：按钮即时生效（不参与「保存」），状态行就地刷新 ---- */
-    var mkSec = panel.querySelector('.mksec');
-    var mkKnow = panel.querySelector('.mknow');
-    var mkOpEl = panel.querySelector('.mkop');
-    var mkEdEl = panel.querySelector('.mked');
-    // 关键样式内联：页面 CSP 拦掉 <style> 时这节也还看得见
-    mkSec.style.cssText = 'border-top:1px solid #eceff3;margin-top:14px;padding-top:2px;';
-    panel.querySelector('.mkhead').style.cssText = 'margin:10px 0 4px;font-weight:600;font-size:13.5px;color:#222;';
-    panel.querySelector('.mktip').style.cssText = 'margin:0 0 8px;color:#6b7280;font-size:12.5px;line-height:1.6;';
-    panel.querySelector('.mkstat').style.cssText = 'margin:0 0 8px;padding:8px 10px;border-radius:8px;' +
-      'background:#f4f7fb;color:#2b3a4a;font-size:12.5px;line-height:1.7;';
-
-    function refreshMark() {
-      var bind = currentBinding();
-      if (!bind) {
-        mkKnow.textContent = '当前：未绑定 —— 先去胶囊点「绑定」';
-        mkOpEl.textContent = 'OP   开始 ——   结束 ——';
-        mkEdEl.textContent = 'ED   开始 ——   结束 ——';
-        return;
-      }
-      var segs = loadLocalSegs(bind._key);
-      var ops = segs.ops || [], eds = segs.eds || [];
-      var op = ops.length ? ops[ops.length - 1] : null;
-      var ed = eds.length ? eds[eds.length - 1] : null;
-      mkKnow.textContent = '当前：' + (bind.title || bind._key) +
-        '   已标 OP ' + ops.length + ' 套 / ED ' + eds.length + ' 套';
-      mkOpEl.textContent = 'OP   开始 ' + (op ? fmtSec(op.start) : '——') +
-        '   结束 ' + (op && op.end > op.start ? fmtSec(op.end) : '——');
-      mkEdEl.textContent = 'ED   开始 ' + (ed ? fmtSec(ed.start) : '——') +
-        '   结束 ' + (ed && ed.end > ed.start ? fmtSec(ed.end) : '——');
-    }
-    [['mk-op-s', markOpStart], ['mk-op-e', markOpEnd], ['mk-ed-s', markEdStart], ['mk-ed-e', markEdEnd]]
-      .forEach(function (pair) {
-        var btn = panel.querySelector('.' + pair[0]);
-        noFocus(btn);
-        btn.addEventListener('click', function () { pair[1](); refreshMark(); });
-      });
-    var mkClrBtn = panel.querySelector('.mk-clr');
-    noFocus(mkClrBtn);
-    mkClrBtn.addEventListener('click', function () {
-      var bind = currentBinding();
-      if (!bind) { showToast('清空本番标记', '当前没有绑定番剧'); return; }
-      try { GM_deleteValue(localSegsKey(bind._key)); } catch (e) { /* ignore */ }
-      syncFrameMonitor(runtime.result);
-      refreshMark();
-      showToast('清空本番标记', '已删掉这个番的本地指纹');
-    });
-    refreshMark();
 
     modeSel.value = config.autoDetect;
     panel.querySelector('.op').checked = config.jumpOp;

@@ -1,5 +1,7 @@
 # 本地标记「ED 结束」+ 标记入口移入设置面板 · 设计
 
+> 修订（2026-10-16）：本设计里「标记入口放在设置面板」那一节已被 `2026-10-16-marking-mode-toolbar-design.md` 取代（改为胶囊 🎯 + 浮动工具条）。ED 结束标记的部分仍然有效。
+
 - 日期：2026-10-16
 - 状态：待评审
 - 范围：`bilibili-aniskip` userscript（`F:\dsh\bilibili-aniskip`）
