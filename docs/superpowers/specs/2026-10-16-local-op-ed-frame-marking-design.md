@@ -19,11 +19,11 @@
 | 换 OP/ED | 重新标记 → 追加新一套指纹（旧指纹自动区分哪一套在播，无需删） |
 | 优先级 | 云端时间戳优先；云端没有时，才用本地指纹兜底 |
 
-## 3. 前提与风险（必须先验证）
+## 3. 前提与风险（已实测通过）
 
-- **CORS 是头号前提**：跨域 `<video>` 直接画到 canvas 会被「污染」，`getImageData` 读像素直接报错。必须给 `<video>` 提前加 `crossorigin="anonymous"` 才能读到像素。
-- B 站视频 CDN 是否放行 CORS，**需实测确认**。现成截图脚本（[Video Screenshot from h5player](https://greasyfork.org/en/scripts/575933-video-screenshot-from-h5player/code)）用同一技术在 B 站可用，说明大概率可行，但不打包票。
-- **兜底**：若实测 CORS 不通，整个「认帧」方案退回「认时间」（按 OP 时长 / ED 时长复用），避免卡死。
+- **实测结论（2026-10-16）**：B 站播放器用 MSE（`<video>.src` 是 blob URL），但 MediaSource 是 CORS 干净的 —— 直接对当前 `<video>` `drawImage` + `getImageData` 能读到像素（实测 `R=40`）。对 MSE 而言 `crossOrigin` 与污染无关，**无需注入、无需 patchVideoCORS**。
+- 抓帧失败（例如将来 B 站改动）→ `captureFrameHash` 返回 null，检测循环静默降级为「不跳」，不崩。
+- **兜底**：若哪天读不到像素，整个「认帧」方案退回「认时间」（按 OP 时长 / ED 时长复用），避免卡死。
 
 ## 4. 标记交互（方案 A）
 

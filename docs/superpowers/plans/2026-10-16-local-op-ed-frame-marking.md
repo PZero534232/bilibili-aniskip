@@ -14,7 +14,7 @@
 
 ## 文件结构
 
-- 修改 `bilibili-aniskip.user.js`：新增「14.1 本地帧指纹」段（纯函数 + 浏览器 glue），在 `runtime` 对象加 3 个字段，`boot()` 里注册菜单与 `patchVideoCORS()`，`rerun()` 里挂 `syncFrameMonitor()`，`api_` 导出新纯函数。
+- 修改 `bilibili-aniskip.user.js`：新增「14.1 本地帧指纹」段（纯函数 + 浏览器 glue），在 `runtime` 对象加 3 个字段，`boot()` 里注册菜单，`rerun()` 里挂 `syncFrameMonitor()`，`api_` 导出新纯函数。
 - 修改 `test/bilibili-aniskip.test.js`：新增组 47（`47.` 到 `47f.`）覆盖所有纯函数与检测决策。
 - 修改 `README.md`：特性清单 + 0.5.0 changelog。
 - 版本号：`@version` 0.4.8 → 0.5.0（最后一步做）。
@@ -58,14 +58,14 @@
 })();
 ```
 
-- [ ] **Step 2: 决策门**
+- [x] **Step 2: 决策门 —— 已通过（2026-10-16）**
 
-  - ✅ `loadeddata` + 能读像素 → 继续 Task 1（认帧可行）。
-  - ❌ `error` 或 `getImageData` 抛 SecurityError → **停止本计划**，改做「认时间」方案（标记时记 `currentTime`，按 OP 时长 / ED 时长跨集复用；无需抽帧、无需 CORS）。
+  - 实测：直接对当前 `<video>` `drawImage` + `getImageData` 成功（`R=40`），B 站 MediaSource 干净，**认帧可行**。
+  - 注：最初「新建 video 拉同一 src」的测法失败（`src` 是 blob URL，MSE 特有），已改用「直接画当前 video」重测通过。
 
-- [ ] **Step 3: 在规格文档上记录验证结论**
+- [x] **Step 3: 结论已记录**
 
-在 `docs/superpowers/specs/2026-10-16-local-op-ed-frame-marking-design.md` 顶部「前提与风险」一节的结论处补一行：`实测结论：<日期> B 站 CDN <放行/不放行> CORS`。无代码提交。
+结论已写入设计文档「前提与风险」节。Task 7 因此**删掉 patchVideoCORS**（MSE 下 crossOrigin 与污染无关）。
 
 ---
 
@@ -599,18 +599,18 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
 
 ---
 
-### Task 7: 帧抓取 + crossOrigin 注入（浏览器 glue）
+### Task 7: 帧抓取（浏览器 glue）
 
 **Files:**
 - Modify: `bilibili-aniskip.user.js`
 
-> 本任务没有单测（依赖真实 canvas / 真实 CDN）。按 Task 0 的 spike 结论决定是否继续。
+> 本任务没有单测（依赖真实 canvas）。已实测 B 站 MediaSource 干净、能直接读像素（见 Task 0），**无需任何 crossOrigin 注入**。
 
-- [ ] **Step 1: 实现 `captureFrameHash` 与 `patchVideoCORS`（加在 `shouldUseLocalSegs` 之后）**
+- [ ] **Step 1: 实现 `captureFrameHash`（加在 `shouldUseLocalSegs` 之后）**
 
 ```js
   var frameCanvas = null;
-  /* 抓当前帧 → 8×8 灰度 → aHash。失败（CORS 没通 / 没有画面）返回 null。 */
+  /* 抓当前帧 → 8×8 灰度 → aHash。失败（读不到像素 / 没有画面）返回 null。 */
   function captureFrameHash() {
     var video = runtime.video || getVideo();
     if (!video || !video.videoWidth) return null;
@@ -624,55 +624,18 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
       return aHash(gray8x8(img));
     } catch (e) { return null; }
   }
-
-  /* 抢在 B 站播放器给 <video> 设 src 之前注入 crossorigin=anonymous，
-   * 否则跨域视频画到 canvas 会被污染、读不到像素。幂等，全程 try/catch。 */
-  function patchVideoCORS() {
-    if (patchVideoCORS.done) return;
-    patchVideoCORS.done = true;
-    try {
-      var proto = HTMLVideoElement.prototype;
-      var origSet = proto.setAttribute;
-      proto.setAttribute = function (name, value) {
-        if (String(name).toLowerCase() === 'src' && !this.getAttribute('crossorigin')) {
-          origSet.call(this, 'crossorigin', 'anonymous');
-        }
-        return origSet.call(this, name, value);
-      };
-      var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-      if (desc && desc.set) {
-        var origSrc = desc.set;
-        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-          get: desc.get,
-          set: function (v) {
-            if (!this.getAttribute('crossorigin')) this.setAttribute('crossorigin', 'anonymous');
-            origSrc.call(this, v);
-          }
-        });
-      }
-    } catch (e) { /* ignore */ }
-  }
 ```
 
-- [ ] **Step 2: 在 `boot()` 里调用 `patchVideoCORS`**
+- [ ] **Step 2: 手动验证（浏览器）**
 
-在 `boot()`（约 3652 行菜单注册之后）加：
+  1. 装脚本，打开 B 站视频，F12 控制台执行：`(window.__biliAniskip && window.__biliAniskip.api_ && window.__biliAniskip.api_.aHash) ? '有导出' : '没导出'` → 应为「有导出」。
+  2. 控制台执行 Task 0 的直接读像素 snippet，确认仍能读到（不再 SecurityError）。
 
-```js
-    try { patchVideoCORS(); } catch (e) { /* ignore */ }
-```
-
-- [ ] **Step 3: 手动验证（浏览器）**
-
-  1. 装脚本，打开 B 站视频，F12 控制台执行：`document.querySelector('video').crossOrigin` → 应为 `'anonymous'`。
-  2. 执行：`(window.__biliAniskip && window.__biliAniskip.api_ && window.__biliAniskip.api_.aHash) ? '有导出' : '没导出'` → 应为「有导出」。
-  3. 控制台跑 Task 0 的 snippet，确认能读到像素（不再 SecurityError）。
-
-- [ ] **Step 4: 提交**
+- [ ] **Step 3: 提交**
 
 ```bash
 git -C F:\dsh\bilibili-aniskip add bilibili-aniskip.user.js
-git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="140600242+PZero534232@users.noreply.github.com" commit -m "feat: 帧抓取 + video crossOrigin 注入"
+git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="140600242+PZero534232@users.noreply.github.com" commit -m "feat: 帧抓取 captureFrameHash"
 ```
 
 ---
@@ -725,7 +688,7 @@ Expected: `✗ api_.applyFrameHash 已导出`。
     localSegs: null          // 当前 binding 的本地指纹 { ops, eds }
 ```
 
-- [ ] **Step 4: 实现检测循环（加在 `patchVideoCORS` 之后）**
+- [ ] **Step 4: 实现检测循环（加在 `captureFrameHash` 之后）**
 
 ```js
   /* 给定一帧的哈希 + video，走「匹配 → 跳」。从 frameTick 拆出来，方便测试驱动。 */
