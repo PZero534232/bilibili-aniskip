@@ -3430,6 +3430,11 @@
 
     applyPillPos();
     uiRoot.appendChild(pill);
+
+    /* 工具条的状态行 / 进度条标记跟着胶囊一起刷新：识别完成、换分P、换视频时
+     * 胶囊会重画，工具条不能停在「未绑定」、进度条不能停在上一集的标记。 */
+    if (runtime.markOn && markRoot) refreshMarkBar();
+    paintProgressMarks();
   }
 
   /* ---- 胶囊拖动 ---- */
@@ -4387,6 +4392,7 @@
       _markToggle: markToggle, _renderMark: renderMark, _refreshMarkBar: refreshMarkBar,
       _markHost: function () { return markHost; },
       _paintProgressMarks: paintProgressMarks,
+      _applyScreen: applyScreen,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,

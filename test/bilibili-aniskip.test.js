@@ -3682,6 +3682,49 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('48h. 全屏重挂 + 工具条拖动');
+  {
+    const env = makeEnv({
+      store: { autoDetect: 'off', _bindings: JSON.stringify({ 'b:BV_TEST000001': { title: 'T', episodes: 28, anchorPage: 1 } }) }
+    });
+    env.api._runtime.ctx = ctxOf('BV_TEST000001', 1);
+    const toggle = env.api._markToggle;
+    const applyScreen = env.api._applyScreen;
+    checkTrue('api._applyScreen 已导出', typeof applyScreen === 'function');
+    if (typeof toggle === 'function' && typeof applyScreen === 'function') {
+      toggle();
+      const host = env.api._markHost();
+      checkTrue('工具条已画出', !!(host && host.shadowRoot.querySelector('.mkbar')));
+      /* 真全屏只渲染全屏子树：挂在 body 上的 host 必须重新挂进全屏元素 */
+      const fullEl = el('div');
+      env.doc.fullscreenElement = fullEl;
+      applyScreen();
+      checkTrue('全屏时 host 重新挂进全屏元素', host.parentNode === fullEl);
+      env.doc.fullscreenElement = null;
+      applyScreen();
+      checkTrue('退出全屏后不再挂在全屏元素里', host.parentNode !== fullEl);
+      /* 拖动：位移到 4px 才算拖，松手才落盘 */
+      const bar = host.shadowRoot.querySelector('.mkbar');
+      bar.getBoundingClientRect = () => ({ left: 100, top: 200, width: 300, height: 180 });
+      bar.dispatch('mousedown', { clientX: 110, clientY: 210 });
+      env.win.dispatch('mousemove', { clientX: 111, clientY: 211 });
+      check('位移 <4px 不算拖动（没写样式）', bar.style.left || '未写', '未写');
+      check('位移 <4px 不算拖动（不落盘）', env.store._markPos, undefined);
+      env.win.dispatch('mousemove', { clientX: 160, clientY: 250 });
+      check('拖动中 left = 起点 + 位移', Math.round(parseInt(bar.style.left, 10)), 150);
+      check('拖动中 top = 起点 + 位移', Math.round(parseInt(bar.style.top, 10)), 240);
+      env.win.dispatch('mouseup', {});
+      check('松手后位置落盘', env.store._markPos && env.store._markPos.left, 150);
+      /* 换集 / 识别完成后胶囊重画 —— 工具条状态行必须跟着刷新，不能停在「未绑定」 */
+      const save = hook(env, 'saveLocalSegs');
+      save('b:BV_TEST000001', { ops: [{ hash: 'x', start: 5, end: 50 }], eds: [] });
+      env.api._renderPill();
+      check('识别后状态行跟着刷新',
+        /已标 OP 1 套 \/ ED 0 套/.test(host.shadowRoot.querySelector('.mkstat').textContent), true);
+      toggle();
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
