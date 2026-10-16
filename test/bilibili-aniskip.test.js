@@ -3621,6 +3621,27 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('48f. 胶囊 🎯 入口');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    env.api._runtime.ctx = ctxOf('BV_TEST000001', 1);
+    env.api._runtime.result = { ok: false, reason: 'no-match' };
+    env.api._renderPill();
+    const pill = byClass('pill');
+    checkTrue('胶囊渲染出来了', !!pill);
+    const act = pill && pill.querySelector('[data-a=mark]');
+    checkTrue('胶囊上有 🎯 标记入口', !!act);
+    if (act) {
+      checkTrue('🎯 有 click 监听', (act._listeners.click || []).length > 0);
+      act.dispatch('click', {});
+      check('点一下进标记模式', env.api._runtime.markOn, true);
+      check('状态落盘', env.store._markOn, true);
+      act.dispatch('click', {});
+      check('再点一下退出', env.api._runtime.markOn, false);
+      check('退出后状态也落盘', env.store._markOn, false);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

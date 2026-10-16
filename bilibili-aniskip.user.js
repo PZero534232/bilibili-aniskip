@@ -2577,6 +2577,8 @@
    * 不刷新的话新指纹要等下次 rerun 才生效。 */
   function afterMark() {
     syncFrameMonitor(runtime.result);
+    if (runtime.markOn && markRoot) refreshMarkBar();
+    // Task 7 打开：paintProgressMarks();
   }
   function hasPendingOp(segs) {
     return (segs.ops || []).some(function (o) { return o.end < 0; });
@@ -2793,7 +2795,8 @@
         renderPill();
       });
     }
-    // Task 6 打开：applyMarkPos(bar); attachMarkDrag(bar);
+    applyMarkPos(bar);
+    attachMarkDrag(bar);
     markRoot.appendChild(bar);
     refreshMarkBar();
     // Task 7 打开：paintProgressMarks();
@@ -2865,6 +2868,66 @@
     refreshMarkBar();
     // Task 7 打开：paintProgressMarks();
     showToast('已删掉这条标记', (row && row.label ? row.label : '') + ' 第 ' + (index + 1) + ' 条');
+  }
+
+  /* ---- 工具条拖动：位置存 GM，刷新页面还在。位移 < 4px 当点击 ---- */
+  var MARK_DRAG_MIN = 4;
+  var markDrag = null;        // 拖动中的状态（同一时刻只有一根工具条）
+  var markDragBound = false;
+
+  function readMarkPos() {
+    var p = gmGet(MARK_POS_KEY, null);
+    if (p && typeof p.left === 'number' && typeof p.top === 'number') return p;
+    return null;
+  }
+  function applyMarkPos(bar) {
+    var p = readMarkPos();
+    if (!p) return;
+    bar.style.left = Math.round(p.left) + 'px';
+    bar.style.top = Math.round(p.top) + 'px';
+    bar.style.bottom = 'auto';
+  }
+  /* mousemove / mouseup 只挂一次（挂 window）：工具条每次重画都会换新节点，
+   * 监听器要是跟着节点挂，就会一份份堆在 window 上，还各抓着一个已废弃的节点。 */
+  function onMarkDragMove(e) {
+    if (!markDrag) return;
+    var bar = markDrag.bar;
+    var dx = (e.clientX || 0) - markDrag.x, dy = (e.clientY || 0) - markDrag.y;
+    if (!markDrag.moved && Math.abs(dx) < MARK_DRAG_MIN && Math.abs(dy) < MARK_DRAG_MIN) return;
+    markDrag.moved = true;
+    bar.style.left = Math.round(markDrag.l + dx) + 'px';
+    bar.style.top = Math.round(markDrag.t + dy) + 'px';
+    bar.style.bottom = 'auto';
+  }
+  function onMarkDragUp() {
+    if (!markDrag) return;
+    var bar = markDrag.bar;
+    var moved = markDrag.moved;
+    markDrag = null;
+    if (moved) {
+      gmSet(MARK_POS_KEY, {
+        left: parseInt(bar.style.left, 10) || 0,
+        top: parseInt(bar.style.top, 10) || 0
+      });
+    }
+  }
+  function attachMarkDrag(bar) {
+    if (!markDragBound) {
+      markDragBound = true;
+      try {
+        window.addEventListener('mousemove', onMarkDragMove);
+        window.addEventListener('mouseup', onMarkDragUp);
+      } catch (e) { /* ignore */ }
+    }
+    bar.addEventListener('mousedown', function (e) {
+      // 点在按钮或列表行上时不拖，免得把点击吃掉
+      var t = e && e.target;
+      if (t && t.getAttribute && t.getAttribute('data-mk')) return;
+      if (t && t.className && String(t.className).indexOf('mkrow') >= 0) return;
+      var r = bar.getBoundingClientRect ? bar.getBoundingClientRect() : { left: 0, top: 0 };
+      markDrag = { bar: bar, moved: false, x: e.clientX || 0, y: e.clientY || 0, l: r.left, t: r.top };
+      if (e.preventDefault) e.preventDefault();
+    });
   }
 
   function ensureUI() {
@@ -3139,9 +3202,12 @@
   }
   function applyScreen() {
     var s = detectScreen();
-    if (s === runtime.screen) return;
+    var changed = s !== runtime.screen;
     runtime.screen = s;
-    renderPill();
+    if (changed) renderPill();
+    /* 工具条和胶囊不一样：它在全屏下也要显示。真全屏只渲染全屏子树，
+     * 挂在 body 上的 host 会看不见 —— 趁这个时机重新挂进全屏元素并重画。 */
+    if (runtime.markOn) renderMark();
   }
 
   function renderMiniPill(r) {
@@ -3234,10 +3300,18 @@
       parts.push('<span class="sep"></span><span class="act" data-a="bind">改</span>');
       fallback = (waiting && segCount) ? skipNow : showDetails;
     }
+    // 标记模式入口：一键进出工具条，不用再钻设置面板（低频但关键的动作）
+    parts.push('<span class="sep"></span><span class="act" data-a="mark" title="标记 OP/ED 帧">🎯</span>');
     // 末尾统一挂一个设置入口 —— 胶囊原来只有识别出来才出现，想改设置得去油猴菜单，太绕
     parts.push('<span class="sep"></span><span class="act" data-a="cfg" title="番剧跳过设置">⚙</span>');
     parts.push('<span class="sep"></span><span class="act" data-a="collapse" title="收起胶囊">–</span>');
     pill.innerHTML = parts.join('');
+    /* 🎯 在标记模式下高亮。内联写死颜色：页面 CSP 拦掉 <style> 注入时也看得出状态 */
+    var markAct = pill.querySelector('[data-a=mark]');
+    if (markAct) {
+      markAct.style.cssText = 'padding:0 2px;opacity:1;color:' +
+        (runtime.markOn ? '#00d1b6' : 'rgba(255,255,255,.8)') + ';';
+    }
     /* 关键样式内联：页面 CSP 拦掉 <style> 注入时（脚本仍能跑，只是样式没了），
      * 面板早就靠内联活着，胶囊却会变成一个裸 div。这里补上最小可用的外观。 */
     pill.style.cssText = 'display:inline-flex;align-items:center;gap:6px;' +
@@ -3264,6 +3338,7 @@
       node.addEventListener('click', function (e) { e.stopPropagation(); fn(); });
     }
     onAct('bind', openBindPanel);
+    onAct('mark', markToggle);
     onAct('cfg', openSettings);
     onAct('collapse', function () {
       config.pillCollapsed = true;
@@ -4242,6 +4317,9 @@
     if (!/\/(video)\//.test(location.pathname)) return;
     ensureUI();
     renderPill();
+    // 标记模式是持久化状态：刷新 / 进新页面后工具条要自己回来
+    runtime.markOn = !!gmGet(MARK_ON_KEY, false);
+    if (runtime.markOn) renderMark();
     setTimeout(rerun, 900);
     // 防止重复注入（脚本被装两次 / 缓存里跑了两份）叠出多个轮询
     if (runtime.booted) return;
