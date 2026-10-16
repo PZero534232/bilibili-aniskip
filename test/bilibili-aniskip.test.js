@@ -3227,13 +3227,20 @@ function ctxOf(bvid, page) {
       frameStep(m2, segsLong, '1111111111111111', 0, 1400);
       check('中间一帧不中 → 目标清空', m2.target, null);
       check('中间一帧不中 → 计数归零', m2.hits, 0);
-      // ED：命中 → 跳到视频结尾（用长哈希，让 OP 与 ED 能靠 hamming 区分开）
+      // ED 没标结束（pending）→ 落视频时长（用长哈希，让 OP 与 ED 能靠 hamming 区分开）
       const m3 = { target: null, hits: 0 };
-      const segsEd = { ops: [{ hash: '0000000000000000', start: 0, end: 90 }], eds: [{ hash: '1111111111111111' }] };
+      const segsEd = { ops: [{ hash: '0000000000000000', start: 0, end: 90 }], eds: [{ hash: '1111111111111111', start: 1300, end: -1 }] };
       frameStep(m3, segsEd, '1111111111111111', 1300, 1400);
       const edSeg = frameStep(m3, segsEd, '1111111111111111', 1300, 1400);
       check('认到 ED', !!(edSeg && edSeg.type === 'ed'), true);
-      check('ED 落点 = 时长', edSeg && edSeg.end, 1400);
+      check('ED pending → 落视频时长', edSeg && edSeg.end, 1400);
+      // ED 标了结束 → 落点 = 检测点 + ED 时长（跨集复用相对时长）
+      const m5 = { target: null, hits: 0 };
+      const segsEdE = { ops: [], eds: [{ hash: '1111111111111111', start: 1300, end: 1400 }] };
+      frameStep(m5, segsEdE, '1111111111111111', 1250, 1500);
+      const edSegE = frameStep(m5, segsEdE, '1111111111111111', 1250, 1500);
+      check('ED 标了结束 → 认到', !!(edSegE && edSegE.type === 'ed'), true);
+      check('ED 落点 = 检测点 + ED 时长', edSegE && edSegE.end, 1350);
       // pending OP（end<start）不参与匹配
       const segsP = { ops: [{ hash: '0000', start: 0, end: -1 }], eds: [] };
       const m4 = { target: null, hits: 0 };

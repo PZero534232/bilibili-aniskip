@@ -2418,7 +2418,7 @@
 
   /* 连续命中判定 + 跳过段产出。matcher = { target, hits }，测试直接传对象进来。
    * 命中 OP：落点 = 检测点 + (end - start)（序幕长度不定也能对）。
-   * 命中 ED：落点 = 视频时长（跳到底）。 */
+   * 命中 ED：标了结束就同上；没标结束（end < start）落视频时长。 */
   function frameStep(matcher, segs, hash, currentTime, duration) {
     var cand = matcher.target;
     if (cand) {
@@ -2437,16 +2437,18 @@
       if (!cand) {
         for (i = 0; i < eds.length; i++) {
           if (hamming(hash, eds[i].hash) < FRAME_THRESHOLD) {
-            matcher.target = { type: 'ed', hash: eds[i].hash, start: 0, end: 0 };
+            matcher.target = { type: 'ed', hash: eds[i].hash, start: eds[i].start, end: eds[i].end };
             matcher.hits = 1; cand = matcher.target; break;
           }
         }
       }
     }
     if (cand && matcher.hits >= FRAME_CONSECUTIVE) {
+      // OP 一定要有 end；ED 的 end 可选 —— 没标结束时落视频时长（老行为）
       var seg = cand.type === 'op'
         ? { type: 'op', start: currentTime, end: currentTime + (cand.end - cand.start) }
-        : { type: 'ed', start: currentTime, end: duration };
+        : { type: 'ed', start: currentTime,
+            end: (cand.end > cand.start) ? currentTime + (cand.end - cand.start) : duration };
       matcher.target = null; matcher.hits = 0;
       return seg;
     }
