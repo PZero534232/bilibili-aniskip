@@ -540,6 +540,13 @@ function makeEnv(opts) {
   global.GM_registerMenuCommand = () => {};
   global.GM_xmlhttpRequest = (req) => {
     Promise.resolve().then(() => {
+      // 注入网络故障：netFail(req) → 'timeout' | 'error' | { status, responseText }
+      if (opts.netFail) {
+        const err = opts.netFail(req);
+        if (err === 'timeout') { if (req.ontimeout) req.ontimeout(); return; }
+        if (err === 'error') { if (req.onerror) req.onerror({ status: 0 }); return; }
+        if (err && err.status) { if (req.onload) req.onload({ status: err.status, responseText: err.responseText || '' }); return; }
+      }
       const key = Object.keys(net).find((frag) => req.url.indexOf(frag) === 0);
       if (!key) { req.onerror && req.onerror({ status: 0 }); return; }
       const r = net[key];
@@ -585,6 +592,9 @@ function makeEnv(opts) {
   global.clearTimeout = () => {};
   global.clearInterval = (id) => { cleared.push(id); };
   global.setInterval = (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; };
+  global.alert = () => {};      // 浏览器全局；老版本某些兜底路径会调，桩一下免得崩溃
+  global.confirm = () => true;
+  global.prompt = () => null;
 
   eval(SRC);
   return { api: global.unsafeWindow.__biliAniskip, store, intervals, cleared, win, body, doc: global.document };
@@ -1853,10 +1863,14 @@ function ctxOf(bvid, page) {
       cfgWith({ cfgVersion: 2, undoSeconds: 8, skipOffset: -2, jumpEd: false }).skipOffset, -2);
     check('迁移不动 jumpEd',
       cfgWith({ cfgVersion: 2, undoSeconds: 8, skipOffset: -2, jumpEd: false }).jumpEd, false);
-    check('已经是新版（cfgVersion 3）的配置原样保留',
-      cfgWith({ cfgVersion: 3, undoSeconds: 12 }).undoSeconds, 12);
+    check('已经是新版（cfgVersion 4）的配置原样保留',
+      cfgWith({ cfgVersion: 4, undoSeconds: 12 }).undoSeconds, 12);
     check('「不显示撤回」（0 秒）也能存住',
-      cfgWith({ cfgVersion: 3, undoSeconds: 0 }).undoSeconds, 0);
+      cfgWith({ cfgVersion: 4, undoSeconds: 0 }).undoSeconds, 0);
+    check('v0.4.8 之前点过「⇥」存下的 autoNext=开 → 迁移回默认关',
+      cfgWith({ cfgVersion: 3, autoNext: true }).autoNext, false);
+    check('v0.4.7（无 autoNext 概念）升级 → autoNext 默认关',
+      cfgWith({ cfgVersion: 3 }).autoNext, false);
   }
 
   /* --- 28. 网络失败 / 缓存策略（v0.4.5） ---
@@ -2741,22 +2755,335 @@ function ctxOf(bvid, page) {
      *    季链算完必须把「同系列」的条目补进候选 —— 这才是「搜不到第三季」的解药 */
     const down = await openAndSearch(false, '无职转生 第一季');
     await tick(60);
-    /* 这条同时是缓存回归：searchByName 会把结果放进 6 小时缓存，
-     * 面板里的「季族补全」如果直接 push 同一个数组，缓存就被污染了
-     * （实测发现过一次：第二次搜索返回的列表里混进了 via:'chain' 的条目）。 */
+    /* 0.4.7 起 searchByName 直接把结果放进 6 小时缓存；面板里的「季族补全」如果
+     * 直接 push 同一个数组，缓存就被污染了（实测发现过一次：第二次搜索返回的列表里
+     * 混进了 via:'chain' 的条目）。0.4.8 起搜索本身就用 via:'family' 补全同系列。 */
     const rawDown = await down.env.api.api_.searchByName('无职转生 第一季');
-    checkTrue('直查本身只有 3 条（Ⅰ/Ⅱ第2クール/Ⅱ），没被季族补全污染缓存',
-      rawDown.length === 3 && rawDown.every((m) => m.via !== 'chain'), rawDown.map((m) => [m.id, m.via]));
-    check('直查里确实没有第三季 —— 这就是用户说「搜不到第三季」的来源',
-      rawDown.some((m) => m.id === 178789), false);
+    checkTrue('搜索一回来就有第三季（family 补全，不依赖季链）',
+      rawDown.some((m) => m.id === 178789 && m.via === 'family'), rawDown.map((m) => [m.id, m.via]));
+    checkTrue('缓存里没有 via:"chain" 的条目（面板季族补全绝不污染缓存）',
+      rawDown.every((m) => m.via !== 'chain'), rawDown.map((m) => m.via));
     await tick(240);
     const rowsAfter = rowsOf(down.panel);
-    checkTrue('季链算完后候选里补上了第三季（Ⅲ）', hasRow(rowsAfter, 59193),
+    checkTrue('候选列表里也补上了第三季（Ⅲ）', hasRow(rowsAfter, 59193),
       rowsAfter.map((r) => (r.querySelector('.meta') || { textContent: '' }).textContent).join(' | ').slice(0, 200));
-    checkTrue('第三季是靠「同系列（季链补全）」进来的，不是直查结果',
+    checkTrue('第三季标着「同系列」来路（自动补全）',
       rowsAfter.some((r) => r.textContent.indexOf('MAL 59193') >= 0 && /同系列/.test(r.textContent)),
       rowsAfter.length + ' 条');
     checkTrue('候选里也补上了第一季第2クール', hasRow(rowsAfter, 45576), rowsAfter.length);
+  }
+
+  /* ==================================================================
+   * 39. 起始跳过偏移：整段平移（UP 主在开头多加了片段）
+   *
+   * 需求原话：「缺乏起始跳过偏移功能（针对上传 up 主开头多加片段的情况）」。
+   * 数据库的时间戳是按原片标的，UP 主在开头插了 N 秒，这一版里 OP/ED 整段
+   * 都偏后 N 秒 —— 只挪落点（老的 skipOffset）治不了「起跳太早」。
+   * ================================================================== */
+  head('39. 起始跳过偏移：整段平移');
+  {
+    const OP = { type: 'op', start: 100, end: 190 };
+    /* 拿不到 api 就返回空壳：对着旧版本跑时能看到完整失败清单，而不是崩在第一行 */
+    const shiftWith = (shift, seg) => {
+      const env = makeEnv({ store: { skipShift: shift } });
+      const fn = env.api.api_.shiftSeg;
+      if (typeof fn !== 'function') return {};
+      return fn(seg || OP);
+    };
+    checkTrue('api_.shiftSeg 已导出（调试/测试入口）',
+      typeof makeEnv().api.api_.shiftSeg === 'function');
+
+    const s15 = shiftWith(15);
+    check('平移 +15：起点 +15', s15.start, 115);
+    check('平移 +15：落点 +15', s15.end, 205);
+    check('平移 0（默认）→ 原样返回，不做无谓拷贝', shiftWith(0) === OP, true);
+    check('-120 会被配置夹成 -30', shiftWith(-120).start, 70);
+    const neg = shiftWith(-30, { type: 'op', start: 10, end: 40 });
+    check('负平移越过片头 → 起点夹到 0', neg.start, 0);
+    check('负平移越过片头 → 落点保住片段长度', neg.end, 10);
+
+    const mkVideo = (o) => Object.assign({
+      currentTime: 0, duration: 1500, paused: false, ended: false,
+      play() { this.paused = false; },
+      addEventListener() {}, getBoundingClientRect: () => ({ width: 800, height: 450 })
+    }, o);
+
+    /* 端到端：数据库说 OP 是 100–190，这一版实际晚了 20 秒（真实区间 120–210） */
+    const v = mkVideo({ currentTime: 105 });   // 旧实现眼里「已经进了 OP」
+    const e = makeEnv({ store: { autoDetect: 'auto', skipShift: 20 }, video: v });
+    e.api._runtime.result = { ok: true, segments: [OP] };
+    e.api._runtime.video = v;
+    e.api._checkOnce();
+    check('平移之后 105 秒不跳（旧实现这里就跳了）', v.currentTime, 105);
+    v.currentTime = 125;
+    e.api._checkOnce();
+    check('进入平移后的区间才跳，落点 210+ε', Math.round(v.currentTime * 100) / 100, 210.06);
+
+    const v2 = mkVideo({ currentTime: 130 });
+    const e2 = makeEnv({ store: { autoDetect: 'auto', skipShift: 20 }, video: v2 });
+    e2.api._runtime.result = { ok: true, segments: [OP] };
+    e2.api._runtime.video = v2;
+    e2.api._checkOnce();
+    const toast = byClass('toast');
+    checkTrue('跳过提示写明「整体 +20s」', !!toast && /整体 \+20s/.test(toast.textContent),
+      (toast && toast.textContent) || '(没有 toast)');
+
+    check('新装默认：整段平移 0 秒', makeEnv().api.api_.getConfig().skipShift, 0);
+  }
+
+  /* ==================================================================
+   * 40. 胶囊可收起（收起后只剩一颗状态色圆点）
+   * ================================================================== */
+  head('40. 胶囊可收起');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    env.api._runtime.ctx = { bvid: 'BV1TEST00001' };
+    env.api._runtime.result = { ok: false, reason: 'autodetect-off' };
+    const render = env.api._renderPill;
+    checkTrue('调试入口 _renderPill 能用', typeof render === 'function');
+    if (typeof render === 'function') render();
+
+    const pill = byClass('pill');
+    checkTrue('展开态：有「收起」按钮', !!(pill && pill.querySelector('[data-a=collapse]')));
+    orNode(pill && pill.querySelector('[data-a=collapse]'), 'span').click();
+
+    const mini = byClass('pill');
+    checkTrue('收起后是 mini 胶囊（只剩圆点）', !!(mini && /mini/.test(mini.className)));
+    check('收起后不再显示「绑定/改/⚙」等文字', mini && /绑定|改|⚙/.test(mini.textContent), false);
+    check('收起状态写进 GM 配置', env.store.pillCollapsed, true);
+
+    orNode(mini, 'div').click();
+    const back = byClass('pill');
+    checkTrue('点圆点展开', !!(back && !/mini/.test(back.className)));
+    check('展开写回 GM（收起被清掉）', env.store.pillCollapsed, false);
+  }
+
+  /* ==================================================================
+   * 41. 网页全屏：胶囊整个隐藏（连圆点都不留），退出后恢复 —— 自带行为，不是开关
+   * ================================================================== */
+  head('41. 网页全屏不挡视频');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    env.api._runtime.ctx = { bvid: 'BV1TEST00001' };
+    env.api._runtime.result = { ok: false, reason: 'autodetect-off' };
+    const apply = env.api._applyScreen;
+    checkTrue('调试入口 _applyScreen 能用', typeof apply === 'function');
+    const applyFn = (typeof apply === 'function') ? apply : (() => {});
+    const detectFn = env.api.api_.detectScreen;
+    checkTrue('api_.detectScreen 已导出', typeof detectFn === 'function');
+    const detect = (typeof detectFn === 'function') ? detectFn : (() => 'normal');
+
+    // 先渲染出一个胶囊，拿到它的挂载点（uiRoot），好断言「全屏时这里不再有胶囊」
+    if (typeof env.api._renderPill === 'function') env.api._renderPill();
+    const pill0 = byClass('pill');
+    const root = (pill0 && pill0.parentNode) || el('div');
+    checkTrue('初始（普通模式）有胶囊', !!(root && root.querySelector('.pill')));
+
+    const player = el('div'); player.className = 'bpx-player-container';
+    env.body.appendChild(player);
+    check('默认是普通模式', detect(), 'normal');
+    player.setAttribute('data-screen', 'web');
+    check('detectScreen 认出网页全屏', detect(), 'web');
+
+    applyFn();
+    checkTrue('网页全屏下胶囊整个隐藏（连圆点都不留）', !(root.querySelector('.pill')));
+    check('全屏隐藏不写进用户偏好', env.store.pillCollapsed, undefined);
+
+    player.setAttribute('data-screen', 'normal');
+    applyFn();
+    checkTrue('退出全屏胶囊恢复显示', !!(root.querySelector('.pill')));
+  }
+
+  /* ==================================================================
+   * 42. 自动切下一集（默认关；ED 跳完就切；开关在设置面板里）
+   * ================================================================== */
+  head('42. 自动切下一集');
+  {
+    const mkNext = (env) => {
+      const b = el('button'); b.className = 'bpx-player-ctrl-next';
+      b.disabled = false; b.clicked = 0;
+      b.addEventListener('click', () => { b.clicked++; });
+      env.body.appendChild(b);
+      return b;
+    };
+    const mkVideo = (o) => Object.assign({
+      currentTime: 95, duration: 120, paused: false, ended: false,
+      play() { this.paused = false; },
+      addEventListener() {}, getBoundingClientRect: () => ({ width: 800, height: 450 })
+    }, o);
+    const ED = { type: 'ed', start: 90, end: 100 };
+
+    /* ① 默认关：ED 跳完不切 */
+    const off = makeEnv({ store: { autoDetect: 'off' } });
+    const b1 = mkNext(off);
+    off.api._runtime.video = mkVideo();
+    off.api._runtime.result = { ok: true, segments: [ED] };
+    off.api._skipNow();
+    check('默认关：ED 跳完不切下一集', b1.clicked, 0);
+
+    /* ② 开启后：ED 跳完切一次（播放器自带的下一集按钮） */
+    const on = makeEnv({ store: { autoDetect: 'off', autoNext: true, cfgVersion: 4 } });
+    const b2 = mkNext(on);
+    on.api._runtime.video = mkVideo();
+    on.api._runtime.result = { ok: true, segments: [ED] };
+    on.api._skipNow();
+    check('开启后：ED 跳完切一次', b2.clicked, 1);
+
+    /* ③ 不是 ED（比如 OP）不切 */
+    const onOp = makeEnv({ store: { autoDetect: 'off', autoNext: true, cfgVersion: 4 } });
+    const bOp = mkNext(onOp);
+    onOp.api._runtime.video = mkVideo({ currentTime: 10 });
+    onOp.api._runtime.result = { ok: true, segments: [{ type: 'op', start: 5, end: 40 }] };
+    onOp.api._skipNow();
+    check('OP 跳完不切下一集', bOp.clicked, 0);
+
+    /* ④ 没有下一集按钮 → 多分P退化成改 ?p= */
+    const loc3 = { pathname: '/video/BV1TEST00001', search: '?p=1', href: 'https://www.bilibili.com/video/BV1TEST00001?p=1' };
+    const mp = makeEnv({ store: { autoNext: true, cfgVersion: 4 }, location: loc3 });
+    mp.api._runtime.video = mkVideo();
+    mp.api._runtime.ctx = { bvid: 'BV1TEST00001', page: 1, pages: [1, 2, 3] };
+    mp.api._runtime.result = { ok: true, segments: [ED] };
+    mp.api._skipNow();
+    check('多分P：切到 ?p=2', /p=2/.test(loc3.href), true);
+
+    /* ⑤ 同一集只切一次（goNextEpisode 自己的去重） */
+    const g = makeEnv({});
+    const b3 = mkNext(g);
+    const goNext = g.api.api_.goNextEpisode;
+    checkTrue('api_.goNextEpisode 已导出', typeof goNext === 'function');
+    const gnext = (typeof goNext === 'function') ? goNext : (() => false);
+    check('第一次切成功', gnext(), true);
+    check('第二次被挡住', gnext(), false);
+    check('按钮只被点了 1 次', b3.clicked, 1);
+
+    /* ⑥ 开关进了设置面板（不再摆胶囊上）：勾上保存 → autoNext 开 */
+    const s = makeEnv({ store: { autoDetect: 'off' }, location: { pathname: '/video/BV1jfDYBSEKs', search: '?p=1' } });
+    const sp = openPanelVia(s, 'settings');
+    const anBox = sp.querySelector('.autonext');
+    checkTrue('设置面板有「自动切下一集」开关', !!anBox);
+    check('默认关：开关未勾选', anBox && anBox.checked, false);
+    orNode(anBox, 'input').checked = true;
+    orNode(sp.querySelector('.save'), 'button').dispatch('click');
+    check('勾上保存 → autoNext 开', s.store.autoNext, true);
+
+    check('新装默认：autoNext 关', makeEnv().api.api_.getConfig().autoNext, false);
+  }
+
+  /* ==================================================================
+   * 44. 中文名直查只有 3 条时，搜索一回来就有第三季（不依赖季链）
+   *     另外：请求全失败时不得把「没结果」写进缓存。
+   * ================================================================== */
+  head('44. 中文名搜索立刻补全同系列（第三季）');
+  {
+    const mk = (id, mal, eps, native, year) => ({
+      id, idMal: mal, episodes: eps, format: 'TV', startDate: { year }, synonyms: [],
+      title: { native, romaji: native }
+    });
+    const I = mk(108465, 39535, 11, '無職転生 ～異世界行ったら本気だす～', 2021);
+    const I2 = mk(127720, 45576, 12, '無職転生 ～異世界行ったら本気だす～ 第2クール', 2021);
+    const II = mk(146065, 51179, 13, '無職転生Ⅱ ～異世界行ったら本気だす～', 2023);
+    const II2 = mk(166873, 55888, 12, '無職転生Ⅱ ～異世界行ったら本気だす～ 第2クール', 2024);
+    const III = mk(178789, 59193, 14, '無職転生Ⅲ ～異世界行ったら本気だす～', 2026);
+    const node = (m) => ({ id: m.id, idMal: m.idMal, episodes: m.episodes, format: 'TV', startDate: m.startDate, title: m.title });
+    const edge = (t, m) => ({ relationType: t, node: node(m) });
+    const REL = {
+      108465: Object.assign({}, node(I), { relations: { edges: [edge('SEQUEL', I2)] } }),
+      166873: Object.assign({}, node(II2), { relations: { edges: [edge('PREQUEL', II), edge('SEQUEL', III)] } })
+    };
+    const net = makeNet({
+      'https://graphql.anilist.co': (req) => {
+        const q = JSON.parse(req.data);
+        if (q.variables && q.variables.id !== undefined) return { data: { Media: REL[q.variables.id] || null } };
+        return { data: { Page: { media: q.variables.q === '无职转生' ? [I, II2, II] : [] } } };
+      }
+    });
+
+    const env = makeEnv({ net });
+    const list = await env.api.api_.searchByName('无职转生');
+    checkTrue('搜索一回来就有第三季（Ⅲ）', list.some((m) => m.id === 178789), list.map((m) => m.id));
+    const third = list.find((m) => m.id === 178789);
+    check('第三季标着「同系列」来路', third && third.via, 'family');
+    check('第一季第2クール也被补上', list.some((m) => m.id === 127720), true);
+    check('直查的条目仍然在前（Ⅰ 领跑）', list[0] && list[0].id, 108465);
+
+    /* 全失败 → 不得缓存「没结果」 */
+    const dead = makeEnv({ net: makeNet({}), netFail: () => 'error' });
+    await dead.api.api_.searchByName('无职转生');
+    dead.api._flushCache();
+    const cached = JSON.parse(dead.store._cache || '{}');
+    check('请求全失败不写缓存（下次会重新请求）', 'ui:无职转生' in cached, false);
+  }
+
+  /* ==================================================================
+   * 45. 失败原因可辨（限流 / 超时 / 网络不通），不再笼统一句「稍后重试」
+   * ================================================================== */
+  head('45. 网络失败原因可见');
+  {
+    const lbl = (kinds) => {
+      const env = makeEnv({ store: { autoDetect: 'off' } });
+      env.api._runtime.ctx = { bvid: 'BV1TEST00001' };
+      env.api._runtime.result = { ok: false, reason: 'net-error' };
+      env.api._runtime.netFail = { kinds: kinds, sources: [], at: 1 };
+      if (typeof env.api._renderPill === 'function') env.api._renderPill();
+      return (byClass('pill') || { textContent: '' }).textContent;
+    };
+    checkTrue('限流(429) → 胶囊写「限流」', /限流/.test(lbl({ 'http-429': 1 })), lbl({ 'http-429': 1 }));
+    checkTrue('超时 → 胶囊写「超时」', /超时/.test(lbl({ timeout: 1 })), lbl({ timeout: 1 }));
+    checkTrue('网络不通 → 胶囊写「网络不通」', /网络不通/.test(lbl({ network: 1 })), lbl({ network: 1 }));
+
+    /* 端到端：AniList 被限流(429)，原因要带着 source 记进 runtime.netFail */
+    const env = makeEnv({
+      net: makeNet({}),
+      netFail: (req) => (req.url.indexOf('graphql.anilist.co') >= 0 ? { status: 429 } : 'error')
+    });
+    await env.api.api_.searchByName('无职转生');
+    const nf = env.api._runtime.netFail;
+    checkTrue('429 记进 runtime.netFail.kinds', !!(nf && nf.kinds && nf.kinds['http-429']),
+      JSON.stringify(nf && nf.kinds));
+    checkTrue('失败来源记进 sources（anilist）', !!(nf && nf.sources && nf.sources.indexOf('anilist') >= 0),
+      JSON.stringify(nf && nf.sources));
+  }
+
+  /* ==================================================================
+   * 46. 「未识别时也显示胶囊」改成设置里的「隐藏胶囊（普通视频）」
+   * ================================================================== */
+  head('46. 隐藏胶囊（普通视频）');
+  {
+    /* ① 默认（显示胶囊）：设置里的「隐藏胶囊」未勾选 */
+    const env = makeEnv({ store: { autoDetect: 'off' }, location: { pathname: '/video/BV1jfDYBSEKs', search: '?p=1' } });
+    const sp = openPanelVia(env, 'settings');
+    const hideBox = sp.querySelector('.hide');
+    checkTrue('设置面板有「隐藏胶囊」开关', !!hideBox);
+    check('默认不隐藏：开关未勾选', hideBox && hideBox.checked, false);
+
+    /* ② 勾上保存 → showIdlePill 关（普通视频不再渲染胶囊） */
+    orNode(hideBox, 'input').checked = true;
+    orNode(sp.querySelector('.save'), 'button').dispatch('click');
+    check('勾上保存 → showIdlePill 关', env.store.showIdlePill, false);
+
+    /* ③ 再次打开设置：开关反映「已隐藏」；取消勾选保存 → 恢复显示 */
+    const sp2 = openPanelVia(env, 'settings');
+    const hideBox2 = sp2.querySelector('.hide');
+    check('再打开：开关反映已隐藏（勾选）', hideBox2 && hideBox2.checked, true);
+    orNode(hideBox2, 'input').checked = false;
+    orNode(sp2.querySelector('.save'), 'button').dispatch('click');
+    check('取消勾选保存 → showIdlePill 开', env.store.showIdlePill, true);
+
+    check('新装默认：不隐藏（showIdlePill 开）', makeEnv().api.api_.getConfig().showIdlePill, true);
+
+    /* ④ 收起成圆点后，「隐藏胶囊」照样把普通视频的圆点也藏掉 */
+    const c = makeEnv({ store: { autoDetect: 'off', showIdlePill: false, pillCollapsed: true, cfgVersion: 4 } });
+    // 先渲染一个「识别成功」的圆点拿到挂载点（识别成功不受「隐藏胶囊」影响，圆点该显示）
+    c.api._runtime.ctx = { bvid: 'BV1TEST00001' };
+    c.api._runtime.result = { ok: true, title: '无职转生', episode: 1, autoSkip: false, segments: [{ type: 'op', start: 5, end: 40 }] };
+    if (typeof c.api._renderPill === 'function') c.api._renderPill();
+    const mini0 = byClass('pill');
+    const root = (mini0 && mini0.parentNode) || el('div');
+    checkTrue('识别成功 + 收起 → 显示 mini 圆点', !!(root.querySelector('.pill')));
+    // 切到普通视频（autodetect-off）再渲染 → 圆点也被藏掉
+    c.api._runtime.result = { ok: false, reason: 'autodetect-off' };
+    if (typeof c.api._renderPill === 'function') c.api._renderPill();
+    checkTrue('普通视频 + 隐藏胶囊 + 收起 → 连圆点都不显示', !(root.querySelector('.pill')));
   }
 
   /* --- 汇总 --- */

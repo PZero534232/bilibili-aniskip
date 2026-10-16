@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.4.7
+// @version      0.4.8
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -67,11 +67,19 @@
      * 负数不会倒回片段内部（最多落在起跳点之后 1 秒），所以「少跳」是安全的。 */
     skipOffset: 0,
 
+    /* 整段平移：UP 主在开头多加了 N 秒时，数据库的时间戳整体偏后 N 秒。
+     * 起点和落点一起挪（只挪落点治不了「起跳太早」）。 */
+    skipShift: 0,
+
     undoSeconds: 4,        // 跳过后「撤回」提示停留秒数（0 = 不显示撤回）
     showToast: true,       // 跳转提示
 
     useSeasonTitle: true,  // 优先用 UGC 合集里 UP 主改过的单集标题
-    showIdlePill: true,    // 未识别出番剧时也显示胶囊（默认开：入口常在，随时能绑定 / 改设置）
+    showIdlePill: true,    // 未识别出番剧时也显示胶囊（默认显示；设置里以「隐藏胶囊」反向呈现）
+
+    pillCollapsed: false,  // 胶囊是否收成一个小圆点（点圆点展开）
+
+    autoNext: false,       // ED 跳完自动切下一集（默认关：只给「ED 后面没有彩蛋」的番用）
 
     confThreshold: 60,     // auto 模式下自动跳的置信度门槛
     hintThreshold: 35      // 低于此值连提示都不给
@@ -93,12 +101,18 @@
      * v1：showIdlePill 默认 false；v2 起默认 true（用户要求「未识别时也显示胶囊」默认开）。
      *     老安装里存着的 false 既可能是旧默认、也可能是手动关的 —— 但旧默认本来就不显示，
      *     手动再去关一次没有意义，所以这里一律清掉，让新默认生效。
-     * v3：undoSeconds 默认 8 秒 → 4 秒（用户反馈撤回提示停留太久）。同理清掉旧值。 */
+     * v3：undoSeconds 默认 8 秒 → 4 秒（用户反馈撤回提示停留太久）。同理清掉旧值。
+     * v4：autoNext 默认关，但 v0.4.8 曾在胶囊上放过「⇥」开关、点过就存成 true；清掉让默认关生效。
+     *     autoCollapseFullscreen 已整个移除，一并清掉残留。 */
     var prevVer = gmGet('cfgVersion', 1) || 1;
-    var CFG_VERSION = 3;
+    var CFG_VERSION = 4;
     if (prevVer < CFG_VERSION) {
       if (prevVer < 2) { try { GM_deleteValue('showIdlePill'); } catch (e) { /* ignore */ } }
       if (prevVer < 3) { try { GM_deleteValue('undoSeconds'); } catch (e) { /* ignore */ } }
+      if (prevVer < 4) {
+        try { GM_deleteValue('autoNext'); } catch (e) { /* ignore */ }
+        try { GM_deleteValue('autoCollapseFullscreen'); } catch (e) { /* ignore */ }
+      }
       gmSet('cfgVersion', CFG_VERSION);
     }
     Object.keys(DEFAULTS).forEach(function (k) { config[k] = gmGet(k, DEFAULTS[k]); });
@@ -109,8 +123,12 @@
     config.showToast = !!config.showToast;
     config.useSeasonTitle = !!config.useSeasonTitle;
     config.showIdlePill = !!config.showIdlePill;
+    config.pillCollapsed = !!config.pillCollapsed;
+    config.autoNext = !!config.autoNext;
     var off = Number(config.skipOffset);
     config.skipOffset = isFinite(off) ? Math.max(-30, Math.min(30, off)) : 0;
+    var sh = Number(config.skipShift);
+    config.skipShift = isFinite(sh) ? Math.max(-30, Math.min(30, Math.round(sh))) : 0;
     var us = Number(config.undoSeconds);
     config.undoSeconds = isFinite(us) ? Math.max(0, Math.min(30, us)) : DEFAULTS.undoSeconds;
   })();
@@ -118,6 +136,14 @@
   /* ==================================================================
    * 2. 通用工具
    * ================================================================== */
+  /* 把 HTTP 状态码归成可读的失败类别（胶囊文案 / 调试都靠它） */
+  function httpKind(status) {
+    if (status === 429) return 'http-429';
+    if (status === 403) return 'http-403';
+    if (status >= 500) return 'http-5xx';
+    return 'http-4xx';
+  }
+
   function xhr(opts) {
     return new Promise(function (resolve, reject) {
       try {
@@ -129,24 +155,30 @@
           timeout: opts.timeout || 15000,
           onload: function (r) {
             if (r.status >= 200 && r.status < 300) resolve(r.responseText);
-            else reject(new Error('HTTP ' + r.status));
+            else { var e = new Error('HTTP ' + r.status); e.kind = httpKind(r.status); e.status = r.status; reject(e); }
           },
-          onerror: function () { reject(new Error('network error')); },
-          ontimeout: function () { reject(new Error('timeout')); }
+          onerror: function () { var e = new Error('network error'); e.kind = 'network'; reject(e); },
+          ontimeout: function () { var e = new Error('timeout'); e.kind = 'timeout'; reject(e); }
         });
-      } catch (e) { reject(e); }
+      } catch (e) { e.kind = e.kind || 'gm'; reject(e); }
     });
   }
 
   function jget(url) {
-    return xhr({ url: url }).then(function (t) { return JSON.parse(t); });
+    return xhr({ url: url }).then(function (t) {
+      try { return JSON.parse(t); }
+      catch (e) { e.kind = 'parse'; throw e; }
+    });
   }
 
   function jpost(url, body, extraHeaders) {
     var h = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
     if (extraHeaders) Object.keys(extraHeaders).forEach(function (k) { h[k] = extraHeaders[k]; });
     return xhr({ method: 'POST', url: url, data: JSON.stringify(body), headers: h })
-      .then(function (t) { return JSON.parse(t); });
+      .then(function (t) {
+        try { return JSON.parse(t); }
+        catch (e) { e.kind = 'parse'; throw e; }
+      });
   }
 
   function fmtTime(s) {
@@ -612,9 +644,30 @@
   }
 
   /* 网络错误计数：区分「上游说没有」和「网线断了 / 被限流」。
-   * 老实现把所有 catch 都吞成 []，UI 上两者长得一模一样，用户只能靠猜。 */
+   * 老实现把所有 catch 都吞成 []，UI 上两者长得一模一样，用户只能靠猜。
+   * kind/source 记进 runtime.netFail，胶囊文案和调试都能说清「谁挂了、为什么」。 */
   var netErrors = 0;
-  function noteNetError() { netErrors++; }
+  function noteNetError(kind, source) {
+    netErrors++;
+    var f = runtime.netFail || (runtime.netFail = { kinds: {}, sources: [], at: 0 });
+    var k = kind || 'unknown';
+    f.kinds[k] = (f.kinds[k] || 0) + 1;
+    if (source && f.sources.indexOf(source) < 0) f.sources.push(source);
+    f.at = Date.now();
+  }
+
+  /* 胶囊文案：把「哪个源、为什么」说清楚 */
+  function netFailText() {
+    var f = runtime.netFail;
+    if (!f) return '网络请求失败，稍后重试';
+    if (f.kinds['http-429']) return '数据源限流(429)，稍后重试';
+    if (f.kinds.timeout) return '请求超时，稍后重试';
+    if (f.kinds['http-403']) return '数据源拒绝(403)，稍后重试';
+    if (f.kinds['http-5xx']) return '数据源故障(5xx)，稍后重试';
+    if (f.kinds.network) return '网络不通，稍后重试';
+    if (f.kinds.parse) return '数据源返回异常，稍后重试';
+    return '网络请求失败，稍后重试';
+  }
 
   // 手动绑定表 & 黑名单
   var bindings = {};
@@ -689,7 +742,7 @@
         throw new Error((d && d.message) || 'view api failed');
       })
       .catch(function (err) {
-        noteNetError();
+        noteNetError(err && err.kind, 'bili');
         throw err;
       });
   }
@@ -1025,7 +1078,7 @@
         cacheSet(ckey, media, { negative: !media.length });
         return media;
       })
-      .catch(function () { noteNetError(); return []; });
+      .catch(function (e) { noteNetError(e && e.kind, 'anilist'); return []; });
   }
 
   /* ---- 中文名 → 日文原名的桥：Bangumi ----
@@ -1047,7 +1100,7 @@
         cacheSet(ckey, list, { negative: !list.length });
         return list;
       })
-      .catch(function () { noteNetError(); return []; });
+      .catch(function (e) { noteNetError(e && e.kind, 'bangumi'); return []; });
   }
 
   // 条目的别名（英文 / 罗马字 / 繁中 / 简写都在里面，简写的救命稻草）
@@ -1073,7 +1126,7 @@
         cacheSet(ckey, out);
         return out;
       })
-      .catch(function () { noteNetError(); return []; });
+      .catch(function (e) { noteNetError(e && e.kind, 'bangumi'); return []; });
   }
 
   function bgmTitleScore(entry, extras, query) {
@@ -1238,7 +1291,7 @@
          * 会把「没有分季规则」写死一个月，Fairy Tail 这类需要重映射的番会一直取错季。 */
         var msg = (err && err.message) || '';
         if (/^HTTP 4/.test(msg)) cacheSet(ckey, []);
-        else noteNetError();
+        else noteNetError(err && err.kind, 'anilist');
         return { malId: malId, ep: ep, mapped: false };
       });
   }
@@ -1272,7 +1325,7 @@
         cacheSet(ckey, m);
         return m;
       })
-      .catch(function () { noteNetError(); return null; });
+      .catch(function (e) { noteNetError(e && e.kind, 'anilist'); return null; });
   }
 
   function seasonNode(node) {
@@ -1658,7 +1711,7 @@
       });
       cacheSet(ckey, segs, { negative: !segs.length });
       return { segs: segs, failed: false };
-    }).catch(function () { noteNetError(); return { segs: [], failed: true }; });
+    }).catch(function (e) { noteNetError(e && e.kind, 'aniskip'); return { segs: [], failed: true }; });
   }
 
   /* ==================================================================
@@ -1712,7 +1765,7 @@
         cacheSet(ckey, segs, { negative: !segs.length });
         return { segs: segs, failed: false };
       })
-      .catch(function () { noteNetError(); return { segs: [], failed: true }; });
+      .catch(function (e) { noteNetError(e && e.kind, 'anime-skip'); return { segs: [], failed: true }; });
   }
 
   /* ==================================================================
@@ -1880,6 +1933,7 @@
 
   function identify(ctx) {
     netErrors = 0;                       // 本次识别周期内累计的网络失败数
+    runtime.netFail = null;              // 失败原因（限流/超时/…）按识别周期重新累计
     var ms = detectMultiSeason(ctx);
     var guess = episodeGuess(ctx);
 
@@ -2080,6 +2134,8 @@
     booted: false,             // SPA 定位轮询是否已经挂上（防重复注入）
     bootTimer: null,
     lastLocKey: '',
+    screen: 'normal',          // 'normal' | 'web' | 'full'（网页全屏=web：胶囊要临时收起别挡画面）
+    autoNextDone: false,       // 自动切下一集：每个视频只切一次（换集/换视频由 rerun 清掉）
     pillDragged: false       // 胶囊刚被拖动过：紧跟着的那次 click 不算点击
   };
 
@@ -2091,6 +2147,22 @@
   function doSeek(video, target) {
     try { video.currentTime = target; return true; }
     catch (e) { return false; }
+  }
+
+  /* 整段平移：UP 主在开头加了 N 秒，数据库里所有时间戳都偏后 N 秒。
+   * 起点和落点一起挪（只挪落点治不了「起跳太早」）。越界夹回 [0, 时长]。 */
+  function shiftSeg(seg) {
+    var s = Number(config.skipShift) || 0;
+    if (!s) return seg;
+    var dur = (runtime.video && runtime.video.duration) || 0;
+    var a = Math.max(0, seg.start + s);
+    var b = seg.end + s;
+    if (dur) b = Math.min(b, dur - 0.05);
+    if (b - a < 1) b = a + Math.max(1, seg.end - seg.start);
+    return {
+      type: seg.type, mixed: seg.mixed, start: a, end: b,
+      source: seg.source, epLen: seg.epLen, shift: s
+    };
   }
 
   /* 跳过片段的实际落点。config.skipOffset 让用户微调（上游按原片标的时间戳，
@@ -2128,8 +2200,37 @@
     if (ok) {
       if (!wasPaused && video.paused) { try { video.play(); } catch (e) { /* ignore */ } }
       notifySkip(seg, from, video, target);
+      // 自动切下一集：只认 ED；开启时「跳完 ED 就切」，没额外内容的番才该开它
+      if (seg.type === 'ed' && config.autoNext) goNextEpisode();
     }
     return ok;
+  }
+
+  /* 自动切下一集。切换入口依次退化（B 站的 DOM/URL 契约，找不到就什么都不做）：
+   *   1. 播放器自带的「下一集」按钮 .bpx-player-ctrl-next（SPA 内切，最稳）
+   *   2. 同 BV 的多分P → 改 ?p=N+1
+   *   3. UGC 合集里的下一话 → 点列表里当前项的下一个可点项 */
+  function goNextEpisode() {
+    if (runtime.autoNextDone) return false;
+    try {
+      var btn = document.querySelector('.bpx-player-ctrl-next');
+      if (btn && !btn.disabled) { runtime.autoNextDone = true; btn.click(); return true; }
+    } catch (e) { /* ignore */ }
+    var c = runtime.ctx || {};
+    if (c.pages && c.pages.length > 1 && c.page < c.pages.length) {
+      runtime.autoNextDone = true;
+      try {
+        var u = new URL(location.href);
+        u.searchParams.set('p', String(c.page + 1));
+        location.href = u.toString();
+      } catch (e2) { /* ignore */ }
+      return true;
+    }
+    try {
+      var nx = document.querySelector('.video-pod__item.on ~ .video-pod__item a');
+      if (nx) { runtime.autoNextDone = true; nx.click(); return true; }
+    } catch (e3) { /* ignore */ }
+    return false;
   }
 
   function notifySkip(seg, from, video, target) {
@@ -2138,6 +2239,8 @@
     var off = Number(config.skipOffset) || 0;
     var desc = fmtTime(seg.start) + ' → ' + fmtTime(target || seg.end);
     if (off) desc += '（偏移 ' + (off > 0 ? '+' : '') + off + 's）';
+    var sh = Number(config.skipShift) || 0;
+    if (sh) desc += '（整体 ' + (sh > 0 ? '+' : '') + sh + 's）';
     var undo = function () {
       /* 撤回：这是防错跳的最后一道保险。
        * 注意 **不要再删 runtime.skipped 里那条记录** —— 原来删了，于是下一轮轮询
@@ -2168,7 +2271,7 @@
 
     var t = video.currentTime;
     for (var i = 0; i < segs.length; i++) {
-      var s = segs[i];
+      var s = shiftSeg(segs[i]);
       if (!shouldSkipThisSegment(s)) continue;
       if (t >= s.start && t < s.end - 0.2) {
         performSkip(video, s);
@@ -2380,6 +2483,7 @@
         }).catch(function () { /* Bangumi 不可用不影响主流程 */ }));
       }
     });
+    var netBefore = netErrors;
     return Promise.all(jobs).then(function () {
       /* 直查（用户自己敲的那个词）的结果在前，Bangumi 桥的补充在后。
        * 老实现反过来把 via:'bangumi' 整体提到最前 —— 中文名经桥解析成哪一季，
@@ -2390,8 +2494,32 @@
       out.sort(function (a, b) {
         return (directIds[a.id] ? 0 : 1) - (directIds[b.id] ? 0 : 1);
       });
-      cacheSet(ckey, out);
-      return out;
+      /* 直查中文名常常只回 3 条（实测「无职转生」没有第三季）。前 2 条各走一跳
+       * 续季关系（30 天缓存），把同系列的 TV 条目补上 —— 搜索一回来就能选到
+       * 第三季，不用等季链、也不依赖 Bangumi 桥。 */
+      var top = out.filter(function (m) { return directIds[m.id]; }).slice(0, 2);
+      return Promise.all(top.map(function (m) {
+        return anilistRelations(m.id);
+      })).then(function (groups) {
+        (groups || []).forEach(function (g) {
+          if (!g || !g.relations) return;
+          (g.relations.edges || []).forEach(function (e) {
+            var nd = e && e.node;
+            if (!nd || !nd.id || nd.format !== 'TV') return;
+            if (seen[nd.id]) return;
+            seen[nd.id] = 1;
+            out.push({
+              id: nd.id, idMal: nd.idMal, episodes: nd.episodes, format: nd.format || 'TV',
+              title: nd.title || {}, year: (nd.startDate && nd.startDate.year) || 0,
+              via: 'family', bgm: null, cn: ''
+            });
+          });
+        });
+        // 全部请求都失败、结果又是空的 → 别把「没结果」缓存 6 小时（那是网络故障，不是真的没有）
+        var allFailedEmpty = !out.length && netErrors > netBefore;
+        if (!allFailedEmpty) cacheSet(ckey, out);
+        return out;
+      });
     });
   }
 
@@ -2422,9 +2550,73 @@
   }
 
   /* ---- 状态胶囊：所有交互的入口 ---- */
+  /* 状态圆点颜色：off 灰 / warn 橙 / err 红 / '' 绿 */
+  var DOT_COLORS = { 'off': '#8a9099', 'warn': '#ffb648', 'err': '#ff5b5b', '': '#00d1b2' };
+
+  function pillDotCls(r) {
+    if (!r) return 'off';
+    if (!r.ok) {
+      var idleOff = r.reason === 'autodetect-off';
+      if (idleOff || r.reason === 'no-match' || r.reason === 'low-score') return 'off';
+      if (r.reason === 'net-error') return 'warn';
+      return 'err';
+    }
+    var segCount = (r.segments || []).filter(segmentEnabled).length;
+    return segCount ? '' : 'warn';
+  }
+
+  function isMiniPill() {
+    return !!config.pillCollapsed;
+  }
+
+  /* B 站「网页全屏」是 CSS 铺满（不是浏览器全屏），我们的胶囊 z-index 比它高，于是浮在画面上。
+   * 用户要求：全屏时**完全隐藏**胶囊（连小圆点都不要），退出再恢复 —— 这是自带行为，不给开关。
+   * 真实全屏本来只渲染 fullscreen 子树，胶囊也不显示。这里只认 web/full，认不出就按普通处理。 */
+  function detectScreen() {
+    try {
+      var c = document.querySelector('.bpx-player-container');
+      var v = c && c.getAttribute && c.getAttribute('data-screen');
+      if (v === 'web') return 'web';
+      if (v === 'full') return 'full';
+    } catch (e) { /* ignore */ }
+    try { if (document.fullscreenElement) return 'full'; } catch (e2) { /* ignore */ }
+    return 'normal';
+  }
+  function applyScreen() {
+    var s = detectScreen();
+    if (s === runtime.screen) return;
+    runtime.screen = s;
+    renderPill();
+  }
+
+  function renderMiniPill(r) {
+    var m = document.createElement('div');
+    m.className = 'pill mini';
+    m.innerHTML = '<span class="dot"></span>';
+    m.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;' +
+      'border-radius:50%;background:rgba(20,22,26,.72);cursor:pointer;user-select:none;touch-action:none;';
+    var dot = m.querySelector('.dot');
+    if (dot) {
+      dot.style.cssText = 'display:block;width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:' +
+        (DOT_COLORS[pillDotCls(r)] || '#8a9099') + ';';
+    }
+    attachPillDrag(m);
+    m.addEventListener('click', function () {
+      if (runtime.pillDragged) { runtime.pillDragged = false; return; }
+      config.pillCollapsed = false;
+      gmSet('pillCollapsed', false);
+      renderPill();
+    });
+    applyPillPos();
+    uiRoot.appendChild(m);
+  }
+
   function renderPill() {
     ensureUI();
     uiRoot.innerHTML = '';
+    // 网页全屏 / 真实全屏：胶囊整个隐藏（连圆点都不留），退出全屏由 applyScreen 再渲染回来。
+    // 这是自带行为，不是开关。
+    if (runtime.screen === 'web' || runtime.screen === 'full') return;
     var pill = document.createElement('div');
     pill.className = 'pill';
 
@@ -2432,6 +2624,13 @@
     var ctx = runtime.ctx;
     var bound = false;
     try { bound = !!(ctx && getBinding(ctx)); } catch (e) { bound = false; }
+
+    // 「隐藏胶囊（普通视频）」：普通视频（自动识别关闭时的默认态）上整个不显示 ——
+    // 连收起的小圆点也一起藏。已绑定的番剧例外：绑过代表用户明确要它跳，得留着方便随时改。
+    if (r && !r.ok && r.reason === 'autodetect-off' && !config.showIdlePill && !bound) return;
+
+    /* 收起态：只剩一颗状态色小圆点，点它展开。 */
+    if (isMiniPill()) { renderMiniPill(r); return; }
 
     var parts = [];
     var fallback = openBindPanel;      // 点胶囊空白处做什么
@@ -2442,10 +2641,8 @@
     } else if (!r) {
       parts.push('<span class="dot off"></span><span>番剧跳过 · 未识别</span>');
     } else if (!r.ok) {
-      // 自动识别关闭时（默认），普通视频不留任何视觉痕迹 —— 除非用户开了「未识别时也显示胶囊」。
-      // 这个视频已经绑过也例外：绑过代表用户明确要它跳，胶囊留着方便随时改。
+      // 自动识别关闭时（默认），普通视频不留任何视觉痕迹 —— 上面的「隐藏胶囊」早退已处理。
       var idleOff = r.reason === 'autodetect-off';
-      if (idleOff && !config.showIdlePill && !bound) return;
       var why = {
         'autodetect-off': '未识别',
         blacklisted: '已标记「不是番剧」· 不会再跳',
@@ -2456,7 +2653,7 @@
         // 但「番名没匹配上」「置信度不足」根本不是错误，更不是网络故障
         'no-match': '没匹配到番剧，可点「绑定」',
         'low-score': '番名不太确定，可点「绑定」',
-        'net-error': '网络请求失败，稍后重试'
+        'net-error': netFailText()
       }[r.reason] || '识别失败';
       // autodetect-off 是「正常状态」、net-error 是「外部故障」，都不该用红点吓人
       var dotCls = (idleOff || r.reason === 'no-match' || r.reason === 'low-score') ? 'off'
@@ -2484,6 +2681,7 @@
     }
     // 末尾统一挂一个设置入口 —— 胶囊原来只有识别出来才出现，想改设置得去油猴菜单，太绕
     parts.push('<span class="sep"></span><span class="act" data-a="cfg" title="番剧跳过设置">⚙</span>');
+    parts.push('<span class="sep"></span><span class="act" data-a="collapse" title="收起胶囊">–</span>');
     pill.innerHTML = parts.join('');
     /* 关键样式内联：页面 CSP 拦掉 <style> 注入时（脚本仍能跑，只是样式没了），
      * 面板早就靠内联活着，胶囊却会变成一个裸 div。这里补上最小可用的外观。 */
@@ -2512,6 +2710,11 @@
     }
     onAct('bind', openBindPanel);
     onAct('cfg', openSettings);
+    onAct('collapse', function () {
+      config.pillCollapsed = true;
+      gmSet('pillCollapsed', true);
+      renderPill();
+    });
     onAct('go', skipNow);
     /* 「不是番剧」的**标记入口已经整个删掉**（0.4.6 试过挪进绑定面板，用户反馈
      * 仍然「太突兀」）：它是个低频、误触代价很大的动作（一不小心整条视频再也不跳），
@@ -2583,7 +2786,7 @@
 
   function applyPillPos() {
     var p = readPillPos();
-    if (!p) return;
+    if (!p) { try { uiRoot.style.cssText = ''; } catch (e2) { /* ignore */ } return; }
     var c = clampPillPos(p.left, p.top);
     setPillRootPos(c.left, c.top);
   }
@@ -2648,7 +2851,7 @@
 
   function nextSkippableSeg() {
     var segs = (runtime.result && runtime.result.segments) || [];
-    var en = segs.filter(segmentEnabled);
+    var en = segs.filter(segmentEnabled).map(shiftSeg);
     if (!en.length) return null;
     var v = runtime.video || getVideo();
     var t = (v && v.currentTime) || 0;
@@ -3148,7 +3351,9 @@
         item.innerHTML = '<div class="nm"></div><div class="meta"></div>';
         item.querySelector('.nm').textContent = titles;
         item.querySelector('.meta').textContent = [
-          m.via === 'bangumi' ? '经 Bangumi 中文库命中' : (m.via === 'chain' ? '同系列（季链补全）' : ''),
+          m.via === 'bangumi' ? '经 Bangumi 中文库命中'
+            : (m.via === 'chain' ? '同系列（季链补全）'
+            : (m.via === 'family' ? '同系列（自动补全）' : '')),
           m.format,
           m.year ? m.year + ' 年' : '',
           m.episodes ? m.episodes + ' 集' : '集数未知',
@@ -3272,11 +3477,14 @@
       '<div class="row"><div><div class="lab">跳过「融进正片」的 OP/ED</div><div class="tip">有些番没有独立 OP 段，OP 是和画面融在一起播的（每集还可能不一样）。跳过这类区间会切掉正片内容，默认关</div></div><input type="checkbox" class="mixed"></div>' +
       '<div class="row"><div><div class="lab">跳过偏移（秒）</div><div class="tip">在数据库给的时间戳上再挪一点。正数＝多跳（跳过 OP 后的黑屏／静帧），负数＝少跳（保留 OP 尾巴，最多减到片段起点，不会倒着跳）</div></div>' +
       '<slot name="offset"></slot></div>' +
+      '<div class="row"><div><div class="lab">片头/片尾整段平移（秒）</div><div class="tip">UP 主在开头多加了片段时用：起点和落点一起挪。比如开头多加了 20 秒就填 20，OP/ED 会整段顺延 20 秒</div></div>' +
+      '<slot name="skipshift"></slot></div>' +
       '<div class="row"><div><div class="lab">撤回提示秒数</div><div class="tip">跳过后可以点「撤回」回到原位置，0＝不显示</div></div>' +
       '<slot name="undo"></slot></div>' +
       '<div class="row"><div><div class="lab">显示跳转提示</div></div><input type="checkbox" class="toast"></div>' +
       '<div class="row"><div><div class="lab">优先用合集单集标题</div><div class="tip">UP 主在合集里改过的标题往往比原始标题干净</div></div><input type="checkbox" class="seasonT"></div>' +
-      '<div class="row"><div><div class="lab">未识别时也显示胶囊</div><div class="tip">关掉则普通视频上完全无痕，入口在油猴菜单</div></div><input type="checkbox" class="idle"></div>' +
+      '<div class="row"><div><div class="lab">隐藏胶囊（普通视频）</div><div class="tip">未识别出番剧的普通视频上不显示胶囊；识别成功／已绑定的番剧照常显示。想找回入口用油猴菜单</div></div><input type="checkbox" class="hide"></div>' +
+      '<div class="row"><div><div class="lab">自动切下一集</div><div class="tip">ED 跳完直接切下一个 P／下一话（依次退化：播放器的下一集按钮 → 同 BV 分P → UGC 合集下一话）。只给「ED 后面没有彩蛋」的番用，默认关</div></div><input type="checkbox" class="autonext"></div>' +
       '<div class="row"><div><div class="lab">胶囊位置</div><div class="tip">胶囊可以直接用鼠标／手指拖到任意位置，位置会记住；拖累了就点这里回到右上角</div></div>' +
       '<button class="resetpos">重置位置</button></div>' +
       '<div class="btns"><button class="clr">清空缓存</button>' +
@@ -3301,10 +3509,14 @@
     offInput.className = 'offset';
     offInput.type = 'number'; offInput.min = '-30'; offInput.max = '30'; offInput.step = '1';
     slotted.push(offInput);
+    var shiftInput = mkSlot('input', 'skipshift', INP_CSS + 'width:90px;');
+    shiftInput.className = 'skipshift';
+    shiftInput.type = 'number'; shiftInput.min = '-30'; shiftInput.max = '30'; shiftInput.step = '1';
+    slotted.push(shiftInput);
 
     // 复选框：只做「不给焦点」（tabindex=-1 + 阻止 mousedown 默认行为），
     // 翻转交给浏览器原生行为 —— 自己翻的实现见 15.2 的踩坑记录
-    ['op', 'ed', 'recap', 'mixed', 'toast', 'seasonT', 'idle'].forEach(function (cls) {
+    ['op', 'ed', 'recap', 'mixed', 'toast', 'seasonT', 'hide', 'autonext'].forEach(function (cls) {
       noFocus(panel.querySelector('.' + cls));
     });
     noFocus(panel.querySelector('.clr'));
@@ -3320,9 +3532,11 @@
     panel.querySelector('.mixed').checked = config.jumpMixed;
     undoInput.value = config.undoSeconds;
     offInput.value = config.skipOffset;
+    shiftInput.value = config.skipShift;
     panel.querySelector('.toast').checked = config.showToast;
     panel.querySelector('.seasonT').checked = config.useSeasonTitle;
-    panel.querySelector('.idle').checked = config.showIdlePill;
+    panel.querySelector('.hide').checked = !config.showIdlePill;   // 「隐藏胶囊」= showIdlePill 反过来
+    panel.querySelector('.autonext').checked = config.autoNext;
 
     panel.querySelector('.cancel').addEventListener('click', closePanel);
     panel.querySelector('.clr').addEventListener('click', function () {
@@ -3347,9 +3561,14 @@
           var n = parseInt(offInput.value, 10);
           return isFinite(n) ? n : 0;
         })())),
+        skipShift: Math.max(-30, Math.min(30, (function () {
+          var n = parseInt(shiftInput.value, 10);
+          return isFinite(n) ? n : 0;
+        })())),
         showToast: panel.querySelector('.toast').checked,
         useSeasonTitle: panel.querySelector('.seasonT').checked,
-        showIdlePill: panel.querySelector('.idle').checked
+        showIdlePill: !panel.querySelector('.hide').checked,   // 「隐藏胶囊」勾上 = showIdlePill 关
+        autoNext: panel.querySelector('.autonext').checked
       };
       Object.keys(patch).forEach(function (k) { gmSet(k, patch[k]); config[k] = patch[k]; });
       closePanel();
@@ -3370,6 +3589,7 @@
     runtime.skipped = {};
     runtime.undo = null;
     runtime.allowAutoSkip = false;
+    runtime.autoNextDone = false;
     stopMonitor();
     return buildContext().then(function (ctx) {
       if (gen !== runtime.gen) return null;          // 已经切走了，这次结果作废
@@ -3430,6 +3650,19 @@
 
     try { GM_registerMenuCommand('🔍 绑定 / 识别番剧', openBindPanel); } catch (e) { /* ignore */ }
     try { GM_registerMenuCommand('⚙ 番剧跳过设置', openSettings); } catch (e) { /* ignore */ }
+
+    // 网页全屏 / 真实全屏切换：胶囊要跟着收起/恢复。
+    // B 站把 data-screen 设在 .bpx-player-container 上；观察不到就退化成只在 fullscreenchange 里响应。
+    try {
+      if (typeof MutationObserver === 'function' && document.body) {
+        runtime.screenObs = new MutationObserver(function () { applyScreen(); });
+        runtime.screenObs.observe(document.body, {
+          attributes: true, subtree: true, attributeFilter: ['data-screen']
+        });
+      }
+    } catch (e) { /* ignore */ }
+    try { document.addEventListener('fullscreenchange', applyScreen); } catch (e2) { /* ignore */ }
+    applyScreen();          // 首屏状态别等观察器第一次回调
   }
 
   try {
@@ -3457,6 +3690,8 @@
       _flushCache: flushCache,
       _openBindPanel: openBindPanel,
       _openSettings: openSettings,
+      _renderPill: renderPill,
+      _applyScreen: applyScreen,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,
@@ -3475,7 +3710,8 @@
         titleSeasonNo: titleSeasonNo,
         alignGroupsToSeasons: alignGroupsToSeasons, nameScore: nameScore,
         CHAIN_VERSION: CHAIN_VERSION, isJunkTailPart: isJunkTailPart,
-        skipTarget: skipTarget,
+        skipTarget: skipTarget, shiftSeg: shiftSeg,
+        detectScreen: detectScreen, goNextEpisode: goNextEpisode,
         // 数据层：缓存策略 / 网络失败 / 请求裁剪（排查「为什么没跳」用）
         applyRelationRules: applyRelationRules, fetchVideoInfo: fetchVideoInfo,
         trimViewData: trimViewData, fetchSegsFor: fetchSegsFor,
