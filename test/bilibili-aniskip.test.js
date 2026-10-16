@@ -3111,6 +3111,22 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('47b. 帧指纹：gray8x8 降采样');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const gray8x8 = hook(env, 'gray8x8');
+    checkTrue('api_.gray8x8 已导出', typeof gray8x8 === 'function');
+    if (typeof gray8x8 === 'function') {
+      const black = []; for (let i = 0; i < 4 * 4 * 4; i++) black.push(0);
+      const gb = gray8x8({ data: black, width: 4, height: 4 });
+      check('输出 64 个亮度', gb && gb.length, 64);
+      check('全黑 → 0', gb && gb[0], 0);
+      const white = []; for (let i = 0; i < 4 * 4 * 4; i++) white.push(255);
+      const gw = gray8x8({ data: white, width: 4, height: 4 });
+      check('全白 → 255', gw && gw[0], 255);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

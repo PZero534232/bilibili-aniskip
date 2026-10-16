@@ -2334,6 +2334,22 @@
     return d;
   }
 
+  /* canvas ImageData → 8×8 灰度亮度数组（长度 64，0-255，Rec.601 权重）。
+   * imgData = { data: RGBA 数组, width, height } —— 这样测试里能喂假数据。 */
+  function gray8x8(imgData) {
+    var w = imgData.width, h = imgData.height, d = imgData.data, out = [];
+    var cw = w / 8, ch = h / 8;
+    for (var gy = 0; gy < 8; gy++) {
+      for (var gx = 0; gx < 8; gx++) {
+        var sx = Math.floor(gx * cw), sy = Math.floor(gy * ch);
+        var i = (sy * w + sx) * 4;
+        var r = d[i] || 0, g = d[i + 1] || 0, b = d[i + 2] || 0;
+        out.push(0.299 * r + 0.587 * g + 0.114 * b);
+      }
+    }
+    return out;
+  }
+
   /* ==================================================================
    * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
@@ -3748,6 +3764,7 @@
         shouldAutoSkip: shouldAutoSkip, shouldShowIdentifyToast: shouldShowIdentifyToast,
         nextSkippableSeg: nextSkippableSeg,
         aHash: aHash, hamming: hamming,
+        gray8x8: gray8x8,
         getConfig: function () { return Object.assign({}, config); }
       }
     };
