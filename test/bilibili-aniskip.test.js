@@ -3218,7 +3218,9 @@ function ctxOf(bvid, page) {
       // pending OP（end<start）不参与匹配
       const segsP = { ops: [{ hash: '0000', start: 0, end: -1 }], eds: [] };
       const m4 = { target: null, hits: 0 };
-      check('pending OP 不参与匹配', frameStep(m4, segsP, H, 0, 1400), null);
+      frameStep(m4, segsP, H, 0, 1400);
+      check('pending OP 不参与匹配 → 无目标', m4.target, null);
+      check('pending OP 不参与匹配 → 不计数', m4.hits, 0);
     }
   }
 
