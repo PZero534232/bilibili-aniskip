@@ -3725,6 +3725,72 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('48i. 标记只画在标它的那一集（换集不画假位置）');
+  {
+    const bar = el('div');
+    bar.className = 'bpx-player-progress-wrap';
+    const env = makeEnv({
+      store: { autoDetect: 'off', _bindings: JSON.stringify({ 'b:BV1jfDYBSEKs': { title: 'T', episodes: 13, anchorPage: 1 } }) },
+      bars: [bar],
+      location: { pathname: '/video/BV1jfDYBSEKs', search: '?p=1' }
+    });
+    env.api._runtime.ctx = ctxOf('BV1jfDYBSEKs', 1);
+    env.api._runtime.video = { currentTime: 0, duration: 1400, paused: true, ended: false, play() {}, addEventListener() {} };
+
+    /* 集号格式：locKeyOf() = BV + 第几个 P */
+    const lk = hook(env, 'locKeyOf');
+    checkTrue('集号 = BV:第几P', typeof lk === 'function' && lk() === 'BV1jfDYBSEKs:1',
+      typeof lk === 'function' ? lk() : 'locKeyOf 没导出');
+
+    /* 标记时把集号写进去；标结束不能把它冲掉 */
+    const ros = hook(env, 'recordOpStart'), roe = hook(env, 'recordOpEnd'), res = hook(env, 'recordEdStart');
+    const o1 = ros({ ops: [], eds: [] }, 'h1', 12, 'BV1jfDYBSEKs:1');
+    check('OP 开始记下集号', o1.ops[0].vid, 'BV1jfDYBSEKs:1');
+    check('标 OP 结束时集号还在', roe(o1, 90).ops[0].vid, 'BV1jfDYBSEKs:1');
+    check('ED 开始也记下集号', res({ ops: [], eds: [] }, 'h2', 1300, 'BV1jfDYBSEKs:1').eds[0].vid, 'BV1jfDYBSEKs:1');
+    /* 清洗：老数据没有 vid 归一成 null；脏值也归一成 null；正常的原样留 */
+    const vls = hook(env, 'validateLocalSegs');
+    check('老数据没有 vid → null', vls({ ops: [{ hash: 'a', start: 1, end: 2 }], eds: [] }).ops[0].vid, null);
+    check('非字符串 vid → null', vls({ ops: [{ hash: 'a', start: 1, end: 2, vid: 7 }], eds: [] }).ops[0].vid, null);
+    check('正常 vid 原样保留', vls({ ops: [{ hash: 'a', start: 1, end: 2, vid: 'BV1jfDYBSEKs:3' }], eds: [] }).ops[0].vid, 'BV1jfDYBSEKs:3');
+
+    /* 纯函数：本集画、别集不画、认不出集号时照旧画 */
+    const pm = hook(env, 'progressMarks');
+    const mk = (vid) => ({ ops: [{ hash: 'a', start: 10, end: 70, vid: vid }], eds: [] });
+    check('本集标的 → 画', pm(mk('BV1jfDYBSEKs:1'), 1400, 'BV1jfDYBSEKs:1').length, 1);
+    check('别的集标的 → 不画', pm(mk('BV1jfDYBSEKs:2'), 1400, 'BV1jfDYBSEKs:1').length, 0);
+    check('没记集号的老标记 → 照旧画', pm(mk(null), 1400, 'BV1jfDYBSEKs:1').length, 1);
+    check('调用方没传集号 → 照旧画（向后兼容）', pm(mk('BV1jfDYBSEKs:2'), 1400).length, 1);
+    check('ED 未标结束也按集过滤',
+      pm({ ops: [], eds: [{ hash: 'b', start: 1300, end: -1, vid: 'BV1jfDYBSEKs:2' }] }, 1400, 'BV1jfDYBSEKs:1').length, 0);
+    check('ED 未标结束（本集）仍画到片尾',
+      (pm({ ops: [], eds: [{ hash: 'b', start: 1300, end: -1, vid: 'BV1jfDYBSEKs:1' }] }, 1400, 'BV1jfDYBSEKs:1')[0] || {}).b, 100);
+
+    /* 端到端：第 1P 上标的，换到第 2P 后刻度必须清掉 */
+    const save = hook(env, 'saveLocalSegs');
+    const paint = env.api._paintProgressMarks;
+    save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90, vid: 'BV1jfDYBSEKs:1' }], eds: [] });
+    paint();
+    const layer = bar.querySelector('[data-aniskip-marks]');
+    check('本集（第 1P）画出刻度', layer ? layer._children.length : -1, 2);
+    global.location = { pathname: '/video/BV1jfDYBSEKs', search: '?p=2' };
+    paint();
+    check('换到第 2P 后刻度被清掉（不画假位置）', bar.querySelector('[data-aniskip-marks]')._children.length, 0);
+    /* 老数据没集号 —— 不能让它凭空消失 */
+    save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90 }], eds: [] });
+    paint();
+    check('没集号的老标记仍然画出来', bar.querySelector('[data-aniskip-marks]')._children.length, 2);
+
+    /* 工具条文案：说清「标记标于别集，本集按指纹复用」 */
+    save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90, vid: 'BV1jfDYBSEKs:1' }], eds: [] });
+    env.api._markToggle();
+    env.api._refreshMarkBar();
+    const statEl = env.api._markHost().shadowRoot.querySelector('.mkroot').querySelector('.mkstat');
+    checkTrue('工具条写明标记标于哪一集', /标于/.test(statEl.textContent), statEl.textContent);
+    checkTrue('工具条写明本集按指纹复用', /按指纹复用/.test(statEl.textContent), statEl.textContent);
+    env.api._markToggle();
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

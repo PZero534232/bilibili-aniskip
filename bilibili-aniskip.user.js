@@ -689,6 +689,18 @@
     var m = /[?&]p=(\d+)/.exec(location.search);
     return m ? parseInt(m[1], 10) : 1;
   }
+  /* 当前这一集的稳定标识（BV/av + 第几个 P）。两处靠它：
+   *   · bootTimer 判断「换集了没有」—— 同 BV 换 P、合集里换 BV 都算换；
+   *   · 本地 OP/ED 标记记下「是在哪一集标的」，换集后进度条不再画别的集的绝对位置。
+   * pathname 里没有 BV（av 号页面）时退回 av 号，不然所有 av 页面会共用一个键。 */
+  function locKeyOf() {
+    var bv = currentBvid();
+    if (!bv) {
+      var m = /\/video\/av(\d+)/i.exec(location.pathname || '');
+      bv = m ? 'av' + m[1] : '';
+    }
+    return bv + ':' + currentPage();
+  }
 
   // 从页面里拿 cid：先试 __INITIAL_STATE__，失败再试 ?cid=，兜底取播放器 video
   function currentCid() {
@@ -2367,8 +2379,12 @@
     return 'aniskip.localSegs.' + bindingKey;
   }
 
+  /* 集号字段归一：非空字符串才认，其余一律 null（= 认不出是哪一集标的）。 */
+  function strOrNull(v) { return (typeof v === 'string' && v) ? v : null; }
+
   /* 清洗本地指纹：坏条目直接丢；op / ed 的 end 允许 < start（表示「还没标结束」）。
-   * 老数据只有 hash 的 ed → start 缺省 0、end 缺省 -1。 */
+   * 老数据只有 hash 的 ed → start 缺省 0、end 缺省 -1。
+   * vid = 标记时所在的那一集（locKeyOf()）；老数据没有 → null，行为退回「哪一集都画」。 */
   function validateLocalSegs(data) {
     var out = { ops: [], eds: [] };
     if (!data || typeof data !== 'object') return out;
@@ -2376,7 +2392,7 @@
       if (!op || typeof op.hash !== 'string' || !op.hash.length) return;
       var start = Number(op.start), end = Number(op.end);
       if (!isFinite(start) || !isFinite(end)) return;
-      out.ops.push({ hash: op.hash, start: start, end: end });
+      out.ops.push({ hash: op.hash, start: start, end: end, vid: strOrNull(op.vid) });
     });
     (Array.isArray(data.eds) ? data.eds : []).forEach(function (ed) {
       if (!ed || typeof ed.hash !== 'string' || !ed.hash.length) return;
@@ -2385,7 +2401,8 @@
       out.eds.push({
         hash: ed.hash,
         start: isFinite(start) ? start : 0,
-        end: isFinite(end) ? end : -1
+        end: isFinite(end) ? end : -1,
+        vid: strOrNull(ed.vid)
       });
     });
     return out;
@@ -2400,10 +2417,12 @@
     gmSet(localSegsKey(bindingKey), validateLocalSegs(data));
   }
 
-  /* 标记动作都是纯函数：入参是当前指纹集 + 新信息，返回新指纹集（不落盘，落盘由调用方做）。 */
-  function recordOpStart(segs, hash, time) {
+  /* 标记动作都是纯函数：入参是当前指纹集 + 新信息，返回新指纹集（不落盘，落盘由调用方做）。
+   * vid 入参 = 当前这一集（locKeyOf()），跟着标记一起存 —— 换集后进度条靠它决定画不画；
+   * 不传（老调用方 / 测试）就是 null：认不出集号，照旧在所有集画。 */
+  function recordOpStart(segs, hash, time, vid) {
     var out = validateLocalSegs(segs);
-    out.ops.push({ hash: hash, start: time, end: -1 });   // -1 = 还没标结束
+    out.ops.push({ hash: hash, start: time, end: -1, vid: strOrNull(vid) });   // -1 = 还没标结束
     return out;
   }
   function recordOpEnd(segs, time) {
@@ -2413,9 +2432,9 @@
     }
     return out;
   }
-  function recordEdStart(segs, hash, time) {
+  function recordEdStart(segs, hash, time, vid) {
     var out = validateLocalSegs(segs);
-    out.eds.push({ hash: hash, start: time, end: -1 });   // -1 = 还没标结束
+    out.eds.push({ hash: hash, start: time, end: -1, vid: strOrNull(vid) });   // -1 = 还没标结束
     return out;
   }
   function recordEdEnd(segs, time) {
@@ -2592,7 +2611,7 @@
     if (!bind) { showToast('标 OP 开始', '先绑定 / 识别这个番剧再标'); return; }
     var hash = captureFrameHash();
     if (!hash) { showToast('标 OP 开始', '抓不到画面（可能 CORS 没通）'); return; }
-    saveLocalSegs(bind._key, recordOpStart(loadLocalSegs(bind._key), hash, currentTime()));
+    saveLocalSegs(bind._key, recordOpStart(loadLocalSegs(bind._key), hash, currentTime(), locKeyOf()));
     afterMark();
     showToast('标 OP 开始', '已记录 · ' + Math.round(currentTime()) + 's（再标一次 OP 结束）');
   }
@@ -2610,7 +2629,7 @@
     if (!bind) { showToast('标 ED 开始', '先绑定 / 识别这个番剧再标'); return; }
     var hash = captureFrameHash();
     if (!hash) { showToast('标 ED 开始', '抓不到画面（可能 CORS 没通）'); return; }
-    saveLocalSegs(bind._key, recordEdStart(loadLocalSegs(bind._key), hash, currentTime()));
+    saveLocalSegs(bind._key, recordEdStart(loadLocalSegs(bind._key), hash, currentTime(), locKeyOf()));
     afterMark();
     showToast('标 ED 开始', '已记录 · ' + Math.round(currentTime()) + 's（再标一次 ED 结束）');
   }
@@ -2638,16 +2657,24 @@
 
   /* 本地标记 → 进度条上要画的区间 [{type:'op'|'ed', a:起%, b:终%}]。
    * · 未标结束的 OP 不画（它本来就不参与匹配）；
-   * · 未标结束的 ED 画到片尾（对应「落视频时长」的语义）。 */
-  function progressMarks(segs, dur) {
+   * · 未标结束的 ED 画到片尾（对应「落视频时长」的语义）；
+   * · 只画「标它的那一集」（vid 相等）。换集后 OP/ED 的绝对位置大概率不一样，照旧画
+   *   等于在进度条上画个假位置 —— 跳过本身不受影响：frameStep 只用标记的「长度」
+   *   （end − start）+ 检测到指纹的那一刻，所以换集照样跳得对。
+   *   vid 为空、或调用方没传（老数据 / 老调用方）时照旧画：宁可多画一条，
+   *   也不能让老标记凭空消失。 */
+  function progressMarks(segs, dur, vid) {
     var out = [];
     if (!(dur > 0)) return out;
+    function onThisEp(m) { return !vid || !m.vid || m.vid === vid; }
     var ops = (segs && segs.ops) || [], eds = (segs && segs.eds) || [], i;
     for (i = 0; i < ops.length; i++) {
+      if (!onThisEp(ops[i])) continue;
       if (!(ops[i].end > ops[i].start)) continue;
       out.push({ type: 'op', a: pct(ops[i].start, dur), b: pct(ops[i].end, dur) });
     }
     for (i = 0; i < eds.length; i++) {
+      if (!onThisEp(eds[i])) continue;
       var s = eds[i].start;
       var e = (eds[i].end > eds[i].start) ? eds[i].end : dur;
       out.push({ type: 'ed', a: pct(s, dur), b: pct(e, dur) });
@@ -2717,6 +2744,15 @@
   function fmtSec(n) {
     if (!isFinite(n) || n < 0) return '——';
     return Math.round(n * 10) / 10 + 's';
+  }
+
+  /* 集号（'BV1xx…:3'）→ 人话（'BV1xx… 第3P'）；认不出来就原样返回。工具条文案用。 */
+  function vidLabel(v) {
+    var m = /^(.*):(\d+)$/.exec(String(v || ''));
+    if (!m) return String(v || '');
+    var bv = m[1];
+    if (bv.length > 12) bv = bv.slice(0, 12) + '…';
+    return bv + ' 第' + parseInt(m[2], 10) + 'P';
   }
 
   /* 把秒跳到某个位置（工具条列表点行用）。不改变播放状态。 */
@@ -2816,8 +2852,21 @@
     }
     var segs = loadLocalSegs(bind._key);
     var ops = segs.ops || [], eds = segs.eds || [];
+    /* 说清「这些标记是在哪一集标的」：别的集的标记本集不画进度条（见 progressMarks），
+     * 只按指纹复用 —— 不写清楚的话，用户会以为换集后标记和刻度一起坏了。 */
+    var cur = locKeyOf(), fromOther = [], legacy = 0, all = ops.concat(eds), k;
+    for (k = 0; k < all.length; k++) {
+      var v = all[k].vid;
+      if (!v) legacy++;
+      else if (v !== cur && fromOther.indexOf(v) < 0) fromOther.push(v);
+    }
+    var hint = '';
+    if (fromOther.length) {
+      hint += ' · 标记标于 ' + fromOther.map(vidLabel).join('、') + '（本集按指纹复用，不画位置）';
+    }
+    if (legacy) hint += ' · ' + legacy + ' 条旧标记没记集号，仍会画在进度条上';
     stat.textContent = '当前：' + (bind.title || bind._key) +
-      '   已标 OP ' + ops.length + ' 套 / ED ' + eds.length + ' 套';
+      '   已标 OP ' + ops.length + ' 套 / ED ' + eds.length + ' 套' + hint;
     list.textContent = '';
     var rows = [], i;
     for (i = 0; i < ops.length; i++) rows.push({ listKey: 'ops', i: i, label: 'OP', hash: ops[i].hash, s: ops[i].start, e: ops[i].end });
@@ -2975,7 +3024,7 @@
     var segs = bind ? loadLocalSegs(bind._key) : null;
     var v = runtime.video || getVideo();
     var dur = (v && v.duration) || 0;
-    var marks = progressMarks(segs, dur);
+    var marks = progressMarks(segs, dur, locKeyOf());
     var sig = '';
     for (var i = 0; i < marks.length; i++) sig += marks[i].type + ':' + marks[i].a + '-' + marks[i].b + ';';
     for (var j = 0; j < bars.length; j++) paintOneBar(bars[j], marks, sig);
@@ -4322,9 +4371,9 @@
     runtime.booted = true;
 
     // B 站是单页应用：换视频 / 换分P 时重新识别
-    runtime.lastLocKey = currentBvid() + ':' + currentPage();
+    runtime.lastLocKey = locKeyOf();
     runtime.bootTimer = setInterval(function () {
-      var key = currentBvid() + ':' + currentPage();
+      var key = locKeyOf();
       if (key !== runtime.lastLocKey) {
         runtime.lastLocKey = key;
         rerun();
@@ -4427,7 +4476,7 @@
         loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
         recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
         recordEdEnd: recordEdEnd, removeLocalSeg: removeLocalSeg,
-        pct: pct, progressMarks: progressMarks,
+        pct: pct, progressMarks: progressMarks, locKeyOf: locKeyOf, vidLabel: vidLabel,
         frameStep: frameStep,
         shouldUseLocalSegs: shouldUseLocalSegs,
         applyFrameHash: applyFrameHash,
