@@ -2425,12 +2425,15 @@
     return out;
   }
 
-  /* 删掉指定的那一条（工具条列表里的 ✕）。listKey = 'ops' | 'eds'。
-   * 先过 validateLocalSegs：拿到的永远是干净的副本，不会改到调用方的对象。 */
+  /* 删掉指定的那一条（工具条列表里的 ✕）。listKey 只能是 'ops' | 'eds'。
+   * 先过 validateLocalSegs：拿到的永远是干净的副本，不会改到调用方的对象。
+   * 入参非法一律原样返回 —— 绝不抛错，也绝不误删（spec 的契约）。 */
   function removeLocalSeg(segs, listKey, index) {
     var out = validateLocalSegs(segs);
+    if (listKey !== 'ops' && listKey !== 'eds') return out;
     var list = out[listKey];
-    if (!list || typeof index !== 'number' || index < 0 || index >= list.length) return out;
+    if (typeof index !== 'number' || !isFinite(index) || index % 1 !== 0) return out;
+    if (index < 0 || index >= list.length) return out;
     list.splice(index, 1);
     return out;
   }

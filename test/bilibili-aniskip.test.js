@@ -3420,6 +3420,18 @@ function ctxOf(bvid, page) {
       check('删 eds 越界不动', rm(src, 'eds', 9).eds.length, 1);
       check('listKey 非法不动', rm(src, 'nope', 0).ops.length, 2);
       check('空值不抛错', rm(null, 'ops', 0).ops.length, 0);
+      // 原型链键（'constructor' 等）不能被当成数组列表用
+      // 注意：这里必须把调用本身包进 try —— 否则抛出的 TypeError 会直接崩掉整个测试进程，
+      // 而不是被 checkTrue 报成一条失败。
+      let threwProto = false;
+      let protoOut = null;
+      try { protoOut = rm(src, 'constructor', 0); } catch (e) { threwProto = true; }
+      checkTrue('原型链键不抛错', !threwProto, true);
+      check('原型链键不动数据', protoOut === null ? -1 : protoOut.ops.length, 2);
+      // 索引必须是整数：NaN / 小数以前会悄悄删掉第 0 条
+      check('NaN 索引不动数据', rm(src, 'ops', NaN).ops.length, 2);
+      check('小数索引不动数据', rm(src, 'ops', 0.5).ops.length, 2);
+      check('字符串索引不动数据', rm(src, 'ops', '0').ops.length, 2);
     }
   }
 
