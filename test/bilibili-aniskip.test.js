@@ -3127,6 +3127,40 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('47c. 指纹存取与校验');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const key = hook(env, 'localSegsKey');
+    const validate = hook(env, 'validateLocalSegs');
+    const load = hook(env, 'loadLocalSegs');
+    const save = hook(env, 'saveLocalSegs');
+    checkTrue('api_.localSegsKey 已导出', typeof key === 'function');
+    checkTrue('api_.validateLocalSegs 已导出', typeof validate === 'function');
+    checkTrue('api_.loadLocalSegs 已导出', typeof load === 'function');
+    checkTrue('api_.saveLocalSegs 已导出', typeof save === 'function');
+    if (typeof key === 'function') {
+      check('key 前缀', key('b:BV1'), 'aniskip.localSegs.b:BV1');
+    }
+    if (typeof validate === 'function') {
+      const v = validate({
+        ops: [{ hash: 'abc', start: 0, end: 90 }, { hash: '', start: 0, end: 5 }, { hash: 'x', start: 10, end: 10 }],
+        eds: [{ hash: 'ed1' }, { bad: 1 }, null]
+      });
+      check('空 hash op 丢弃，其余保留', v.ops.length, 2);
+      check('保留的第一个 op hash', v.ops[0] && v.ops[0].hash, 'abc');
+      check('合法 ed 保留、坏 ed 丢弃', v.eds.length, 1);
+      check('pending op（end=-1）保留', validate({ ops: [{ hash: 'p', start: 3, end: -1 }], eds: [] }).ops.length, 1);
+      check('非对象输入 → 空', validate(null).ops.length, 0);
+    }
+    if (typeof save === 'function' && typeof load === 'function') {
+      save('b:BV1', { ops: [{ hash: 'abc', start: 0, end: 90 }], eds: [{ hash: 'ed1' }] });
+      const l = load('b:BV1');
+      check('save 后 load 回来 op', l.ops.length, 1);
+      check('save 后 load 回来 ed', l.eds.length, 1);
+      check('没存过的 key → 空', load('b:NOPE').ops.length, 0);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

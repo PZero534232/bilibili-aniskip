@@ -2350,6 +2350,36 @@
     return out;
   }
 
+  function localSegsKey(bindingKey) {
+    return 'aniskip.localSegs.' + bindingKey;
+  }
+
+  /* 清洗本地指纹：坏条目直接丢；op 的 end 允许 < start（表示「还没标结束」）。 */
+  function validateLocalSegs(data) {
+    var out = { ops: [], eds: [] };
+    if (!data || typeof data !== 'object') return out;
+    (Array.isArray(data.ops) ? data.ops : []).forEach(function (op) {
+      if (!op || typeof op.hash !== 'string' || !op.hash.length) return;
+      var start = Number(op.start), end = Number(op.end);
+      if (!isFinite(start) || !isFinite(end)) return;
+      out.ops.push({ hash: op.hash, start: start, end: end });
+    });
+    (Array.isArray(data.eds) ? data.eds : []).forEach(function (ed) {
+      if (!ed || typeof ed.hash !== 'string' || !ed.hash.length) return;
+      out.eds.push({ hash: ed.hash });
+    });
+    return out;
+  }
+
+  function loadLocalSegs(bindingKey) {
+    if (!bindingKey) return { ops: [], eds: [] };
+    return validateLocalSegs(gmGet(localSegsKey(bindingKey), null));
+  }
+  function saveLocalSegs(bindingKey, data) {
+    if (!bindingKey) return;
+    gmSet(localSegsKey(bindingKey), validateLocalSegs(data));
+  }
+
   /* ==================================================================
    * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
@@ -3765,6 +3795,8 @@
         nextSkippableSeg: nextSkippableSeg,
         aHash: aHash, hamming: hamming,
         gray8x8: gray8x8,
+        localSegsKey: localSegsKey, validateLocalSegs: validateLocalSegs,
+        loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
         getConfig: function () { return Object.assign({}, config); }
       }
     };
