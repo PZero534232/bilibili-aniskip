@@ -2531,18 +2531,34 @@
     return v ? v.currentTime : 0;
   }
 
+  /* 标记后立刻重新同步抽帧：runtime.localSegs 是 rerun 时的快照，
+   * 不刷新的话新指纹要等下次 rerun 才生效。 */
+  function afterMark() {
+    syncFrameMonitor(runtime.result);
+  }
+  function hasPendingOp(segs) {
+    return (segs.ops || []).some(function (o) { return o.end < 0; });
+  }
+  function hasPendingEd(segs) {
+    return (segs.eds || []).some(function (e) { return e.end < 0; });
+  }
+
   function markOpStart() {
     var bind = currentBinding();
     if (!bind) { showToast('标 OP 开始', '先绑定 / 识别这个番剧再标'); return; }
     var hash = captureFrameHash();
     if (!hash) { showToast('标 OP 开始', '抓不到画面（可能 CORS 没通）'); return; }
     saveLocalSegs(bind._key, recordOpStart(loadLocalSegs(bind._key), hash, currentTime()));
+    afterMark();
     showToast('标 OP 开始', '已记录 · ' + Math.round(currentTime()) + 's（再标一次 OP 结束）');
   }
   function markOpEnd() {
     var bind = currentBinding();
     if (!bind) { showToast('标 OP 结束', '先绑定 / 识别这个番剧再标'); return; }
-    saveLocalSegs(bind._key, recordOpEnd(loadLocalSegs(bind._key), currentTime()));
+    var cur = loadLocalSegs(bind._key);
+    if (!hasPendingOp(cur)) { showToast('标 OP 结束', '没有待结束的 OP —— 先标「OP 开始」'); return; }
+    saveLocalSegs(bind._key, recordOpEnd(cur, currentTime()));
+    afterMark();
     showToast('标 OP 结束', '已记录 · ' + Math.round(currentTime()) + 's');
   }
   function markEdStart() {
@@ -2551,7 +2567,17 @@
     var hash = captureFrameHash();
     if (!hash) { showToast('标 ED 开始', '抓不到画面（可能 CORS 没通）'); return; }
     saveLocalSegs(bind._key, recordEdStart(loadLocalSegs(bind._key), hash, currentTime()));
-    showToast('标 ED 开始', '已记录 · ' + Math.round(currentTime()) + 's');
+    afterMark();
+    showToast('标 ED 开始', '已记录 · ' + Math.round(currentTime()) + 's（再标一次 ED 结束）');
+  }
+  function markEdEnd() {
+    var bind = currentBinding();
+    if (!bind) { showToast('标 ED 结束', '先绑定 / 识别这个番剧再标'); return; }
+    var cur = loadLocalSegs(bind._key);
+    if (!hasPendingEd(cur)) { showToast('标 ED 结束', '没有待结束的 ED —— 先标「ED 开始」'); return; }
+    saveLocalSegs(bind._key, recordEdEnd(cur, currentTime()));
+    afterMark();
+    showToast('标 ED 结束', '已记录 · ' + Math.round(currentTime()) + 's');
   }
 
   /* ==================================================================
@@ -3945,6 +3971,7 @@
       _renderPill: renderPill,
       _applyScreen: applyScreen,
       _syncFrameMonitor: syncFrameMonitor,
+      _markEdEnd: markEdEnd,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,
