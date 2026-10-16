@@ -2506,6 +2506,38 @@
     }
   }
 
+  function currentBinding() {
+    var ctx = runtime.ctx;
+    return ctx && getBinding(ctx);
+  }
+  function currentTime() {
+    var v = runtime.video || getVideo();
+    return v ? v.currentTime : 0;
+  }
+
+  function markOpStart() {
+    var bind = currentBinding();
+    if (!bind) { showToast('标 OP 开始', '先绑定 / 识别这个番剧再标'); return; }
+    var hash = captureFrameHash();
+    if (!hash) { showToast('标 OP 开始', '抓不到画面（可能 CORS 没通）'); return; }
+    saveLocalSegs(bind._key, recordOpStart(loadLocalSegs(bind._key), hash, currentTime()));
+    showToast('标 OP 开始', '已记录 · ' + Math.round(currentTime()) + 's（再标一次 OP 结束）');
+  }
+  function markOpEnd() {
+    var bind = currentBinding();
+    if (!bind) { showToast('标 OP 结束', '先绑定 / 识别这个番剧再标'); return; }
+    saveLocalSegs(bind._key, recordOpEnd(loadLocalSegs(bind._key), currentTime()));
+    showToast('标 OP 结束', '已记录 · ' + Math.round(currentTime()) + 's');
+  }
+  function markEdStart() {
+    var bind = currentBinding();
+    if (!bind) { showToast('标 ED 开始', '先绑定 / 识别这个番剧再标'); return; }
+    var hash = captureFrameHash();
+    if (!hash) { showToast('标 ED 开始', '抓不到画面（可能 CORS 没通）'); return; }
+    saveLocalSegs(bind._key, recordEdStart(loadLocalSegs(bind._key), hash));
+    showToast('标 ED 开始', '已记录 · ' + Math.round(currentTime()) + 's');
+  }
+
   /* ==================================================================
    * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
@@ -3851,6 +3883,9 @@
 
     try { GM_registerMenuCommand('🔍 绑定 / 识别番剧', openBindPanel); } catch (e) { /* ignore */ }
     try { GM_registerMenuCommand('⚙ 番剧跳过设置', openSettings); } catch (e) { /* ignore */ }
+    try { GM_registerMenuCommand('⏱ 标 OP 开始', markOpStart); } catch (e) { /* ignore */ }
+    try { GM_registerMenuCommand('⏱ 标 OP 结束', markOpEnd); } catch (e) { /* ignore */ }
+    try { GM_registerMenuCommand('⏱ 标 ED 开始', markEdStart); } catch (e) { /* ignore */ }
 
     // 网页全屏 / 真实全屏切换：胶囊要跟着收起/恢复。
     // B 站把 data-screen 设在 .bpx-player-container 上；观察不到就退化成只在 fullscreenchange 里响应。
