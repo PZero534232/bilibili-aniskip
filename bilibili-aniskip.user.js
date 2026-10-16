@@ -2755,6 +2755,34 @@
       '<div class="mkstat"></div>' +
       '<div class="mklist"></div>' +
       '<div class="mkfoot"><button class="mkbtn mkclr" data-mk="clr">清空本番标记</button></div>';
+    /* 四个标记按钮：直接复用既有 handler（内部已有未绑定 / 抓帧失败的 toast 分支），
+     * 点完不关工具条，就地刷新状态行、列表、进度条。 */
+    var mkPairs = [['op-s', markOpStart], ['op-e', markOpEnd], ['ed-s', markEdStart], ['ed-e', markEdEnd]];
+    for (var mi = 0; mi < mkPairs.length; mi++) {
+      (function (name, fn) {
+        var node = bar.querySelector('[data-mk=' + name + ']');
+        if (!node) return;
+        noFocus(node);
+        node.addEventListener('click', function () {
+          fn();
+          refreshMarkBar();
+          // Task 7 打开：paintProgressMarks();
+        });
+      })(mkPairs[mi][0], mkPairs[mi][1]);
+    }
+    var clrBtn = bar.querySelector('[data-mk=clr]');
+    if (clrBtn) {
+      noFocus(clrBtn);
+      clrBtn.addEventListener('click', function () {
+        var bind = currentBinding();
+        if (!bind) { showToast('清空本番标记', '当前没有绑定番剧'); return; }
+        try { GM_deleteValue(localSegsKey(bind._key)); } catch (e) { /* ignore */ }
+        syncFrameMonitor(runtime.result);
+        refreshMarkBar();
+        // Task 7 打开：paintProgressMarks();
+        showToast('清空本番标记', '已删掉这个番的本地指纹');
+      });
+    }
     var closeBtn = bar.querySelector('.mkclose');
     if (closeBtn) {
       noFocus(closeBtn);

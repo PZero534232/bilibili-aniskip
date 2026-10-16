@@ -3580,6 +3580,47 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('48e. 工具条按钮：标记动作 + 清空');
+  {
+    const env = makeEnv({
+      store: { autoDetect: 'off', _bindings: JSON.stringify({ 'b:BV_TEST000001': { title: 'T', episodes: 28, anchorPage: 1 } }) }
+    });
+    env.api._runtime.ctx = ctxOf('BV_TEST000001', 1);
+    env.api._runtime.video = { currentTime: 77, duration: 1400, paused: true, ended: false,
+      play() {}, addEventListener() {} };
+    /* harness 的 GM_setValue 存裸对象，真机由油猴自己序列化 —— 两种都要能读 */
+    const segsOf = () => {
+      const v = env.store['aniskip.localSegs.b:BV_TEST000001'];
+      return !v ? {} : (typeof v === 'string' ? JSON.parse(v) : v);
+    };
+    const opsOf = () => segsOf().ops || [];
+    const toggle = env.api._markToggle;
+    checkTrue('api._markToggle 已导出', typeof toggle === 'function');
+    if (typeof toggle === 'function') {
+      toggle();
+      const root = env.api._markHost().shadowRoot;
+      const opStart = root.querySelector('[data-mk=op-s]');
+      const clr = root.querySelector('[data-mk=clr]');
+      checkTrue('找得到「标 OP 开始」', !!opStart);
+      checkTrue('找得到「清空本番标记」', !!clr);
+      opStart.dispatch('click', {});
+      checkTrue('标 OP 开始 已挂监听', (opStart._listeners.click || []).length > 0);
+      check('抓不到画面时不写脏数据', opsOf().length, 0);
+      const save = hook(env, 'saveLocalSegs');
+      save('b:BV_TEST000001', { ops: [{ hash: 'h', start: 10, end: -1 }], eds: [] });
+      env.api._renderMark();
+      const r2 = env.api._markHost().shadowRoot;
+      r2.querySelector('[data-mk=op-e]').dispatch('click', {});
+      const after = opsOf();
+      check('标 OP 结束 补上 end', after.length ? after[0].end : -1, 77);
+      check('列表即时刷新（显示 77s）', /77s/.test(r2.querySelector('.mklist').textContent), true);
+      r2.querySelector('[data-mk=clr]').dispatch('click', {});
+      check('清空本番标记', env.store['aniskip.localSegs.b:BV_TEST000001'], undefined);
+      check('清空后列表显示「还没标过」', /还没标过/.test(r2.querySelector('.mklist').textContent), true);
+      toggle();
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
