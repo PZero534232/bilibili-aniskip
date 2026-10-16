@@ -2981,7 +2981,9 @@
 
   /* ---- 进度条标记叠加：把本地标记画在 B 站自己的进度条上 ---- */
 
-  /* 把标记画到一个进度条容器上。找不到父容器 / 写不进 DOM 都静默放弃。
+  /* 把标记画到一个进度条容器上 —— 只画起点刻度，不画整段高亮：
+   * 区间条会压掉进度条一大块，而落点根本不靠它（跳过用指纹 + 标记时长算），留着挡视线。
+   * 找不到父容器 / 写不进 DOM 都静默放弃。
    * 用 dataset 上的签名避免反复无谓重排；换容器（全屏）时新容器没有签名 → 会重画。 */
   function paintOneBar(bar, marks, sig) {
     try {
@@ -3004,10 +3006,6 @@
       for (var i = 0; i < marks.length; i++) {
         var m = marks[i];
         var color = m.type === 'op' ? '#00a1d6' : '#ffb648';
-        var span = document.createElement('span');
-        span.style.cssText = 'position:absolute;top:0;bottom:0;left:' + m.a + '%;width:' +
-          Math.max(0, m.b - m.a) + '%;background:' + color + ';opacity:.55;border-radius:2px;';
-        layer.appendChild(span);
         var tick = document.createElement('span');
         tick.style.cssText = 'position:absolute;top:0;bottom:0;left:' + m.a + '%;width:2px;background:' + color + ';';
         layer.appendChild(tick);

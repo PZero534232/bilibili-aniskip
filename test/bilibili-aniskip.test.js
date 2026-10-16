@@ -3666,7 +3666,7 @@ function ctxOf(bvid, page) {
       const layer = bar1.querySelector('[data-aniskip-marks]');
       check('进度条里插了覆盖层', !!layer, true);
       check('容器被设为 relative（否则绝对定位会跑偏）', bar1.style.position, 'relative');
-      check('画了 2 个元素（区间条 + 起点刻度）', layer ? layer._children.length : 0, 2);
+      check('只画 1 个起点刻度（不再画整段高亮）', layer ? layer._children.length : 0, 1);
       // 内容没变 → 不重复写 DOM
       const before = layer._children.slice();
       paint();
@@ -3772,14 +3772,14 @@ function ctxOf(bvid, page) {
     save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90, vid: 'BV1jfDYBSEKs:1' }], eds: [] });
     paint();
     const layer = bar.querySelector('[data-aniskip-marks]');
-    check('本集（第 1P）画出刻度', layer ? layer._children.length : -1, 2);
+    check('本集（第 1P）画出刻度', layer ? layer._children.length : -1, 1);
     global.location = { pathname: '/video/BV1jfDYBSEKs', search: '?p=2' };
     paint();
     check('换到第 2P 后刻度被清掉（不画假位置）', bar.querySelector('[data-aniskip-marks]')._children.length, 0);
     /* 老数据没集号 —— 不能让它凭空消失 */
     save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90 }], eds: [] });
     paint();
-    check('没集号的老标记仍然画出来', bar.querySelector('[data-aniskip-marks]')._children.length, 2);
+    check('没集号的老标记仍然画出来', bar.querySelector('[data-aniskip-marks]')._children.length, 1);
 
     /* 工具条文案：说清「标记标于别集，本集按指纹复用」 */
     save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90, vid: 'BV1jfDYBSEKs:1' }], eds: [] });
