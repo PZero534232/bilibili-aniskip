@@ -257,26 +257,35 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
   head('48c. 工具条 host：全屏挂载点选择');
   {
     const env = makeEnv({ store: { autoDetect: 'off' } });
-    const ensure = hook(env, 'ensureMarkHost');
+    const ensure = hook(env, '_ensureMarkHost');
     checkTrue('api._ensureMarkHost 已导出', typeof ensure === 'function');
     if (typeof ensure === 'function') {
       const root = ensure();
-      check('普通情况挂到 body', root && root.tagName, 'BODY');
-      check('host 有 shadowRoot', !!(root && root.shadowRoot), true);
-      const before = root._children.length;
-      ensure();
-      check('重复调用不重复挂（同一个 host）', ensure(), root);
-      check('重复调用不会多出子节点', root._children.length, before);
+      checkTrue('ensure 返回 host 本身（tagName=DIV）', !!root && root.tagName === 'DIV');
+      checkTrue('host 的父节点是 body', root.parentNode === env.body);
+      checkTrue('host 有 shadowRoot', !!root.shadowRoot);
+      const kids = root.shadowRoot ? root.shadowRoot._children.length : -1;
+      checkTrue('shadow 里正好 style + mkroot', kids === 2);
+      /* 注意：check() 用 brief() 字符串化比较，两个裸 <div> 都会变成 "<div>" ——
+       * 凡是「同一个对象」「没多挂一次」这类断言，必须用 checkTrue 做恒等比较，
+       * 否则就是永远通过的空断言。 */
+      checkTrue('重复调用返回同一个 host（同一对象）', ensure() === root);
+      checkTrue('重复调用不会重建 shadow 内容', (root.shadowRoot ? root.shadowRoot._children.length : -1) === kids);
+      checkTrue('重复调用不会重复挂到 body', env.body._children.filter(function (c) { return c === root; }).length === 1);
+      /* 桩的 appendChild 不会把节点从旧父节点的 _children 里摘掉（真实 DOM 会），
+       * 所以这里断言 parentNode 而不是「旧父节点里没有了」 */
       const fsEl = el('div');
-      fsEl.tagName = 'DIV';
       global.document.fullscreenElement = fsEl;
-      check('真全屏时改挂进全屏元素', ensure(), fsEl);
-      check('原 body 上的 host 已移走', env.body._children.indexOf(root), -1);
+      ensure();
+      checkTrue('真全屏时 host 的父节点换成全屏元素', root.parentNode === fsEl);
+      checkTrue('host 出现在全屏元素的子节点里', fsEl._children.indexOf(root) >= 0);
       global.document.fullscreenElement = null;
-      check('退出全屏挂回 body', ensure(), env.body);
+      ensure();
+      checkTrue('退出全屏挂回 body', root.parentNode === env.body);
       const vid = el('video');
       global.document.fullscreenElement = vid;
-      check('全屏元素是 video → 退回 body', ensure(), env.body);
+      ensure();
+      checkTrue('全屏元素是 video → 退回 body', root.parentNode === env.body);
       global.document.fullscreenElement = null;
       ensure();
     }
@@ -389,7 +398,7 @@ Expected: 有失败，含 `api._ensureMarkHost 已导出`（未导出）。
 
 Run: `node test/bilibili-aniskip.test.js -q`
 
-Expected: `0 失败`（通过数 ≈ 614；以实际为准）。
+Expected: `0 失败`（通过数 ≈ 624；以实际为准）。
 
 - [ ] **Step 5: 语法检查**
 
