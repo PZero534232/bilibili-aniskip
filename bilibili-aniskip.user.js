@@ -2357,7 +2357,8 @@
     return 'aniskip.localSegs.' + bindingKey;
   }
 
-  /* 清洗本地指纹：坏条目直接丢；op 的 end 允许 < start（表示「还没标结束」）。 */
+  /* 清洗本地指纹：坏条目直接丢；op / ed 的 end 允许 < start（表示「还没标结束」）。
+   * 老数据只有 hash 的 ed → start 缺省 0、end 缺省 -1。 */
   function validateLocalSegs(data) {
     var out = { ops: [], eds: [] };
     if (!data || typeof data !== 'object') return out;
@@ -2369,7 +2370,13 @@
     });
     (Array.isArray(data.eds) ? data.eds : []).forEach(function (ed) {
       if (!ed || typeof ed.hash !== 'string' || !ed.hash.length) return;
-      out.eds.push({ hash: ed.hash });
+      var start = Number(ed.start), end = Number(ed.end);
+      // 老数据只有 hash（没有 start/end）→ 归一成「未标结束」，行为落回「跳视频结尾」
+      out.eds.push({
+        hash: ed.hash,
+        start: isFinite(start) ? start : 0,
+        end: isFinite(end) ? end : -1
+      });
     });
     return out;
   }

@@ -3149,8 +3149,13 @@ function ctxOf(bvid, page) {
       check('空 hash op 丢弃，其余保留', v.ops.length, 2);
       check('保留的第一个 op hash', v.ops[0] && v.ops[0].hash, 'abc');
       check('合法 ed 保留、坏 ed 丢弃', v.eds.length, 1);
+      check('老 ed（只有 hash）归一为 pending', !!(v.eds[0] && v.eds[0].start === 0 && v.eds[0].end === -1), true);
       check('pending op（end=-1）保留', validate({ ops: [{ hash: 'p', start: 3, end: -1 }], eds: [] }).ops.length, 1);
       check('非对象输入 → 空', validate(null).ops.length, 0);
+      const ve = validate({ ops: [], eds: [{ hash: 'e2', start: 1300.5, end: 1400.25 }] });
+      check('ed start 保留', ve.eds[0] && ve.eds[0].start, 1300.5);
+      check('ed end 保留', ve.eds[0] && ve.eds[0].end, 1400.25);
+      check('坏 ed（hash 非串）丢弃', validate({ ops: [], eds: [{ hash: 5 }] }).eds.length, 0);
     }
     if (typeof save === 'function' && typeof load === 'function') {
       save('b:BV1', { ops: [{ hash: 'abc', start: 0, end: 90 }], eds: [{ hash: 'ed1' }] });
