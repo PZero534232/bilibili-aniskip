@@ -3172,9 +3172,11 @@ function ctxOf(bvid, page) {
     const ropS = hook(env, 'recordOpStart');
     const ropE = hook(env, 'recordOpEnd');
     const redS = hook(env, 'recordEdStart');
+    const redE = hook(env, 'recordEdEnd');
     checkTrue('api_.recordOpStart 已导出', typeof ropS === 'function');
     checkTrue('api_.recordOpEnd 已导出', typeof ropE === 'function');
     checkTrue('api_.recordEdStart 已导出', typeof redS === 'function');
+    checkTrue('api_.recordEdEnd 已导出', typeof redE === 'function');
     if (typeof ropS === 'function' && typeof ropE === 'function') {
       let s = { ops: [], eds: [] };
       s = ropS(s, 'hashA', 0);
@@ -3185,9 +3187,21 @@ function ctxOf(bvid, page) {
       check('OP 结束：start 保留', s.ops[0].start, 0);
     }
     if (typeof redS === 'function') {
-      const s2 = redS({ ops: [], eds: [] }, 'edHash');
+      const s2 = redS({ ops: [], eds: [] }, 'edHash', 1300);
       check('ED 开始：记一套', s2.eds.length, 1);
       check('ED hash 存对', s2.eds[0].hash, 'edHash');
+      check('ED 开始时间存对', s2.eds[0].start, 1300);
+      check('ED 结束前 end=-1', s2.eds[0].end, -1);
+    }
+    if (typeof redS === 'function' && typeof redE === 'function') {
+      let s3 = redS({ ops: [], eds: [] }, 'edHash', 1300);
+      s3 = redE(s3, 1400);
+      check('ED 结束：补上 end', s3.eds[0].end, 1400);
+      check('ED 结束：start 保留', s3.eds[0].start, 1300);
+      check('无 pending ED 时不动', redE({ ops: [], eds: [{ hash: 'x', start: 0, end: 5 }] }, 9).eds[0].end, 5);
+      const s4 = redE(redS(redS({ ops: [], eds: [] }, 'a', 1), 'b', 2), 9);
+      check('多条 pending：只补最后一条', s4.eds[0].end, -1);
+      check('多条 pending：最后一条被补上', s4.eds[1].end, 9);
     }
   }
 

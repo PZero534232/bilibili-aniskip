@@ -2403,9 +2403,16 @@
     }
     return out;
   }
-  function recordEdStart(segs, hash) {
+  function recordEdStart(segs, hash, time) {
     var out = validateLocalSegs(segs);
-    out.eds.push({ hash: hash });
+    out.eds.push({ hash: hash, start: time, end: -1 });   // -1 = 还没标结束
+    return out;
+  }
+  function recordEdEnd(segs, time) {
+    var out = validateLocalSegs(segs);
+    for (var i = out.eds.length - 1; i >= 0; i--) {
+      if (out.eds[i].end < 0) { out.eds[i].end = time; break; }
+    }
     return out;
   }
 
@@ -2541,7 +2548,7 @@
     if (!bind) { showToast('标 ED 开始', '先绑定 / 识别这个番剧再标'); return; }
     var hash = captureFrameHash();
     if (!hash) { showToast('标 ED 开始', '抓不到画面（可能 CORS 没通）'); return; }
-    saveLocalSegs(bind._key, recordEdStart(loadLocalSegs(bind._key), hash));
+    saveLocalSegs(bind._key, recordEdStart(loadLocalSegs(bind._key), hash, currentTime()));
     showToast('标 ED 开始', '已记录 · ' + Math.round(currentTime()) + 's');
   }
 
@@ -3969,6 +3976,7 @@
         localSegsKey: localSegsKey, validateLocalSegs: validateLocalSegs,
         loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
         recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
+        recordEdEnd: recordEdEnd,
         frameStep: frameStep,
         shouldUseLocalSegs: shouldUseLocalSegs,
         applyFrameHash: applyFrameHash,
