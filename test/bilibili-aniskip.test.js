@@ -3161,6 +3161,31 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('47d. 标记记录');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const ropS = hook(env, 'recordOpStart');
+    const ropE = hook(env, 'recordOpEnd');
+    const redS = hook(env, 'recordEdStart');
+    checkTrue('api_.recordOpStart 已导出', typeof ropS === 'function');
+    checkTrue('api_.recordOpEnd 已导出', typeof ropE === 'function');
+    checkTrue('api_.recordEdStart 已导出', typeof redS === 'function');
+    if (typeof ropS === 'function' && typeof ropE === 'function') {
+      let s = { ops: [], eds: [] };
+      s = ropS(s, 'hashA', 0);
+      check('OP 开始：新开一套 pending', s.ops.length, 1);
+      check('OP 结束前 end=-1', s.ops[0].end, -1);
+      s = ropE(s, 90);
+      check('OP 结束：补上 end', s.ops[0].end, 90);
+      check('OP 结束：start 保留', s.ops[0].start, 0);
+    }
+    if (typeof redS === 'function') {
+      const s2 = redS({ ops: [], eds: [] }, 'edHash');
+      check('ED 开始：记一套', s2.eds.length, 1);
+      check('ED hash 存对', s2.eds[0].hash, 'edHash');
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

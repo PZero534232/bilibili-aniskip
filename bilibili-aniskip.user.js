@@ -2380,6 +2380,25 @@
     gmSet(localSegsKey(bindingKey), validateLocalSegs(data));
   }
 
+  /* 标记动作都是纯函数：入参是当前指纹集 + 新信息，返回新指纹集（不落盘，落盘由调用方做）。 */
+  function recordOpStart(segs, hash, time) {
+    var out = validateLocalSegs(segs);
+    out.ops.push({ hash: hash, start: time, end: -1 });   // -1 = 还没标结束
+    return out;
+  }
+  function recordOpEnd(segs, time) {
+    var out = validateLocalSegs(segs);
+    for (var i = out.ops.length - 1; i >= 0; i--) {
+      if (out.ops[i].end < 0) { out.ops[i].end = time; break; }
+    }
+    return out;
+  }
+  function recordEdStart(segs, hash) {
+    var out = validateLocalSegs(segs);
+    out.eds.push({ hash: hash });
+    return out;
+  }
+
   /* ==================================================================
    * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
@@ -3797,6 +3816,7 @@
         gray8x8: gray8x8,
         localSegsKey: localSegsKey, validateLocalSegs: validateLocalSegs,
         loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
+        recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
         getConfig: function () { return Object.assign({}, config); }
       }
     };
