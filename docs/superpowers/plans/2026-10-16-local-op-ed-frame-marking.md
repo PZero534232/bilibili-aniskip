@@ -457,10 +457,11 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
       frameStep(m2, segsLong, '1111111111111111', 0, 1400);
       check('中间一帧不中 → 目标清空', m2.target, null);
       check('中间一帧不中 → 计数归零', m2.hits, 0);
-      // ED：命中 → 跳到视频结尾
+      // ED：命中 → 跳到视频结尾（长哈希，避免 '1111' 误匹配 OP '0000'）
       const m3 = { target: null, hits: 0 };
-      frameStep(m3, segs, '1111', 1300, 1400);
-      const edSeg = frameStep(m3, segs, '1111', 1300, 1400);
+      const segsEd = { ops: [{ hash: '0000000000000000', start: 0, end: 90 }], eds: [{ hash: '1111111111111111' }] };
+      frameStep(m3, segsEd, '1111111111111111', 1300, 1400);
+      const edSeg = frameStep(m3, segsEd, '1111111111111111', 1300, 1400);
       check('认到 ED', !!(edSeg && edSeg.type === 'ed'), true);
       check('ED 落点 = 时长', edSeg && edSeg.end, 1400);
       // pending OP（end<start）不参与匹配
