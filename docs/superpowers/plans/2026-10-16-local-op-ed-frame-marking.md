@@ -267,10 +267,11 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
         ops: [{ hash: 'abc', start: 0, end: 90 }, { hash: '', start: 0, end: 5 }, { hash: 'x', start: 10, end: 10 }],
         eds: [{ hash: 'ed1' }, { bad: 1 }, null]
       });
-      check('合法 op 保留', v.ops.length, 1);
-      check('坏 op 丢弃（空 hash / end<=start）', v.ops[0] && v.ops[0].hash, 'abc');
-      check('合法 ed 保留', v.eds.length, 1);
-      check('pending op 也保留（end=-1）', validate({ ops: [{ hash: 'p', start: 3, end: -1 }], eds: [] }).ops.length, 1);
+      check('空 hash op 丢弃，其余保留', v.ops.length, 2);
+      check('保留的第一个 op hash', v.ops[0] && v.ops[0].hash, 'abc');
+      check('合法 ed 保留、坏 ed 丢弃', v.eds.length, 1);
+      check('pending op（end=-1）保留', validate({ ops: [{ hash: 'p', start: 3, end: -1 }], eds: [] }).ops.length, 1);
+      check('非对象输入 → 空', validate(null).ops.length, 0);
     }
     if (typeof save === 'function' && typeof load === 'function') {
       save('b:BV1', { ops: [{ hash: 'abc', start: 0, end: 90 }], eds: [{ hash: 'ed1' }] });
@@ -441,7 +442,7 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
     checkTrue('api_.frameStep 已导出', typeof frameStep === 'function');
     if (typeof frameStep === 'function') {
       const segs = { ops: [{ hash: '0000', start: 0, end: 90 }], eds: [{ hash: '1111' }] };
-      const H = '0000', F = '0101';
+      const H = '0000';
       const m = { target: null, hits: 0 };
       check('第一次命中不跳（未够连续）', frameStep(m, segs, H, 0, 1400), null);
       check('命中计数 1', m.hits, 1);
@@ -449,10 +450,11 @@ git -C F:\dsh\bilibili-aniskip -c user.name="PZero534232" -c user.email="1406002
       check('连续命中后认到 OP', !!(seg && seg.type === 'op'), true);
       check('OP 落点 = 检测点 + 时长', seg && seg.end, 91);
       check('认到后清空目标', m.target, null);
-      // 中途一次不中 → 连续计数归零，重新攒
+      // 中途一次不中 → 连续计数归零，重新攒（用长哈希，让 hamming 能 ≥ 阈值）
       const m2 = { target: null, hits: 0 };
-      frameStep(m2, segs, H, 0, 1400);
-      frameStep(m2, segs, F, 0, 1400);
+      const segsLong = { ops: [{ hash: '0000000000000000', start: 0, end: 90 }], eds: [] };
+      frameStep(m2, segsLong, '0000000000000000', 0, 1400);
+      frameStep(m2, segsLong, '1111111111111111', 0, 1400);
       check('中间一帧不中 → 目标清空', m2.target, null);
       check('中间一帧不中 → 计数归零', m2.hits, 0);
       // ED：命中 → 跳到视频结尾
