@@ -1,5 +1,7 @@
 # 本地「手动标记 OP/ED 帧」功能设计
 
+> 修订（2026-10-16）：ED 结束标记与标记入口位置已改，见 `2026-10-16-local-op-ed-ed-end-and-settings-ui-design.md`。
+
 - 日期：2026-10-16
 - 状态：待评审
 - 范围：`bilibili-aniskip` userscript（`F:\dsh\bilibili-aniskip`）

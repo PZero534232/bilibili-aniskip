@@ -3989,9 +3989,6 @@
 
     try { GM_registerMenuCommand('🔍 绑定 / 识别番剧', openBindPanel); } catch (e) { /* ignore */ }
     try { GM_registerMenuCommand('⚙ 番剧跳过设置', openSettings); } catch (e) { /* ignore */ }
-    try { GM_registerMenuCommand('⏱ 标 OP 开始', markOpStart); } catch (e) { /* ignore */ }
-    try { GM_registerMenuCommand('⏱ 标 OP 结束', markOpEnd); } catch (e) { /* ignore */ }
-    try { GM_registerMenuCommand('⏱ 标 ED 开始', markEdStart); } catch (e) { /* ignore */ }
 
     // 网页全屏 / 真实全屏切换：胶囊要跟着收起/恢复。
     // B 站把 data-screen 设在 .bpx-player-container 上；观察不到就退化成只在 fullscreenchange 里响应。
