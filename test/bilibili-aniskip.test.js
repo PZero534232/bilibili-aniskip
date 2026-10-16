@@ -3224,6 +3224,22 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('47f. 本地兜底启用判定');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const shouldUse = hook(env, 'shouldUseLocalSegs');
+    checkTrue('api_.shouldUseLocalSegs 已导出', typeof shouldUse === 'function');
+    if (typeof shouldUse === 'function') {
+      const good = { ops: [{ hash: 'h', start: 0, end: 90 }], eds: [] };
+      check('无 bindingKey → 不用', shouldUse({ ok: true, segments: [] }, good), false);
+      check('云端有段 → 不用', shouldUse({ ok: true, bindingKey: 'b:x', segments: [{ type: 'op' }] }, good), false);
+      check('云端空 + 本地有 → 用', shouldUse({ ok: true, bindingKey: 'b:x', segments: [] }, good), true);
+      check('本地空 → 不用', shouldUse({ ok: true, bindingKey: 'b:x', segments: [] }, { ops: [], eds: [] }), false);
+      check('只有 pending op → 不用', shouldUse({ ok: true, bindingKey: 'b:x', segments: [] }, { ops: [{ hash: 'h', start: 0, end: -1 }], eds: [] }), false);
+      check('只有 ED 也够 → 用', shouldUse({ ok: true, bindingKey: 'b:x', segments: [] }, { ops: [], eds: [{ hash: 'e' }] }), true);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

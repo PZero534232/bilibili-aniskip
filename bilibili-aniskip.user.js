@@ -2436,6 +2436,15 @@
     return null;
   }
 
+  /* 本地指纹什么时候参与：已绑定（有 bindingKey）、云端没给段、本地有可用指纹。 */
+  function shouldUseLocalSegs(r, localSegs) {
+    if (!r || !r.ok || !r.bindingKey) return false;
+    if (r.segments && r.segments.length) return false;
+    if (!localSegs) return false;
+    var usableOp = (localSegs.ops || []).some(function (o) { return o.end > o.start; });
+    return !!(usableOp || (localSegs.eds || []).length);
+  }
+
   /* ==================================================================
    * 15. UI：状态胶囊 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
@@ -3855,6 +3864,7 @@
         loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
         recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
         frameStep: frameStep,
+        shouldUseLocalSegs: shouldUseLocalSegs,
         getConfig: function () { return Object.assign({}, config); }
       }
     };
