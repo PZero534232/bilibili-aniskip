@@ -2136,7 +2136,10 @@
     lastLocKey: '',
     screen: 'normal',          // 'normal' | 'web' | 'full'（网页全屏=web：胶囊要临时收起别挡画面）
     autoNextDone: false,       // 自动切下一集：每个视频只切一次（换集/换视频由 rerun 清掉）
-    pillDragged: false       // 胶囊刚被拖动过：紧跟着的那次 click 不算点击
+    pillDragged: false,      // 胶囊刚被拖动过：紧跟着的那次 click 不算点击
+    frameMatcher: null,      // { target, hits }：抽帧匹配的连续命中状态
+    frameTimer: null,        // 抽帧 interval 句柄
+    localSegs: null          // 当前 binding 的本地指纹 { ops, eds }
   };
 
   function shouldSkipThisSegment(seg) {
@@ -2459,6 +2462,45 @@
       var img = ctx.getImageData(0, 0, c.width, c.height);
       return aHash(gray8x8(img));
     } catch (e) { return null; }
+  }
+
+  /* 给定一帧的哈希 + video，走「匹配 → 跳」。从 frameTick 拆出来，方便测试驱动。 */
+  function applyFrameHash(hash, video) {
+    if (!runtime.localSegs) return;
+    var seg = frameStep(runtime.frameMatcher, runtime.localSegs, hash, video.currentTime, video.duration);
+    if (seg) performSkip(video, seg);
+  }
+
+  function frameTick() {
+    var video = runtime.video || getVideo();
+    if (!video || video.paused || video.ended || !video.duration) return;
+    var hash = captureFrameHash();
+    if (!hash) return;
+    applyFrameHash(hash, video);
+  }
+
+  function startFrameMonitor() {
+    if (runtime.frameTimer) return;
+    runtime.frameMatcher = { target: null, hits: 0 };
+    runtime.video = runtime.video || getVideo();
+    runtime.frameTimer = setInterval(frameTick, FRAME_SAMPLE_MS);
+  }
+  function stopFrameMonitor() {
+    if (runtime.frameTimer) { clearInterval(runtime.frameTimer); runtime.frameTimer = null; }
+    runtime.frameMatcher = { target: null, hits: 0 };
+  }
+
+  /* rerun 识别完后调用：云端有段 → 停掉抽帧；云端空且本地有指纹 → 开抽帧。 */
+  function syncFrameMonitor(r) {
+    var key = r && r.bindingKey;
+    var segs = key ? loadLocalSegs(key) : null;
+    if (shouldUseLocalSegs(r, segs)) {
+      runtime.localSegs = segs;
+      startFrameMonitor();
+    } else {
+      runtime.localSegs = null;
+      stopFrameMonitor();
+    }
   }
 
   /* ==================================================================
@@ -3745,6 +3787,7 @@
     runtime.allowAutoSkip = false;
     runtime.autoNextDone = false;
     stopMonitor();
+    stopFrameMonitor();
     return buildContext().then(function (ctx) {
       if (gen !== runtime.gen) return null;          // 已经切走了，这次结果作废
       runtime.ctx = ctx;
@@ -3761,6 +3804,7 @@
         runtime.skipped = {};
         startMonitor();
       }
+      syncFrameMonitor(r);
       if (shouldShowIdentifyToast(r)) {
         showToast('已识别：' + r.title,
           '第 ' + r.episode + ' 集 · ' + (r.segments || []).filter(segmentEnabled).length + ' 段时间戳');
@@ -3846,6 +3890,7 @@
       _openSettings: openSettings,
       _renderPill: renderPill,
       _applyScreen: applyScreen,
+      _syncFrameMonitor: syncFrameMonitor,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
         validateSegs: validateSegs, durationScore: durationScore, similarity: similarity,
@@ -3881,6 +3926,7 @@
         recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
         frameStep: frameStep,
         shouldUseLocalSegs: shouldUseLocalSegs,
+        applyFrameHash: applyFrameHash,
         getConfig: function () { return Object.assign({}, config); }
       }
     };

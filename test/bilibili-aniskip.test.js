@@ -3240,6 +3240,26 @@ function ctxOf(bvid, page) {
     }
   }
 
+  head('47g. 检测循环：applyFrameHash 认到就跳');
+  {
+    const env = makeEnv({ store: { autoDetect: 'off' } });
+    const applyFrameHash = hook(env, 'applyFrameHash');
+    checkTrue('api_.applyFrameHash 已导出', typeof applyFrameHash === 'function');
+    if (typeof applyFrameHash === 'function') {
+      const mkVideo = () => ({ currentTime: 5, duration: 1400, paused: false, ended: false,
+        play() { this.paused = false; }, addEventListener() {} });
+      const v = mkVideo();
+      env.api._runtime.video = v;
+      env.api._runtime.result = { ok: true, segments: [] };
+      env.api._runtime.frameMatcher = { target: null, hits: 0 };
+      env.api._runtime.localSegs = { ops: [{ hash: '0000', start: 0, end: 90 }], eds: [] };
+      applyFrameHash('0000', v);          // 第 1 次：只攒连续计数，不跳
+      check('第一次命中不跳', Math.round(v.currentTime), 5);
+      applyFrameHash('0000', v);          // 第 2 次：认到，跳到 5+90
+      check('认到 OP 后跳走', Math.round(v.currentTime), 95);
+    }
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
