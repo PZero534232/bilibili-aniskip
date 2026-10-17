@@ -2233,25 +2233,27 @@ function ctxOf(bvid, page) {
   head('33. 文档一致性（v0.4.5）');
   {
     const SRC_PATH = SRCS.find((p) => fs.existsSync(p));
-    const README = ['README.md', path.join('..', 'README.md')]
+    const readDoc = (names) => names
       .map((r) => path.join(path.dirname(SRC_PATH), r))
       .map((p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null))
       .find((x) => x) || '';
+    const README = readDoc(['README.md', path.join('..', 'README.md')]);
+    const CHANGELOG = readDoc(['CHANGELOG.md', path.join('..', 'CHANGELOG.md')]);
 
-    /* 版本号跟 README 的更新日志必须对得上 —— 写死成某个版本的话每次发版都要改测试，
-     * 而且很容易「升了脚本忘了写日志」（或反过来）。 */
+    /* 版本号跟更新日志必须对得上 —— 写死成某个版本的话每次发版都要改测试，
+     * 而且很容易「升了脚本忘了写日志」（或反过来）。0.5.0 起更新日志搬到 CHANGELOG.md。 */
     const ver = (/@version\s+([0-9]+\.[0-9]+\.[0-9]+)/.exec(SRC) || [])[1];
-    checkTrue('脚本版本号与 README 更新日志一致（' + ver + '）',
-      !!ver && new RegExp('###\\s*' + ver.replace(/\./g, '\\.')).test(README));
-    checkTrue('README 有 0.4.5 更新日志', /###\s*0\.4\.5/.test(README));
-    checkTrue('README 有 0.4.6 更新日志', /###\s*0\.4\.6/.test(README));
+    checkTrue('脚本版本号与 CHANGELOG 更新日志一致（' + ver + '）',
+      !!ver && new RegExp('##\\s*' + ver.replace(/\./g, '\\.')).test(CHANGELOG));
+    checkTrue('CHANGELOG 有 0.4.5 更新日志', /##\s*0\.4\.5/.test(CHANGELOG));
+    checkTrue('CHANGELOG 有 0.4.6 更新日志', /##\s*0\.4\.6/.test(CHANGELOG));
     checkTrue('README 的「撤回提示秒数」默认值是 4（不再是 8）',
       /\|\s*撤回提示秒数\s*\|\s*`4`\s*\|/.test(README));
     checkTrue('README 设置表补上了「跳过偏移」', /跳过偏移/.test(README));
     checkTrue('README 不再写死用例数', !/19[0-9]\s*项用例/.test(README));
     checkTrue('README 写清了 ask = 点了才跳', /`ask`[\s\S]{0,200}点了才跳/.test(README));
     checkTrue('README 写清了 auto 的置信度门槛', /置信度 ≥ 60/.test(README));
-    checkTrue('README 提到了网络失败态', /网络请求失败/.test(README));
+    checkTrue('README 提到了网络失败态', /网络不通|数据源限流/.test(README));
   }
 
   /* --- 34. 绑定面板：多季合集不许存成「没季链的单季绑定」（v0.4.6） ---
@@ -3440,28 +3442,6 @@ function ctxOf(bvid, page) {
     }
   }
 
-  head('48b. 进度条标记换算 pct / progressMarks');
-  {
-    const env = makeEnv({ store: { autoDetect: 'off' } });
-    const pctF = hook(env, 'pct');
-    const pm = hook(env, 'progressMarks');
-    checkTrue('api_.pct 已导出', typeof pctF === 'function');
-    checkTrue('api_.progressMarks 已导出', typeof pm === 'function');
-    if (typeof pctF === 'function' && typeof pm === 'function') {
-      check('pct 一半', pctF(700, 1400), 50);
-      check('pct 超出时长夹到 100', pctF(2000, 1400), 100);
-      check('pct 负数 → 0', pctF(-5, 1400), 0);
-      check('pct 时长非法 → 0', pctF(10, 0), 0);
-      const ms = pm({ ops: [{ hash: 'a', start: 10, end: 70 }], eds: [{ hash: 'b', start: 1300, end: -1 }] }, 1400);
-      check('两条标记都产出', ms.length, 2);
-      check('op 起点百分比', Math.round(ms[0].a * 100) / 100, 0.71);
-      check('op 终点百分比', Math.round(ms[0].b * 100) / 100, 5);
-      check('ED 未标结束 → 画到片尾', ms[1].b, 100);
-      check('pending 的 OP 不画', pm({ ops: [{ hash: 'p', start: 10, end: -1 }], eds: [] }, 1400).length, 0);
-      check('时长为 0 → 空数组', pm({ ops: [{ hash: 'a', start: 1, end: 2 }], eds: [] }, 0).length, 0);
-    }
-  }
-
   head('48c. 工具条 host：全屏挂载点选择');
   {
     const env = makeEnv({ store: { autoDetect: 'off' } });
@@ -3647,41 +3627,6 @@ function ctxOf(bvid, page) {
     }
   }
 
-  head('48g. 进度条标记叠加');
-  {
-    const bar1 = el('div');
-    bar1.className = 'bpx-player-progress-wrap';
-    const env = makeEnv({
-      store: { autoDetect: 'off', _bindings: JSON.stringify({ 'b:BV_TEST000001': { title: 'T', episodes: 28, anchorPage: 1 } }) },
-      bars: [bar1]
-    });
-    env.api._runtime.ctx = ctxOf('BV_TEST000001', 1);
-    env.api._runtime.video = { currentTime: 0, duration: 1400, paused: true, ended: false, play() {}, addEventListener() {} };
-    const hookFn = hook(env, 'saveLocalSegs');
-    const paint = env.api._paintProgressMarks;
-    checkTrue('api._paintProgressMarks 已导出', typeof paint === 'function');
-    if (typeof paint === 'function' && typeof hookFn === 'function') {
-      hookFn('b:BV_TEST000001', { ops: [{ hash: 'a', start: 0, end: 90 }], eds: [] });
-      paint();
-      const layer = bar1.querySelector('[data-aniskip-marks]');
-      check('进度条里插了覆盖层', !!layer, true);
-      check('容器被设为 relative（否则绝对定位会跑偏）', bar1.style.position, 'relative');
-      check('只画 1 个起点刻度（不再画整段高亮）', layer ? layer._children.length : 0, 1);
-      // 内容没变 → 不重复写 DOM
-      const before = layer._children.slice();
-      paint();
-      check('签名没变时不重写 DOM', layer._children[0] === before[0], true);
-      // 清掉标记 → 覆盖层被清空
-      hookFn('b:BV_TEST000001', { ops: [], eds: [] });
-      paint();
-      check('没标记时覆盖层清空', layer._children.length, 0);
-      // 找不到容器也不能抛错
-      env.api._runtime.ctx = null;
-      paint();
-      checkTrue('没绑定时不抛错', true, true);
-    }
-  }
-
   head('48h. 全屏重挂 + 工具条拖动');
   {
     const env = makeEnv({
@@ -3725,13 +3670,10 @@ function ctxOf(bvid, page) {
     }
   }
 
-  head('48i. 标记只画在标它的那一集（换集不画假位置）');
+  head('48i. 标记带集号（工具条写明标于哪一集）');
   {
-    const bar = el('div');
-    bar.className = 'bpx-player-progress-wrap';
     const env = makeEnv({
       store: { autoDetect: 'off', _bindings: JSON.stringify({ 'b:BV1jfDYBSEKs': { title: 'T', episodes: 13, anchorPage: 1 } }) },
-      bars: [bar],
       location: { pathname: '/video/BV1jfDYBSEKs', search: '?p=1' }
     });
     env.api._runtime.ctx = ctxOf('BV1jfDYBSEKs', 1);
@@ -3754,35 +3696,10 @@ function ctxOf(bvid, page) {
     check('非字符串 vid → null', vls({ ops: [{ hash: 'a', start: 1, end: 2, vid: 7 }], eds: [] }).ops[0].vid, null);
     check('正常 vid 原样保留', vls({ ops: [{ hash: 'a', start: 1, end: 2, vid: 'BV1jfDYBSEKs:3' }], eds: [] }).ops[0].vid, 'BV1jfDYBSEKs:3');
 
-    /* 纯函数：本集画、别集不画、认不出集号时照旧画 */
-    const pm = hook(env, 'progressMarks');
-    const mk = (vid) => ({ ops: [{ hash: 'a', start: 10, end: 70, vid: vid }], eds: [] });
-    check('本集标的 → 画', pm(mk('BV1jfDYBSEKs:1'), 1400, 'BV1jfDYBSEKs:1').length, 1);
-    check('别的集标的 → 不画', pm(mk('BV1jfDYBSEKs:2'), 1400, 'BV1jfDYBSEKs:1').length, 0);
-    check('没记集号的老标记 → 照旧画', pm(mk(null), 1400, 'BV1jfDYBSEKs:1').length, 1);
-    check('调用方没传集号 → 照旧画（向后兼容）', pm(mk('BV1jfDYBSEKs:2'), 1400).length, 1);
-    check('ED 未标结束也按集过滤',
-      pm({ ops: [], eds: [{ hash: 'b', start: 1300, end: -1, vid: 'BV1jfDYBSEKs:2' }] }, 1400, 'BV1jfDYBSEKs:1').length, 0);
-    check('ED 未标结束（本集）仍画到片尾',
-      (pm({ ops: [], eds: [{ hash: 'b', start: 1300, end: -1, vid: 'BV1jfDYBSEKs:1' }] }, 1400, 'BV1jfDYBSEKs:1')[0] || {}).b, 100);
-
-    /* 端到端：第 1P 上标的，换到第 2P 后刻度必须清掉 */
+    /* 工具条文案：站在第 2P 看第 1P 标的标记，要写清「标记标于别集，本集按指纹复用」 */
     const save = hook(env, 'saveLocalSegs');
-    const paint = env.api._paintProgressMarks;
     save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90, vid: 'BV1jfDYBSEKs:1' }], eds: [] });
-    paint();
-    const layer = bar.querySelector('[data-aniskip-marks]');
-    check('本集（第 1P）画出刻度', layer ? layer._children.length : -1, 1);
     global.location = { pathname: '/video/BV1jfDYBSEKs', search: '?p=2' };
-    paint();
-    check('换到第 2P 后刻度被清掉（不画假位置）', bar.querySelector('[data-aniskip-marks]')._children.length, 0);
-    /* 老数据没集号 —— 不能让它凭空消失 */
-    save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90 }], eds: [] });
-    paint();
-    check('没集号的老标记仍然画出来', bar.querySelector('[data-aniskip-marks]')._children.length, 1);
-
-    /* 工具条文案：说清「标记标于别集，本集按指纹复用」 */
-    save('b:BV1jfDYBSEKs', { ops: [{ hash: 'a', start: 0, end: 90, vid: 'BV1jfDYBSEKs:1' }], eds: [] });
     env.api._markToggle();
     env.api._refreshMarkBar();
     const statEl = env.api._markHost().shadowRoot.querySelector('.mkroot').querySelector('.mkstat');

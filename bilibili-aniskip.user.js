@@ -691,7 +691,7 @@
   }
   /* 当前这一集的稳定标识（BV/av + 第几个 P）。两处靠它：
    *   · bootTimer 判断「换集了没有」—— 同 BV 换 P、合集里换 BV 都算换；
-   *   · 本地 OP/ED 标记记下「是在哪一集标的」，换集后进度条不再画别的集的绝对位置。
+   *   · 本地 OP/ED 标记记下「是在哪一集标的」，换集后工具条要写明它标于哪一集。
    * pathname 里没有 BV（av 号页面）时退回 av 号，不然所有 av 页面会共用一个键。 */
   function locKeyOf() {
     var bv = currentBvid();
@@ -2418,7 +2418,7 @@
   }
 
   /* 标记动作都是纯函数：入参是当前指纹集 + 新信息，返回新指纹集（不落盘，落盘由调用方做）。
-   * vid 入参 = 当前这一集（locKeyOf()），跟着标记一起存 —— 换集后进度条靠它决定画不画；
+   * vid 入参 = 当前这一集（locKeyOf()），跟着标记一起存 —— 工具条靠它写明「标于哪一集」；
    * 不传（老调用方 / 测试）就是 null：认不出集号，照旧在所有集画。 */
   function recordOpStart(segs, hash, time, vid) {
     var out = validateLocalSegs(segs);
@@ -2597,7 +2597,6 @@
   function afterMark() {
     syncFrameMonitor(runtime.result);
     if (runtime.markOn && markRoot) refreshMarkBar();
-    paintProgressMarks();
   }
   function hasPendingOp(segs) {
     return (segs.ops || []).some(function (o) { return o.end < 0; });
@@ -2647,40 +2646,6 @@
    * 15. UI：状态胶囊 + 标记工具条 + 绑定面板 + 设置面板 + Toast
    * ================================================================== */
   var host = null, shadow = null, uiRoot = null, toastRoot = null;
-
-  /* 秒 → 进度条百分比（0~100）。时长非法时一律 0，绝不除零。 */
-  function pct(t, dur) {
-    if (!(dur > 0) || !isFinite(t) || t <= 0) return 0;
-    var v = t / dur * 100;
-    return v > 100 ? 100 : v;
-  }
-
-  /* 本地标记 → 进度条上要画的区间 [{type:'op'|'ed', a:起%, b:终%}]。
-   * · 未标结束的 OP 不画（它本来就不参与匹配）；
-   * · 未标结束的 ED 画到片尾（对应「落视频时长」的语义）；
-   * · 只画「标它的那一集」（vid 相等）。换集后 OP/ED 的绝对位置大概率不一样，照旧画
-   *   等于在进度条上画个假位置 —— 跳过本身不受影响：frameStep 只用标记的「长度」
-   *   （end − start）+ 检测到指纹的那一刻，所以换集照样跳得对。
-   *   vid 为空、或调用方没传（老数据 / 老调用方）时照旧画：宁可多画一条，
-   *   也不能让老标记凭空消失。 */
-  function progressMarks(segs, dur, vid) {
-    var out = [];
-    if (!(dur > 0)) return out;
-    function onThisEp(m) { return !vid || !m.vid || m.vid === vid; }
-    var ops = (segs && segs.ops) || [], eds = (segs && segs.eds) || [], i;
-    for (i = 0; i < ops.length; i++) {
-      if (!onThisEp(ops[i])) continue;
-      if (!(ops[i].end > ops[i].start)) continue;
-      out.push({ type: 'op', a: pct(ops[i].start, dur), b: pct(ops[i].end, dur) });
-    }
-    for (i = 0; i < eds.length; i++) {
-      if (!onThisEp(eds[i])) continue;
-      var s = eds[i].start;
-      var e = (eds[i].end > eds[i].start) ? eds[i].end : dur;
-      out.push({ type: 'ed', a: pct(s, dur), b: pct(e, dur) });
-    }
-    return out;
-  }
 
   /* ---- 标记工具条：独立 host（不与胶囊共用，见 spec §5） ---- */
   var MARK_ON_KEY = '_markOn';
@@ -2794,7 +2759,7 @@
       '<div class="mklist"></div>' +
       '<div class="mkfoot"><button class="mkbtn mkclr" data-mk="clr">清空本番标记</button></div>';
     /* 四个标记按钮：直接复用既有 handler（内部已有未绑定 / 抓帧失败的 toast 分支），
-     * 点完不关工具条，就地刷新状态行、列表、进度条。 */
+     * 点完不关工具条，就地刷新状态行与列表。 */
     var mkPairs = [['op-s', markOpStart], ['op-e', markOpEnd], ['ed-s', markEdStart], ['ed-e', markEdEnd]];
     for (var mi = 0; mi < mkPairs.length; mi++) {
       (function (name, fn) {
@@ -2804,7 +2769,6 @@
         node.addEventListener('click', function () {
           fn();
           refreshMarkBar();
-          paintProgressMarks();
         });
       })(mkPairs[mi][0], mkPairs[mi][1]);
     }
@@ -2817,7 +2781,6 @@
         try { GM_deleteValue(localSegsKey(bind._key)); } catch (e) { /* ignore */ }
         syncFrameMonitor(runtime.result);
         refreshMarkBar();
-        paintProgressMarks();
         showToast('清空本番标记', '已删掉这个番的本地指纹');
       });
     }
@@ -2835,7 +2798,6 @@
     attachMarkDrag(bar);
     markRoot.appendChild(bar);
     refreshMarkBar();
-    paintProgressMarks();
   }
 
   /* 状态行 + 列表。只更新这两块，不重建整个工具条。 */
@@ -2852,8 +2814,7 @@
     }
     var segs = loadLocalSegs(bind._key);
     var ops = segs.ops || [], eds = segs.eds || [];
-    /* 说清「这些标记是在哪一集标的」：别的集的标记本集不画进度条（见 progressMarks），
-     * 只按指纹复用 —— 不写清楚的话，用户会以为换集后标记和刻度一起坏了。 */
+    /* 说清「这些标记是在哪一集标的」：标记跨集复用，但写清来源，免得用户以为标记串到别的集了。 */
     var cur = locKeyOf(), fromOther = [], legacy = 0, all = ops.concat(eds), k;
     for (k = 0; k < all.length; k++) {
       var v = all[k].vid;
@@ -2862,9 +2823,9 @@
     }
     var hint = '';
     if (fromOther.length) {
-      hint += ' · 标记标于 ' + fromOther.map(vidLabel).join('、') + '（本集按指纹复用，不画位置）';
+      hint += ' · 标记标于 ' + fromOther.map(vidLabel).join('、') + '（本集按指纹复用）';
     }
-    if (legacy) hint += ' · ' + legacy + ' 条旧标记没记集号，仍会画在进度条上';
+    if (legacy) hint += ' · ' + legacy + ' 条旧标记没记集号（重新标一次就带上了）';
     stat.textContent = '当前：' + (bind.title || bind._key) +
       '   已标 OP ' + ops.length + ' 套 / ED ' + eds.length + ' 套' + hint;
     list.textContent = '';
@@ -2899,7 +2860,7 @@
     return wrap;
   }
 
-  /* 删单条：落盘 → 重新同步抽帧（顺带清掉已跳指纹）→ 就地刷新列表与进度条。
+  /* 删单条：落盘 → 重新同步抽帧（顺带清掉已跳指纹）→ 就地刷新列表。
    * 用指纹核对目标：列表可能已经重画过，光靠 index 会删到别的标记上。
    * 对不上就什么都不做 —— 不误删，也不假报成功。
    * 只用 refreshMarkBar 局部刷新，不整树重建，免得列表滚动位置被顶回顶部。 */
@@ -2915,7 +2876,6 @@
     saveLocalSegs(bind._key, removeLocalSeg(segs, listKey, index));
     syncFrameMonitor(runtime.result);
     refreshMarkBar();
-    paintProgressMarks();
     showToast('已删掉这条标记', (row && row.label ? row.label : '') + ' 第 ' + (index + 1) + ' 条');
   }
 
@@ -2977,55 +2937,6 @@
       markDrag = { bar: bar, moved: false, x: e.clientX || 0, y: e.clientY || 0, l: r.left, t: r.top };
       if (e.preventDefault) e.preventDefault();
     });
-  }
-
-  /* ---- 进度条标记叠加：把本地标记画在 B 站自己的进度条上 ---- */
-
-  /* 把标记画到一个进度条容器上 —— 只画起点刻度，不画整段高亮：
-   * 区间条会压掉进度条一大块，而落点根本不靠它（跳过用指纹 + 标记时长算），留着挡视线。
-   * 找不到父容器 / 写不进 DOM 都静默放弃。
-   * 用 dataset 上的签名避免反复无谓重排；换容器（全屏）时新容器没有签名 → 会重画。 */
-  function paintOneBar(bar, marks, sig) {
-    try {
-      var layer = bar.querySelector('[data-aniskip-marks]');
-      if (!layer) {
-        var pos = '';
-        try {
-          var cs = window.getComputedStyle ? window.getComputedStyle(bar) : null;
-          pos = (cs && cs.position) || '';
-        } catch (e0) { pos = ''; }
-        if (pos !== 'relative' && pos !== 'absolute' && pos !== 'fixed') bar.style.position = 'relative';
-        layer = document.createElement('div');
-        layer.setAttribute('data-aniskip-marks', '1');
-        layer.style.cssText = 'position:absolute;top:0;bottom:0;left:0;right:0;pointer-events:none;overflow:hidden;';
-        bar.appendChild(layer);
-      }
-      if (bar.dataset.aniskipSig === sig) return;
-      bar.dataset.aniskipSig = sig;
-      layer.innerHTML = '';
-      for (var i = 0; i < marks.length; i++) {
-        var m = marks[i];
-        var color = m.type === 'op' ? '#00a1d6' : '#ffb648';
-        var tick = document.createElement('span');
-        tick.style.cssText = 'position:absolute;top:0;bottom:0;left:' + m.a + '%;width:2px;background:' + color + ';';
-        layer.appendChild(tick);
-      }
-    } catch (e) { /* 进度条 DOM 变了就放弃这一条，不影响别的功能 */ }
-  }
-
-  /* 在所有能找到的进度条容器上刷新标记。不需要处于标记模式。 */
-  function paintProgressMarks() {
-    var bars = [];
-    try { bars = document.querySelectorAll('.bpx-player-progress-wrap'); } catch (e) { bars = []; }
-    if (!bars || !bars.length) return;
-    var bind = currentBinding();
-    var segs = bind ? loadLocalSegs(bind._key) : null;
-    var v = runtime.video || getVideo();
-    var dur = (v && v.duration) || 0;
-    var marks = progressMarks(segs, dur, locKeyOf());
-    var sig = '';
-    for (var i = 0; i < marks.length; i++) sig += marks[i].type + ':' + marks[i].a + '-' + marks[i].b + ';';
-    for (var j = 0; j < bars.length; j++) paintOneBar(bars[j], marks, sig);
   }
 
   function ensureUI() {
@@ -3478,10 +3389,9 @@
     applyPillPos();
     uiRoot.appendChild(pill);
 
-    /* 工具条的状态行 / 进度条标记跟着胶囊一起刷新：识别完成、换分P、换视频时
-     * 胶囊会重画，工具条不能停在「未绑定」、进度条不能停在上一集的标记。 */
+    /* 工具条的状态行跟着胶囊一起刷新：识别完成、换分P、换视频时
+     * 胶囊会重画，工具条不能停在「未绑定」。 */
     if (runtime.markOn && markRoot) refreshMarkBar();
-    paintProgressMarks();
   }
 
   /* ---- 胶囊拖动 ---- */
@@ -4376,9 +4286,6 @@
         runtime.lastLocKey = key;
         rerun();
       }
-      /* 兜底：B 站会重排控制栏（换清晰度 / 进出全屏），进度条节点会换成新的，
-       * 新的没有签名 → 这里把它补画上。签名没变时不写 DOM。 */
-      paintProgressMarks();
     }, 1200);
 
     // 防抖窗口（800ms）里关标签页会丢写，这两处兜一下
@@ -4438,7 +4345,6 @@
       _ensureMarkHost: ensureMarkHost,
       _markToggle: markToggle, _renderMark: renderMark, _refreshMarkBar: refreshMarkBar,
       _markHost: function () { return markHost; },
-      _paintProgressMarks: paintProgressMarks,
       _applyScreen: applyScreen,
       api_: {
         extractEpisode: extractEpisode, animeNameCandidates: animeNameCandidates, cleanTitle: cleanTitle,
@@ -4474,7 +4380,7 @@
         loadLocalSegs: loadLocalSegs, saveLocalSegs: saveLocalSegs,
         recordOpStart: recordOpStart, recordOpEnd: recordOpEnd, recordEdStart: recordEdStart,
         recordEdEnd: recordEdEnd, removeLocalSeg: removeLocalSeg,
-        pct: pct, progressMarks: progressMarks, locKeyOf: locKeyOf, vidLabel: vidLabel,
+        locKeyOf: locKeyOf, vidLabel: vidLabel,
         frameStep: frameStep,
         shouldUseLocalSegs: shouldUseLocalSegs,
         applyFrameHash: applyFrameHash,
