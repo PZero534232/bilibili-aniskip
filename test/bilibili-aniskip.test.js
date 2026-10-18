@@ -681,8 +681,7 @@ function ctxOf(bvid, page) {
     check('正常 OP 保留', validateSegs([S('op', 10, 100)], 1500).length, 1);
     check('太短 10s 丢弃', validateSegs([S('op', 10, 20)], 1500).length, 0);
     check('OP 太长 300s 丢弃', validateSegs([S('op', 10, 310)], 1500).length, 0);
-    check('recap 280s 保留', validateSegs([S('recap', 10, 280)], 1500).length, 1);
-    check('recap 320s 丢弃', validateSegs([S('recap', 10, 320)], 1500).length, 0);
+    check('recap 段一律丢弃（回顾不再跳）', validateSegs([S('recap', 10, 280)], 1500).length, 0);
     check('end<=start 丢弃', validateSegs([S('op', 100, 50)], 1500).length, 0);
     check('起点超出视频时长丢弃', validateSegs([S('op', 1400, 1500)], 1000).length, 0);
     check('近似重复去重', validateSegs([S('op', 10, 100), S('op', 11, 101)], 1500).length, 1);
@@ -1294,13 +1293,16 @@ function ctxOf(bvid, page) {
     check('P50（第三季01）→ Ⅲ 第1话', hitOf(50), [59193, 1]);
     check('P63（第三季14）→ Ⅲ 第14话', hitOf(63), [59193, 14]);
 
-    /* ⑥ mixed-op（OP 融进画面）默认不跳 */
+    /* ⑥ 回顾 / 融进正片的 OP/ED 不再跳（两个开关已从设置里删掉） */
     const cfgLZ = e0.api.getConfig();
-    check('jumpMixed 默认关', cfgLZ.jumpMixed, false);
-    checkTrue('mixed-op/mixed-ed 由独立开关注册', /if \(config\.jumpMixed\) types\.push\('mixed-op'/.test(SRC));
-    checkTrue('仅当 jumpOp 时才请求纯 op（不再顺带 mixed-op）', /if \(config\.jumpOp\) types\.push\('op'\);/.test(SRC));
-    checkTrue('mixed 段单独受 segmentEnabled 控制', /if \(s\.mixed\) return config\.jumpMixed;/.test(SRC));
-    checkTrue('设置面板有「融进正片」开关', /融进正片/.test(SRC) && /class="mixed"/.test(SRC));
+    checkTrue('jumpMixed / jumpRecap 已从配置里删掉',
+      cfgLZ.jumpMixed === undefined && cfgLZ.jumpRecap === undefined,
+      [cfgLZ.jumpMixed, cfgLZ.jumpRecap]);
+    checkTrue('只请求 op / ed（不再请求 recap / mixed-*）',
+      !/types\.push\('recap'\)/.test(SRC) && !/types\.push\('mixed-op'/.test(SRC));
+    checkTrue('mixed 段一律不跳', /if \(s\.mixed\) return false;/.test(SRC));
+    checkTrue('设置面板里没有这两个开关',
+      !/class="recap"/.test(SRC) && !/class="mixed"/.test(SRC) && !/跳过回顾/.test(SRC));
 
     /* ⑦ 胶囊：设置入口 + 绑过的视频在关闭自动识别时仍可见 */
     checkTrue('胶囊带设置入口', /data-a="cfg"/.test(SRC) && /onAct\('cfg', openSettings\)/.test(SRC));
@@ -1495,7 +1497,7 @@ function ctxOf(bvid, page) {
     // 比一个失败态更有用（用户能看出「认出来了，只是这集没数据」），且不会跳任何东西。
     const r5 = await e.api.identify(gctx(5));
     checkTrue('P5 上游无数据 → 0 段（不是失败态）', r5.ok && (r5.segments || []).length === 0, [r5.ok, r5.reason, (r5.segments || []).length]);
-    check('P5 没有任何可跳区间', (r5.segments || []).filter(s => s.type === 'op' || s.type === 'ed' || s.type === 'recap'), []);
+    check('P5 没有任何可跳区间', (r5.segments || []).filter(s => s.type === 'op' || s.type === 'ed'), []);
   }
 
   /* --- 25. 真实案例：单季投稿被误判成多季连播（BV1LUTt6fE6K） ---
@@ -1815,8 +1817,8 @@ function ctxOf(bvid, page) {
     check('+3 → 多跳 3 秒（把 OP 后的黑屏一起跳掉）', targetWith(3), 193.06);
     check('-5 → 少跳 5 秒（留住 OP 尾巴）', targetWith(-5), 185.06);
     // 短片段 + 大负偏移：下限锁在「起跳点 +1 秒」，绝不倒回片段内部
-    check('-30（已被配置夹住）用在 15 秒的回顾上 → 锁在起点 +1 秒',
-      targetWith(-30, mkVideo(), { type: 'recap', start: 100, end: 115 }), 101);
+    check('-30（已被配置夹住）用在 15 秒的短片段上 → 锁在起点 +1 秒',
+      targetWith(-30, mkVideo(), { type: 'op', start: 100, end: 115 }), 101);
     check('-100 会被配置夹成 -30（不会出现离谱的负跳跃）', targetWith(-100), 160.06);
     check('+30 但视频只剩 200 秒 → 锁在片尾前', targetWith(30, mkVideo({ duration: 200 })), 199.95);
 

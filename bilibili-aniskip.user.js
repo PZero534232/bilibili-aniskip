@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.5.0
+// @version      0.5.1
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -59,8 +59,6 @@
 
     jumpOp: true,          // 跳过片头
     jumpEd: true,          // 跳过片尾
-    jumpRecap: false,      // 跳过总集篇回顾（很多人想看，默认关）
-    jumpMixed: false,      // 跳过「融进正片画面」的 OP/ED（没独立 OP 段的番，跳过会切正片，默认关）
 
     /* 跳完之后落点再前后挪几秒（正数＝多跳，负数＝少跳）。
      * 上游时间戳是按「原片」标的，B站这版可能剪过/加过片头，落点常差一两秒；
@@ -118,8 +116,6 @@
     Object.keys(DEFAULTS).forEach(function (k) { config[k] = gmGet(k, DEFAULTS[k]); });
     config.jumpOp = !!config.jumpOp;
     config.jumpEd = !!config.jumpEd;
-    config.jumpRecap = !!config.jumpRecap;
-    config.jumpMixed = !!config.jumpMixed;
     config.showToast = !!config.showToast;
     config.useSeasonTitle = !!config.useSeasonTitle;
     config.showIdlePill = !!config.showIdlePill;
@@ -1694,11 +1690,8 @@
     var types = [];
     if (config.jumpOp) types.push('op');
     if (config.jumpEd) types.push('ed');
-    if (config.jumpRecap) types.push('recap');
-    // mixed-op / mixed-ed =「OP/ED 与正片画面融在一起」，不是独立的 OP 段。
-    // 实测无职转生大量集数就是这种（每集 OP 画面都不同 / 干脆没有独立 OP），
-    // 跳过这类区间会切掉正片内容，所以独立成开关、默认关。
-    if (config.jumpMixed) types.push('mixed-op', 'mixed-ed');
+    // 只请求 op / ed：回顾（recap）和 mixed-*（OP/ED 融进正片画面）都不跳。
+    // 不请求它们就永远不会拿到、更不会跳到 —— 这两类片段跳了只会切掉正片或用户想看的回顾。
     if (!types.length) return Promise.resolve({ segs: [], failed: false });
 
     var qs = types.map(function (t) { return 'types[]=' + t; }).join('&');
@@ -1736,10 +1729,13 @@
     'query($id:String!){findShowsByExternalId(service:ANILIST,serviceId:$id){name ' +
     'episodes{number timestamps{at type{name}}}}}';
 
+  /* 只认纯净的片头 / 片尾。Mixed Intro / Mixed Credits（OP/ED 融进正片画面）
+   * 和 Recap（总集篇回顾）映射成 null 直接丢掉 —— 这两类片段不跳。 */
   var AS_TYPE_MAP = {
-    'Intro': 'op', 'New Intro': 'op', 'Mixed Intro': 'op',
-    'Credits': 'ed', 'New Credits': 'ed', 'Mixed Credits': 'ed',
-    'Recap': 'recap', 'Preview': null, 'Canon': null, 'Transition': null,
+    'Intro': 'op', 'New Intro': 'op',
+    'Credits': 'ed', 'New Credits': 'ed',
+    'Mixed Intro': null, 'Mixed Credits': null, 'Recap': null,
+    'Preview': null, 'Canon': null, 'Transition': null,
     'Title Card': null, 'Branding': null, 'Unknown': null
   };
 
@@ -1783,7 +1779,9 @@
   /* ==================================================================
    * 11. 合并与校验（照搬参考脚本的成熟参数）
    * ================================================================== */
-  var LIMITS = { op: [15, 210], ed: [15, 210], recap: [15, 300] };
+  /* 只有 op / ed 合法。recap（回顾）不在白名单里 → validateSegs 直接丢弃，
+   * 老缓存里残留的回顾段也进不来。 */
+  var LIMITS = { op: [15, 210], ed: [15, 210] };
 
   function validateSegs(segs, videoDuration) {
     var out = [], seen = {};
@@ -1830,11 +1828,13 @@
     return validateSegs(all, videoDuration);
   }
 
+  /* 只跳纯净的 OP / ED。mixed-*（OP/ED 融进正片画面）和 recap（回顾）一律不跳：
+   * 前者跳了会切掉正片内容，后者很多人想看。这两类已经不再请求，这里再兜一层，
+   * 防止老缓存 / 老数据里的段被误跳。 */
   function segmentEnabled(s) {
-    if (s.mixed) return config.jumpMixed;      // 融进画面的 OP/ED，默认不跳
+    if (s.mixed) return false;
     if (s.type === 'op') return config.jumpOp;
     if (s.type === 'ed') return config.jumpEd;
-    if (s.type === 'recap') return config.jumpRecap;
     return false;
   }
 
@@ -2258,7 +2258,7 @@
   }
 
   function notifySkip(seg, from, video, target) {
-    var label = seg.type === 'op' ? '片头 OP' : (seg.type === 'ed' ? '片尾 ED' : '回顾 Recap');
+    var label = seg.type === 'op' ? '片头 OP' : '片尾 ED';
     if (!config.showToast) return;
     var off = Number(config.skipOffset) || 0;
     var desc = fmtTime(seg.start) + ' → ' + fmtTime(target || seg.end);
@@ -3523,8 +3523,7 @@
     if (!r || !r.ok) return;
     var segs = (r.segments || []);
     var lines = segs.map(function (s) {
-      var label = s.type === 'op' ? 'OP' : (s.type === 'ed' ? 'ED' : 'Recap');
-      if (s.mixed) label = '混入正片的 ' + label;
+      var label = s.type === 'op' ? 'OP' : 'ED';
       var mark = segmentEnabled(s) ? '' : ' · 已关闭';
       return label + '  ' + fmtTime(s.start) + ' – ' + fmtTime(s.end) + '  （' + s.source + mark + '）';
     });
@@ -4116,8 +4115,6 @@
       '<slot name="mode"></slot></div>' +
       '<div class="row"><div><div class="lab">跳过 OP</div></div><input type="checkbox" class="op"></div>' +
       '<div class="row"><div><div class="lab">跳过 ED</div></div><input type="checkbox" class="ed"></div>' +
-      '<div class="row"><div><div class="lab">跳过回顾 Recap</div><div class="tip">总集篇的回顾片段，很多人想看</div></div><input type="checkbox" class="recap"></div>' +
-      '<div class="row"><div><div class="lab">跳过「融进正片」的 OP/ED</div><div class="tip">有些番没有独立 OP 段，OP 是和画面融在一起播的（每集还可能不一样）。跳过这类区间会切掉正片内容，默认关</div></div><input type="checkbox" class="mixed"></div>' +
       '<div class="row"><div><div class="lab">跳过偏移（秒）</div><div class="tip">在数据库给的时间戳上再挪一点。正数＝多跳（跳过 OP 后的黑屏／静帧），负数＝少跳（保留 OP 尾巴，最多减到片段起点，不会倒着跳）</div></div>' +
       '<slot name="offset"></slot></div>' +
       '<div class="row"><div><div class="lab">片头/片尾整段平移（秒）</div><div class="tip">UP 主在开头多加了片段时用：起点和落点一起挪。比如开头多加了 20 秒就填 20，OP/ED 会整段顺延 20 秒</div></div>' +
@@ -4159,7 +4156,7 @@
 
     // 复选框：只做「不给焦点」（tabindex=-1 + 阻止 mousedown 默认行为），
     // 翻转交给浏览器原生行为 —— 自己翻的实现见 15.2 的踩坑记录
-    ['op', 'ed', 'recap', 'mixed', 'toast', 'seasonT', 'hide', 'autonext'].forEach(function (cls) {
+    ['op', 'ed', 'toast', 'seasonT', 'hide', 'autonext'].forEach(function (cls) {
       noFocus(panel.querySelector('.' + cls));
     });
     noFocus(panel.querySelector('.clr'));
@@ -4171,8 +4168,6 @@
     modeSel.value = config.autoDetect;
     panel.querySelector('.op').checked = config.jumpOp;
     panel.querySelector('.ed').checked = config.jumpEd;
-    panel.querySelector('.recap').checked = config.jumpRecap;
-    panel.querySelector('.mixed').checked = config.jumpMixed;
     undoInput.value = config.undoSeconds;
     offInput.value = config.skipOffset;
     shiftInput.value = config.skipShift;
@@ -4197,8 +4192,6 @@
         autoDetect: modeSel.value,
         jumpOp: panel.querySelector('.op').checked,
         jumpEd: panel.querySelector('.ed').checked,
-        jumpRecap: panel.querySelector('.recap').checked,
-        jumpMixed: panel.querySelector('.mixed').checked,
         undoSeconds: Math.max(0, parseInt(undoInput.value, 10) || 0),
         skipOffset: Math.max(-30, Math.min(30, (function () {
           var n = parseInt(offInput.value, 10);
