@@ -2800,6 +2800,15 @@
     refreshMarkBar();
   }
 
+  /* 工具条状态行补一句「本地标记此刻到底参不参与」——「标了却不跳」多半是这个原因。 */
+  function markBarStatusHint() {
+    if (runtime.localSegs) return ' · 本地指纹匹配中（错过 OP/ED 画面就不会跳）';
+    var r = runtime.result;
+    if (r && r.ok && ((r.segments || []).length)) return ' · 云端已有时间戳，本地标记不参与';
+    if (r && !r.ok) return ' · 识别未完成，本地标记待命';
+    return '';
+  }
+
   /* 状态行 + 列表。只更新这两块，不重建整个工具条。 */
   function refreshMarkBar() {
     if (!markRoot) return;
@@ -2827,7 +2836,7 @@
     }
     if (legacy) hint += ' · ' + legacy + ' 条旧标记没记集号（重新标一次就带上了）';
     stat.textContent = '当前：' + (bind.title || bind._key) +
-      '   已标 OP ' + ops.length + ' 套 / ED ' + eds.length + ' 套' + hint;
+      '   已标 OP ' + ops.length + ' 套 / ED ' + eds.length + ' 套' + hint + markBarStatusHint();
     list.textContent = '';
     var rows = [], i;
     for (i = 0; i < ops.length; i++) rows.push({ listKey: 'ops', i: i, label: 'OP', hash: ops[i].hash, s: ops[i].start, e: ops[i].end });
@@ -4644,6 +4653,7 @@
         // 数据备份：导出 / 解析 / 导入 / 撤销
         buildBackup: buildBackup, parseBackup: parseBackup, applyBackup: applyBackup,
         undoImport: undoImport, hasBackupSnapshot: hasBackupSnapshot,
+        markBarStatusHint: markBarStatusHint,
         shouldUseLocalSegs: shouldUseLocalSegs,
         applyFrameHash: applyFrameHash,
         getConfig: function () { return Object.assign({}, config); }

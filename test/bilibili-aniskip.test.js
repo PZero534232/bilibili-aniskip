@@ -3823,6 +3823,21 @@ function ctxOf(bvid, page) {
     checkTrue('导入写了快照（可撤销）', typeof e.store['aniskip.lastBeforeImport'], 'string');
   }
 
+  /* --- 45. 标记工具条状态行：本地标记到底参不参与 --- */
+  head('45. 标记状态提示');
+  {
+    const e = makeEnv();
+    const hint = hook(e, 'markBarStatusHint');
+    const rt = e.api._runtime;
+    check('未识别时状态行不加料', hint(), '');
+    rt.result = { ok: true, segments: [{ type: 'op', start: 30, end: 120 }] };
+    check('云端有段 → 说明本地标记不参与', hint(), ' · 云端已有时间戳，本地标记不参与');
+    rt.result = { ok: false, reason: 'upstream', segments: [] };
+    check('识别未完成 → 本地标记待命', hint(), ' · 识别未完成，本地标记待命');
+    rt.localSegs = { ops: [{ hash: '01'.repeat(32), start: 5, end: 95, vid: null }], eds: [] };
+    check('本地指纹在跑 → 提示错过画面就不跳', hint(), ' · 本地指纹匹配中（错过 OP/ED 画面就不会跳）');
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
