@@ -4310,6 +4310,9 @@
       '<div class="row"><div><div class="lab">自动切下一集</div><div class="tip">ED 跳完直接切下一个 P／下一话（依次退化：播放器的下一集按钮 → 同 BV 分P → UGC 合集下一话）。只给「ED 后面没有彩蛋」的番用，默认关</div></div><input type="checkbox" class="autonext"></div>' +
       '<div class="row"><div><div class="lab">胶囊位置</div><div class="tip">胶囊可以直接用鼠标／手指拖到任意位置，位置会记住；拖累了就点这里回到右上角</div></div>' +
       '<button class="resetpos">重置位置</button></div>' +
+      '<div class="row"><div><div class="lab">数据备份</div>' +
+      '<div class="tip">导出绑定 / 本地标记 / 设置，换浏览器或重装后导回来。本地标记是手标的画面指纹，丢了没法重建</div></div>' +
+      '<button class="backup">导出 / 导入</button></div>' +
       '<div class="btns"><button class="clr">清空缓存</button>' +
       '<button class="cancel">取消</button><button class="save primary">保存</button></div>';
 
@@ -4370,6 +4373,12 @@
       try { uiRoot.style.cssText = ''; } catch (e) { /* ignore */ }
       showToast('胶囊位置已重置', '回到右上角');
     });
+    var backupBtn = panel.querySelector('.backup');
+    noFocus(backupBtn);
+    backupBtn.addEventListener('click', function () {
+      closePanel();
+      openBackupPanel();
+    });
     panel.querySelector('.save').addEventListener('click', function () {
       var patch = {
         autoDetect: modeSel.value,
@@ -4393,6 +4402,80 @@
       closePanel();
       showToast('设置已保存', '模式：' + config.autoDetect);
       rerun();
+    });
+  }
+
+  /* 数据备份浮层：导出到框里 / 从框里导入 / 撤销导入。
+   * 不走文件下载上传、也不依赖剪贴板权限 —— textarea 是唯一到哪都能用的通道。 */
+  function copyText(text) {
+    try {
+      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () {
+          showToast('已复制', '备份内容已进剪贴板，粘到记事本保存');
+        }, function () {
+          showToast('复制失败', '框里已全选，直接按 Ctrl+C 也行');
+        });
+        return;
+      }
+    } catch (e) { /* ignore */ }
+    showToast('请手动复制', '框里已全选，按 Ctrl+C 即可');
+  }
+
+  function openBackupPanel() {
+    ensureUI();
+    var panel = document.createElement('div');
+    panel.className = 'panel';
+    panel.innerHTML =
+      '<h3>数据备份</h3>' +
+      '<div class="sub">导出＝把绑定 / 本地标记 / 设置存成一段文本，粘到记事本或网盘即可。' +
+      '导入＝用备份整包替换当前数据（导入前会自动留一份快照，可以撤销）。</div>' +
+      '<textarea class="bktext" spellcheck="false" style="width:100%;height:150px;box-sizing:border-box;' +
+      'font:12px/1.6 Consolas,Menlo,monospace;padding:8px;border:1px solid #ddd;border-radius:8px;"></textarea>' +
+      '<div class="btns" style="justify-content:flex-start">' +
+      '<button class="bkfill primary">导出到框里</button>' +
+      '<button class="bkcopy">复制</button>' +
+      '<button class="bkimport">从框里导入</button>' +
+      '<button class="bkundo">撤销导入</button></div>' +
+      '<div class="sub bktip"></div>';
+    var close = mountPanel(panel);
+    var box = panel.querySelector('.bktext');
+    var tip = panel.querySelector('.bktip');
+    var undoBtn = panel.querySelector('.bkundo');
+    undoBtn.style.display = hasBackupSnapshot() ? '' : 'none';
+    ['.bkfill', '.bkcopy', '.bkimport', '.bkundo'].forEach(function (sel) {
+      noFocus(panel.querySelector(sel));
+    });
+    function say(t) { tip.textContent = t; }
+    panel.querySelector('.bkfill').addEventListener('click', function () {
+      var bk = buildBackup();
+      box.value = JSON.stringify(bk, null, 2);
+      try { box.focus(); box.select(); } catch (e) { /* ignore */ }
+      say('已生成：绑定 ' + Object.keys(bk.bindings).length + ' 条、本地标记 ' +
+        Object.keys(bk.localSegs).length + ' 套（已全选，Ctrl+C 复制）');
+    });
+    panel.querySelector('.bkcopy').addEventListener('click', function () {
+      if (!box.value) { say('先点「导出到框里」生成内容'); return; }
+      copyText(box.value);
+    });
+    panel.querySelector('.bkimport').addEventListener('click', function () {
+      var pr = parseBackup(box.value);
+      if (!pr.ok) { say('导入失败：' + pr.reason); return; }
+      if (!confirm('导入会用备份替换当前全部数据（设置 / 绑定 / 本地标记 / 历史黑名单），确定吗？')) return;
+      var res = applyBackup(pr.data);
+      if (!res.ok) { say('导入失败：' + res.reason); return; }
+      say('导入成功。正在刷新…');
+      try { renderPill(); } catch (e2) { /* ignore */ }
+      try { rerun(); } catch (e3) { /* ignore */ }
+      try { close(); } catch (e4) { /* ignore */ }
+      showToast('数据已导入', '绑定 / 本地标记 / 设置已按备份恢复（可撤销一次）');
+    });
+    undoBtn.addEventListener('click', function () {
+      var res = undoImport();
+      if (!res.ok) { say('撤销失败：' + res.reason); return; }
+      try { renderPill(); } catch (e2) { /* ignore */ }
+      try { rerun(); } catch (e3) { /* ignore */ }
+      try { close(); } catch (e4) { /* ignore */ }
+      showToast('已撤销导入', '回到导入前的数据');
     });
   }
 

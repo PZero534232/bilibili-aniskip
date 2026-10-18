@@ -3790,6 +3790,39 @@ function ctxOf(bvid, page) {
     check('没有快照时撤销给出原因', api4.undoImport().ok, false);
   }
 
+  /* --- 44. 设置面板「数据备份」入口 + 浮层 --- */
+  head('44. 数据备份面板');
+  {
+    const HASH = '0101'.repeat(16);
+    const e = makeEnv({
+      store: {
+        autoDetect: 'off',
+        _bindings: JSON.stringify({ 's:1': { title: '芙莉莲', at: 1 } }),
+        'aniskip.localSegs.s:1': { ops: [{ hash: HASH, start: 5, end: 95, vid: 'BV_TEST000001:1' }], eds: [] }
+      }
+    });
+    const sp = openPanelVia(e, 'settings');
+    checkTrue('设置面板有帮助「数据备份」按钮', !!sp.querySelector('.backup'));
+    sp.querySelector('.backup').dispatch('click');
+    const bp = orNode(byClass('panel'));
+    const box = bp.querySelector('.bktext');
+    const tip = bp.querySelector('.bktip');
+    checkTrue('浮层有文本框', !!box);
+    checkTrue('浮层有导入按钮', !!bp.querySelector('.bkimport'));
+
+    box.value = '不是 json';
+    bp.querySelector('.bkimport').dispatch('click');
+    checkTrue('非法内容导入 → 提示失败', /失败/.test(tip.textContent), tip.textContent);
+
+    bp.querySelector('.bkfill').dispatch('click');
+    checkTrue('导出到框里 → 是 JSON', box.value.indexOf('"app": "bilibili-aniskip"') >= 0, box.value.slice(0, 40));
+    checkTrue('导出提示说明条数', /绑定 1 条/.test(tip.textContent), tip.textContent);
+
+    bp.querySelector('.bkimport').dispatch('click');
+    checkTrue('合法备份导入成功', /成功/.test(tip.textContent), tip.textContent);
+    checkTrue('导入写了快照（可撤销）', typeof e.store['aniskip.lastBeforeImport'], 'string');
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);
