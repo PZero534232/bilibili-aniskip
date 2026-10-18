@@ -3710,6 +3710,86 @@ function ctxOf(bvid, page) {
     env.api._markToggle();
   }
 
+  /* --- 43. 数据备份与恢复：导出 / 解析 / 导入（整包覆盖）/ 撤销 --- */
+  head('43. 数据备份与恢复');
+  {
+    const HASH = '0101'.repeat(16);                    // 64 位指纹
+    const BIND = { 's:1': { title: '葬送的芙莉莲', at: 1 } };
+    const SEGS = { ops: [{ hash: HASH, start: 12, end: 102, vid: 'BV_TEST000001:1' }], eds: [] };
+    const makeStore = () => ({
+      autoDetect: 'auto', jumpOp: false, jumpEd: true, skipOffset: 3,
+      _bindings: JSON.stringify(BIND),
+      _blacklist: JSON.stringify({ 'b:BV_GARBAGE001': { t: 1, title: 'x' } }),
+      'aniskip.localSegs.s:1': SEGS
+    });
+
+    const e = makeEnv({ store: makeStore() });
+    const buildBackup = hook(e, 'buildBackup');
+    const parseBackup = hook(e, 'parseBackup');
+    const applyBackup = hook(e, 'applyBackup');
+    const undoImport = hook(e, 'undoImport');
+
+    /* ① 导出内容 */
+    const bk = buildBackup();
+    check('备份 app 标记', bk.app, 'bilibili-aniskip');
+    check('备份 schema', bk.schema, 1);
+    checkTrue('备份带导出时间', typeof bk.exportedAt === 'string' && bk.exportedAt.length >= 10);
+    check('配置键齐全', Object.keys(bk.config).length, Object.keys(e.api.api_.getConfig()).length);
+    checkTrue('导出不含缓存', !('_cache' in bk));
+    check('绑定进备份', bk.bindings['s:1'].title, '葬送的芙莉莲');
+    check('黑名单进备份', Object.keys(bk.blacklist).length, 1);
+    check('本地标记进备份', bk.localSegs['s:1'].ops.length, 1);
+    check('本地标记带集号', bk.localSegs['s:1'].ops[0].vid, 'BV_TEST000001:1');
+
+    /* ② 往返：导出 → 空设备导入 → 内容一致 */
+    const text = JSON.stringify(bk);
+    const e2 = makeEnv({ store: {} });
+    const e2api = e2.api.api_;
+    const parsed = e2api.parseBackup(text);
+    checkTrue('解析合法备份', parsed.ok === true, parsed);
+    const r2 = e2api.applyBackup(parsed.data);
+    checkTrue('导入成功', r2.ok === true, r2);
+    const bk2 = e2api.buildBackup();
+    check('往返：配置一致', bk2.config.jumpOp, false);
+    check('往返：绑定一致', bk2.bindings['s:1'].title, '葬送的芙莉莲');
+    check('往返：标记指纹一致', bk2.localSegs['s:1'].ops[0].hash, HASH);
+    check('往返：标记时间一致', bk2.localSegs['s:1'].ops[0].start, 12);
+
+    /* ③ 坏备份逐类拒绝，且拒绝时不写任何东西 */
+    check('非法 JSON 被拒', parseBackup('{oops').ok, false);
+    check('缺 app 被拒', parseBackup('{"schema":1}').ok, false);
+    check('schema 太新被拒', parseBackup(JSON.stringify({ app: 'bilibili-aniskip', schema: 2 })).ok, false);
+    const noHash = JSON.stringify({ app: 'bilibili-aniskip', schema: 1, localSegs: { 's:1': { ops: [{ start: 1, end: 2 }], eds: [] } } });
+    const noHashParsed = parseBackup(noHash);
+    checkTrue('标记缺指纹：结构能解析', noHashParsed.ok === true, noHashParsed);
+    const noHashApply = applyBackup(noHashParsed.data);
+    check('标记缺指纹：导入被拒', noHashApply.ok, false);
+    checkTrue('拒绝时给出原因', typeof noHashApply.reason === 'string' && noHashApply.reason.length > 0, noHashApply);
+
+    const e3 = makeEnv({ store: { autoDetect: 'off', _bindings: JSON.stringify(BIND) } });
+    const before3 = JSON.stringify(e3.store);
+    const badCfg = e3.api.api_.applyBackup({ app: 'bilibili-aniskip', schema: 1, config: { jumpOp: 'yes' } });
+    check('配置类型错被拒', badCfg.ok, false);
+    check('拒绝后存储一个字节没动', JSON.stringify(e3.store), before3);
+
+    /* ④ 撤销：导入成功会留快照，撤销后回到导入前 */
+    const e4 = makeEnv({
+      store: { autoDetect: 'off', _bindings: JSON.stringify(BIND), 'aniskip.localSegs.s:1': SEGS }
+    });
+    const api4 = e4.api.api_;
+    const r4 = api4.applyBackup(api4.parseBackup(text).data);
+    checkTrue('导入成功（撤销用例）', r4.ok === true, r4);
+    check('导入后配置已换', e4.store.autoDetect, 'auto');
+    checkTrue('导入前快照已存', typeof e4.store['aniskip.lastBeforeImport'], 'string');
+    const snap = JSON.parse(e4.store['aniskip.lastBeforeImport']);
+    check('快照里是导入前的配置', snap.config.autoDetect, 'off');
+    const undo = api4.undoImport();
+    checkTrue('撤销成功', undo.ok === true, undo);
+    check('撤销后配置回到导入前', e4.api.api_.getConfig().autoDetect, 'off');
+    check('撤销后快照被清掉', e4.store['aniskip.lastBeforeImport'], undefined);
+    check('没有快照时撤销给出原因', api4.undoImport().ok, false);
+  }
+
   /* --- 汇总 --- */
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${pass} 通过 / ${fail} 失败`);

@@ -4102,6 +4102,189 @@
     setTimeout(function () { qInput.focus(); qInput.select(); }, 50);
   }
 
+  /* ---- 数据备份与恢复（导出 / 导入 / 撤销） ----
+   * 为什么要：本地标记（aniskip.localSegs.*）是手标的画面指纹，丢了没法重建。
+   * GM 没给 GM_listValues 权限，所以 localSegs 的键从 _bindings 的 key 反推 ——
+   * 没绑定的标记本来也用不上。
+   * 导入是整包覆盖：先全量深校验，任何一项不合格就一个字节都不写。 */
+  var BACKUP_APP = 'bilibili-aniskip';
+  var BACKUP_SCHEMA = 1;
+  var BACKUP_SNAPSHOT_KEY = 'aniskip.lastBeforeImport';
+
+  var BACKUP_BOOL_KEYS = ['jumpOp', 'jumpEd', 'showToast', 'useSeasonTitle', 'showIdlePill', 'pillCollapsed', 'autoNext'];
+  /* 数值项：[最小, 最大, 是否取整]，沿用设置面板的夹取范围 */
+  var BACKUP_NUM_KEYS = {
+    skipOffset: [-30, 30, 0], skipShift: [-30, 30, 1],
+    undoSeconds: [0, 30, 0], confThreshold: [0, 100, 0], hintThreshold: [0, 100, 0]
+  };
+
+  function scriptVersion() {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
+        return String(GM_info.script.version);
+      }
+    } catch (e) { /* ignore */ }
+    return '0';
+  }
+
+  function cloneJson(v) {
+    try { return JSON.parse(JSON.stringify(v)); } catch (e) { return null; }
+  }
+
+  /* 当前数据 → 备份对象（只读，不改状态） */
+  function buildBackup() {
+    var cfg = {}, keys = Object.keys(DEFAULTS), i;
+    for (i = 0; i < keys.length; i++) cfg[keys[i]] = config[keys[i]];
+    var segs = {};
+    Object.keys(bindings).forEach(function (bk) {
+      var v = validateLocalSegs(gmGet(localSegsKey(bk), null));
+      if (v.ops.length || v.eds.length) segs[bk] = v;
+    });
+    return {
+      app: BACKUP_APP,
+      schema: BACKUP_SCHEMA,
+      version: scriptVersion(),
+      exportedAt: new Date().toISOString(),
+      config: cfg,
+      bindings: cloneJson(bindings) || {},
+      blacklist: cloneJson(blacklist) || {},
+      localSegs: segs,
+      ui: {
+        markOn: !!gmGet(MARK_ON_KEY, false),
+        markPos: gmGet(MARK_POS_KEY, null) || null,
+        pillPos: gmGet(PILL_POS_KEY, null) || null
+      }
+    };
+  }
+
+  /* 解析 + 结构校验（值类型深校验在 applyBackup 里，写之前全部跑完） */
+  function parseBackup(text) {
+    var raw;
+    try { raw = JSON.parse(String(text === undefined || text === null ? '' : text)); } catch (e) {
+      return { ok: false, reason: '不是合法 JSON' };
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: '不是备份对象' };
+    if (raw.app !== BACKUP_APP) return { ok: false, reason: '不是本脚本的备份（缺少 app 标记）' };
+    var schema = Number(raw.schema);
+    if (!isFinite(schema) || schema < 1) return { ok: false, reason: '备份格式版本缺失' };
+    if (schema > BACKUP_SCHEMA) return { ok: false, reason: '备份来自更新的版本（schema ' + schema + '），先升级脚本' };
+    var checks = [['config', '设置'], ['bindings', '绑定'], ['blacklist', '黑名单'], ['localSegs', '本地标记']];
+    for (var i = 0; i < checks.length; i++) {
+      var v = raw[checks[i][0]];
+      if (v === undefined) continue;
+      if (!v || typeof v !== 'object' || Array.isArray(v)) {
+        return { ok: false, reason: checks[i][1] + '字段（' + checks[i][0] + '）损坏' };
+      }
+    }
+    return { ok: true, data: raw };
+  }
+
+  function sanitizeBackupConfig(src) {
+    var out = {}, i, k, v;
+    if (src === undefined || src === null) return { config: out };
+    if (typeof src !== 'object' || Array.isArray(src)) return { reason: '设置字段损坏' };
+    if (src.autoDetect !== undefined) {
+      if (src.autoDetect !== 'off' && src.autoDetect !== 'ask' && src.autoDetect !== 'auto') {
+        return { reason: '设置项 autoDetect 只能是 off / ask / auto' };
+      }
+      out.autoDetect = src.autoDetect;
+    }
+    for (i = 0; i < BACKUP_BOOL_KEYS.length; i++) {
+      k = BACKUP_BOOL_KEYS[i];
+      if (src[k] === undefined) continue;
+      if (typeof src[k] !== 'boolean') return { reason: '设置项 ' + k + ' 不是布尔值' };
+      out[k] = src[k];
+    }
+    for (k in BACKUP_NUM_KEYS) {
+      if (!BACKUP_NUM_KEYS.hasOwnProperty(k) || src[k] === undefined) continue;
+      v = Number(src[k]);
+      if (!isFinite(v)) return { reason: '设置项 ' + k + ' 不是数字' };
+      var lim = BACKUP_NUM_KEYS[k];
+      v = Math.max(lim[0], Math.min(lim[1], v));
+      if (lim[2]) v = Math.round(v);
+      out[k] = v;
+    }
+    return { config: out };
+  }
+
+  /* 标记深校验：坏一条就整包拒绝（读取侧 validateLocalSegs 是「静默丢弃」，
+   * 导入不一样 —— 要么全对，要么一个字节都不写） */
+  function sanitizeBackupSegs(data, where) {
+    var out = { ops: [], eds: [] }, lists = [['ops', 'OP'], ['eds', 'ED']], li, i;
+    if (data === undefined || data === null) return { segs: out };
+    if (typeof data !== 'object' || Array.isArray(data)) return { reason: where + ' 不是对象' };
+    for (li = 0; li < lists.length; li++) {
+      var name = lists[li][0], label = lists[li][1], arr = data[name];
+      if (arr === undefined) continue;
+      if (!Array.isArray(arr)) return { reason: where + ' 的 ' + label + ' 列表不是数组' };
+      for (i = 0; i < arr.length; i++) {
+        var it = arr[i], n = i + 1;
+        if (!it || typeof it !== 'object' || Array.isArray(it)) return { reason: where + ' 第 ' + n + ' 条 ' + label + ' 不是对象' };
+        if (typeof it.hash !== 'string' || it.hash.length < 16) return { reason: where + ' 第 ' + n + ' 条 ' + label + ' 缺少画面指纹' };
+        var st = Number(it.start), en = Number(it.end);
+        if (!isFinite(st) || !isFinite(en)) return { reason: where + ' 第 ' + n + ' 条 ' + label + ' 的时间不是数字' };
+        out[name].push({ hash: it.hash, start: st, end: en, vid: strOrNull(it.vid) });
+      }
+    }
+    return { segs: out };
+  }
+
+  /* 整包覆盖：校验 → 留快照 → 写。opts.snapshot === false 时不留快照（撤销用）。 */
+  function applyBackup(data, opts) {
+    opts = opts || {};
+    var cfgRes = sanitizeBackupConfig(data && data.config);
+    if (cfgRes.reason) return { ok: false, reason: cfgRes.reason };
+    var segs = {}, segKeys = Object.keys((data && data.localSegs) || {}), i;
+    for (i = 0; i < segKeys.length; i++) {
+      var sr = sanitizeBackupSegs(data.localSegs[segKeys[i]], '本地标记 ' + segKeys[i]);
+      if (sr.reason) return { ok: false, reason: sr.reason };
+      segs[segKeys[i]] = sr.segs;
+    }
+    var nb = (data && data.bindings) || {}, nbl = (data && data.blacklist) || {};
+    if (typeof nb !== 'object' || Array.isArray(nb)) return { ok: false, reason: '绑定字段损坏' };
+    if (typeof nbl !== 'object' || Array.isArray(nbl)) return { ok: false, reason: '黑名单字段损坏' };
+
+    /* ---- 校验全过，开始写 ---- */
+    if (opts.snapshot !== false) {
+      try { gmSet(BACKUP_SNAPSHOT_KEY, JSON.stringify(buildBackup())); } catch (e) { /* ignore */ }
+    }
+    Object.keys(cfgRes.config).forEach(function (k) { gmSet(k, cfgRes.config[k]); config[k] = cfgRes.config[k]; });
+    var oldKeys = Object.keys(bindings);
+    bindings = nb;
+    persistBindings();
+    for (i = 0; i < oldKeys.length; i++) {
+      if (!segs.hasOwnProperty(oldKeys[i])) {
+        try { GM_deleteValue(localSegsKey(oldKeys[i])); } catch (e) { /* ignore */ }
+      }
+    }
+    Object.keys(segs).forEach(function (bk) { saveLocalSegs(bk, segs[bk]); });
+    blacklist = nbl;
+    persistBlacklist();
+    if (data && data.ui && typeof data.ui === 'object') {
+      try { gmSet(MARK_ON_KEY, !!data.ui.markOn); } catch (e) { /* ignore */ }
+      try { gmSet(MARK_POS_KEY, data.ui.markPos || null); } catch (e) { /* ignore */ }
+      try { gmSet(PILL_POS_KEY, data.ui.pillPos || null); } catch (e) { /* ignore */ }
+    }
+    return { ok: true };
+  }
+
+  function hasBackupSnapshot() {
+    try { return !!gmGet(BACKUP_SNAPSHOT_KEY, null); } catch (e) { return false; }
+  }
+
+  function undoImport() {
+    var raw = null;
+    try { raw = gmGet(BACKUP_SNAPSHOT_KEY, null); } catch (e) { raw = null; }
+    if (!raw) return { ok: false, reason: '没有可撤销的导入' };
+    var pr = parseBackup(raw);
+    if (!pr.ok) return { ok: false, reason: '撤销快照损坏：' + pr.reason };
+    var res = applyBackup(pr.data, { snapshot: false });
+    if (res.ok) {
+      try { GM_deleteValue(BACKUP_SNAPSHOT_KEY); } catch (e) { /* ignore */ }
+    }
+    return res;
+  }
+
   /* ---- 设置面板 ---- */
   function openSettings() {
     ensureUI();
@@ -4375,6 +4558,9 @@
         recordEdEnd: recordEdEnd, removeLocalSeg: removeLocalSeg,
         locKeyOf: locKeyOf, vidLabel: vidLabel,
         frameStep: frameStep,
+        // 数据备份：导出 / 解析 / 导入 / 撤销
+        buildBackup: buildBackup, parseBackup: parseBackup, applyBackup: applyBackup,
+        undoImport: undoImport, hasBackupSnapshot: hasBackupSnapshot,
         shouldUseLocalSegs: shouldUseLocalSegs,
         applyFrameHash: applyFrameHash,
         getConfig: function () { return Object.assign({}, config); }
