@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      0.5.1
+// @version      0.5.2
 // @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
@@ -1706,12 +1706,10 @@
       var segs = res.map(function (r) {
         var raw = r.skipType || '';
         return {
-          type: raw.replace('mixed-', ''),
-          mixed: /^mixed-/.test(raw),
+          type: raw,
           start: +r.interval.startTime,
           end: +r.interval.endTime,
-          source: 'aniskip',
-          epLen: r.episodeLength || 0
+          source: 'aniskip'
         };
       });
       cacheSet(ckey, segs, { negative: !segs.length });
@@ -1766,7 +1764,7 @@
               // （参考实现里给过 90 秒兜底，但这会凭空造出一个总在通过校验的假区间）
               if (i + 1 >= ts.length) continue;
               var end = +ts[i + 1].at;
-              segs.push({ type: mapped, start: start, end: end, source: 'animeskip', epLen: 0 });
+              segs.push({ type: mapped, start: start, end: end, source: 'animeskip' });
             }
           });
         });
@@ -2176,8 +2174,8 @@
     if (dur) b = Math.min(b, dur - 0.05);
     if (b - a < 1) b = a + Math.max(1, seg.end - seg.start);
     return {
-      type: seg.type, mixed: seg.mixed, start: a, end: b,
-      source: seg.source, epLen: seg.epLen, shift: s
+      type: seg.type, start: a, end: b,
+      source: seg.source, shift: s
     };
   }
 
