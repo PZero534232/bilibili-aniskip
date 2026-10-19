@@ -1,0 +1,19 @@
+{
+  "name": "bilibili-aniskip",
+  "version": "1.0.0",
+  "private": true,
+  "description": "B 站番剧 OP/ED 自动跳过（AniSkip / Anime Skip 数据源）—— 单文件 Tampermonkey 用户脚本",
+  "license": "MIT",
+  "author": "PZero534232",
+  "homepage": "https://github.com/PZero534232/bilibili-aniskip",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PZero534232/bilibili-aniskip.git"
+  },
+  "scripts": {
+    "test": "node test/bilibili-aniskip.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

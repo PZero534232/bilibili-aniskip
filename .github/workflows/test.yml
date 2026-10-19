@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 跑测试（零依赖，一条命令）
+        run: npm test
+
+      - name: 版本号一致（package.json ↔ @version）
+        run: |
+          node -e "
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const src = fs.readFileSync('bilibili-aniskip.user.js', 'utf8');
+          const m = /@version\s+(\d+\.\d+\.\d+)/.exec(src);
+          if (!m) { console.error('用户脚本里没找到 @version'); process.exit(1); }
+          if (m[1] !== pkg.version) {
+            console.error('版本号不一致：@version=' + m[1] + '，package.json=' + pkg.version);
+            process.exit(1);
+          }
+          console.log('版本号一致：' + m[1]);
+          "

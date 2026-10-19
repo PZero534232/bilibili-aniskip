@@ -1,0 +1,13 @@
+# 行尾统一为 LF，避免 Windows 上 CRLF / LF 混用（仓库里的用户脚本按 LF 发布）
+* text=auto eol=lf
+
+# 用户脚本再显式声明一次：Tampermonkey / Greasy Fork 对行尾无要求，但统一有好无坏
+*.user.js text eol=lf
+
+# 图片按二进制处理，别做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
