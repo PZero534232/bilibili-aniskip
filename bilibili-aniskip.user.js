@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili 番剧 OP/ED 跳过（AniSkip / Anime Skip 数据源）
 // @namespace    bilibili-aniskip
-// @version      1.0.0
-// @description  用外部动画时间戳库给 B 站上传的番剧自动跳过 OP/ED。支持中文/罗马字/日文/简写搜番，多季连播合集可自动按分P分段对齐数据库条目（一段可含多个季度）。标题乱码、无番名时可手动绑定整季一次，全季复用。默认不自动识别，普通视频绝不触发。
+// @version      1.1.0
+// @description  给 B 站网页端的用户投稿番剧补上跳过片头、片尾。支持多季合集对齐、手动绑定、本地帧标记、可疑片段核对与跳过撤回。默认仅处理已手动绑定的番剧。
 // @author       PZero534232
 // @homepageURL  https://github.com/PZero534232/bilibili-aniskip
 // @supportURL   https://github.com/PZero534232/bilibili-aniskip/issues
@@ -1038,7 +1038,7 @@
   /* ==================================================================
    * 6. 手动绑定 / 黑名单（这两张表让脚本在"标题不可信"时仍然可用）
    * ================================================================== */
-  // 作用域：cid（当前P）< bvid（整 BV 所有 P，最常用）< season_id（UGC 合集，跨 BV）
+  // 表单从最宽的范围开始，读取绑定时优先采用最具体的范围。
   function bindingKeys(ctx) {
     var ks = [];
     if (ctx.seasonId) ks.push({ scope: 'season', key: 's:' + ctx.seasonId, label: '整个合集（含合集里其他视频）' });
@@ -1049,7 +1049,7 @@
 
   function getBinding(ctx) {
     var ks = bindingKeys(ctx);
-    for (var i = 0; i < ks.length; i++) {
+    for (var i = ks.length - 1; i >= 0; i--) {
       var b = bindings[ks[i].key];
       if (b) return Object.assign({ _key: ks[i].key, _scope: ks[i].scope }, b);
     }
@@ -1291,16 +1291,22 @@
       }
       return { malId: malId, ep: ep, mapped: false };
     }
-    if (c !== undefined) return Promise.resolve(apply(c));
+    // 旧版把 429 等错误存成没有负缓存标记的空数组，读取时重新查一次。
+    if (Array.isArray(c) && (c.length || cache[ckey].neg)) return Promise.resolve(apply(c));
     return jget('https://api.aniskip.com/v2/relation-rules/' + encodeURIComponent(malId))
-      .then(function (d) { var r = d && d.rules; cacheSet(ckey, r || []); return apply(r); })
+      .then(function (d) {
+        var rules = d && d.rules;
+        if (!Array.isArray(rules)) {
+          noteNetError('parse', 'aniskip');
+          return apply(null);
+        }
+        cacheSet(ckey, rules, { negative: !rules.length });
+        return apply(rules);
+      })
       .catch(function (err) {
-        /* 只有「上游明确说没有这部番的规则」（4xx）才能缓存 30 天 —— 否则网络抖动
-         * 会把「没有分季规则」写死一个月，Fairy Tail 这类需要重映射的番会一直取错季。 */
-        var msg = (err && err.message) || '';
-        if (/^HTTP 4/.test(msg)) cacheSet(ckey, []);
-        else noteNetError(err && err.kind, 'anilist');
-        return { malId: malId, ep: ep, mapped: false };
+        if (err && err.status === 404) cacheSet(ckey, [], { negative: true });
+        else noteNetError(err && err.kind, 'aniskip');
+        return apply(null);
       });
   }
 
@@ -1781,11 +1787,23 @@
    * 老缓存里残留的回顾段也进不来。 */
   var LIMITS = { op: [15, 210], ed: [15, 210] };
 
+  function segmentReviewReason(seg, duration) {
+    if (seg.reviewReason) return seg.reviewReason;
+    if (seg.type === 'ed' && !seg.fpKey && duration > 0 && isFinite(duration) && seg.end <= duration / 2) {
+      return '片尾时间戳位于视频前半段';
+    }
+    return '';
+  }
+
+  function segmentsOverlap(a, b) {
+    return a.type === b.type && a.start < b.end && b.start < a.end;
+  }
+
   function validateSegs(segs, videoDuration) {
-    var out = [], seen = {};
+    var out = [];
     for (var i = 0; i < segs.length; i++) {
       var s = segs[i];
-      if (!s || !LIMITS[s.type]) continue;
+      if (!s || s.mixed || !Object.prototype.hasOwnProperty.call(LIMITS, s.type)) continue;
       var st = +s.start, en = +s.end;
       if (!isFinite(st) || !isFinite(en)) continue;
       if (en <= st) continue;
@@ -1794,36 +1812,41 @@
       if (len < lim[0] || len > lim[1]) continue;
       if (st < 0 || (videoDuration && st > videoDuration - 3)) continue;
 
-      var key = s.type + ':' + Math.round(st / 3);
-      if (seen[key]) continue;
-      seen[key] = 1;
-      out.push(s);
+      var seg = Object.assign({}, s, { start: st, end: en });
+      var reason = segmentReviewReason(seg, videoDuration);
+      if (reason) seg.reviewReason = reason;
+      out.push(seg);
     }
-    // 同类型重叠时，保留更早的
-    out.sort(function (a, b) { return a.start - b.start; });
+    // 同类片段重叠时优先选可自动跳过的片段，再按起点排序。
+    out.sort(function (a, b) {
+      if (Boolean(a.reviewReason) !== Boolean(b.reviewReason)) return a.reviewReason ? 1 : -1;
+      return a.start - b.start;
+    });
     var final = [];
     for (var j = 0; j < out.length; j++) {
       var conflict = false;
       for (var k = 0; k < final.length; k++) {
-        if (final[k].type === out[j].type && !(out[j].end <= final[k].start || out[j].start >= final[k].end)) {
+        if (segmentsOverlap(final[k], out[j])) {
           conflict = true; break;
         }
       }
       if (!conflict) final.push(out[j]);
     }
-    return final;
+    return final.sort(function (a, b) { return a.start - b.start; });
   }
 
   function mergeSegments(a, b, videoDuration) {
-    // AniSkip 优先（显式区间更可靠），Anime Skip 补 AniSkip 没有的类型
-    var all = a.slice();
-    b.forEach(function (s) {
+    // 各源先校验。有效性相同时保留 AniSkip 的重叠段。
+    var all = validateSegs(a, videoDuration);
+    validateSegs(b, videoDuration).forEach(function (s) {
       var has = all.some(function (x) {
-        return x.type === s.type && !(s.end <= x.start || s.start >= x.end);
+        return segmentsOverlap(x, s) && (!x.reviewReason || s.reviewReason);
       });
-      if (!has) all.push(s);
+      if (has) return;
+      all = all.filter(function (x) { return !segmentsOverlap(x, s); });
+      all.push(s);
     });
-    return validateSegs(all, videoDuration);
+    return all.sort(function (x, y) { return x.start - y.start; });
   }
 
   /* 只跳纯净的 OP / ED。mixed-*（OP/ED 融进正片画面）和 recap（回顾）一律不跳：
@@ -1855,7 +1878,8 @@
     else { reasons.push('未匹配到番剧'); }
     var ds = durationScore(ctx.duration);
     if (ds) { score += ds; reasons.push('时长 ' + Math.round(ctx.duration / 60) + ' 分钟'); }
-    if (segs && segs.length) { score += 20; reasons.push('查到 ' + segs.length + ' 段时间戳'); }
+    var usable = (segs || []).filter(function (seg) { return !seg.reviewReason; }).length;
+    if (usable) { score += 20; reasons.push('查到 ' + usable + ' 段可用时间戳'); }
     return { score: Math.max(0, Math.min(100, score)), reasons: reasons };
   }
 
@@ -1876,6 +1900,9 @@
    * ================================================================== */
   function shouldAutoSkip(r) {
     if (!r || !r.ok) return false;
+    if (r.segments && r.segments.length && !r.segments.some(function (s) {
+      return segmentEnabled(s) && !s.reviewReason;
+    })) return false;
     if (r.manual) return true;                    // 手动绑定＝用户明确要它跳
     if (config.autoDetect !== 'auto') return false;  // off：不猜；ask：等用户点
     var score = (r.confidence && r.confidence.score) || 0;
@@ -1923,22 +1950,46 @@
    * 为什么需要：0.4.5 及更早「点完没等季链算完就保存」会存下没有季链的绑定，
    * 而**升级脚本不会改写 GM 里已有的数据** —— 用户报「绑定错误仍未修复」，
    * 真凶就是那条旧绑定（第一季的 P 去查第二季条目的集号）。
-   * 幂等：同一把键在本次页面生命周期内只算一次，失败也不反复打网络。 */
+   * 同一条绑定只补算一次。替换或导入后的新绑定可单独补算。 */
   var chainRepairs = {};
   function repairSeasonChain(ctx, bind, ms) {
     var key = bind._key || ('b:' + ctx.bvid);
-    if (chainRepairs[key]) return;
-    chainRepairs[key] = 1;
+    var original = bindings[key];
+    if (!original || chainRepairs[key] === original) return;
+    chainRepairs[key] = original;
+    var snapshot = JSON.stringify(original);
     buildSeasonChain(bind.anilistId, ms.totalEps, ctx, bind.title, null, bind.title).then(function (chain) {
-      if (!chain || !chain.seasons || chain.seasons.length < 2) { chainRepairs[key] = -1; return; }
-      chain.builtFor = bind.anilistId;
-      chain.baseId = bind.anilistId;
-      // getBinding 返回的是副本，必须写回 bindings[key] 才会落盘
-      var row = bindings[key];
-      if (row) row.seasonChain = chain; else bind.seasonChain = chain;
+      if (!chain || !chain.seasons || chain.seasons.length < 2 || bindings[key] !== original) return;
+      // 其他标签页也可能改过绑定，写回前对照存储里的当前版本。
+      var latest = JSON.parse(gmGet('_bindings', '{}'));
+      if (!latest || JSON.stringify(latest[key]) !== snapshot) return;
+      latest[key].seasonChain = Object.assign({}, chain, { builtFor: bind.anilistId, baseId: bind.anilistId });
+      bindings = latest;
       persistBindings();
-      rerun();                        // 立刻用新季链重算一遍，这一轮就跳对
-    }).catch(function () { chainRepairs[key] = -1; });
+      if (runtime.ctx && locKeyOf() === ctx.bvid + ':' + ctx.page) rerun();
+    }).catch(function () { /* 保留当前绑定 */ });
+  }
+
+  function savedSeasonChain(bind) {
+    var chain = bind && bind.seasonChain;
+    if (!chain || !chain.seasons || chain.seasons.length < 2 || chain.chainVer !== CHAIN_VERSION) return null;
+    return !chain.builtFor || chain.builtFor === bind.anilistId ? chain : null;
+  }
+
+  function unmappedSeasonResult(chain, ep, ms, manual) {
+    var reason = '季和集尚未对齐，本话不自动跳过';
+    if (chain && chain.groups && chain.groups.length) {
+      var segment = chain.seasons.filter(function (season) {
+        return ep.num >= season.startAbs && ep.num <= season.endAbs;
+      })[0];
+      reason = (segment && segment.aligned === false)
+        ? '第 ' + segment.season + ' 段没能对上数据库条目，这一段不跳'
+        : '第 ' + ep.num + ' 话超出该段对应的条目（可能是 OVA／特别篇），不跳';
+    }
+    return {
+      ok: false, reason: 'chain-miss', manual: manual, multiSeason: ms,
+      seasonChain: chain, ep: ep, confidence: { score: 0, reasons: [reason] }
+    };
   }
 
   function identify(ctx) {
@@ -1953,103 +2004,74 @@
       return Promise.resolve({ ok: false, reason: 'blacklisted', multiSeason: ms });
     }
 
-    // 手动绑定优先 —— 绑过就代表用户明确要它跳，不再走标题猜测
     var bind = getBinding(ctx);
-    if (bind) {
-      var bindEp = resolveEpisode(ctx, bind, guess);
-      var chainMiss = false;
-
-      // 第 1 优先：季链（「第一季+第二季」装在一个合集里的情况）
-      // 版本对不上的季链一律不认 —— 那是旧算法算的，可能把季映射错
-      // （实测 BV1LUTt6fE6K：只投了第 3 季的稿件被算出「第 2 期 + 第 3 期」，第 1 话算到第 2 期）
-      var chainUsable = !!(bind.seasonChain && bind.seasonChain.seasons &&
-        bind.seasonChain.seasons.length > 1 && bind.seasonChain.chainVer === CHAIN_VERSION);
-      if (!chainUsable && ms.multi && bind.anilistId) repairSeasonChain(ctx, bind, ms);
-
-      if (chainUsable) {
-        var hit = mapBySeasonChain(bind.seasonChain, bindEp.num);
-        if (hit && hit.malId) {
-          return fetchSegsFor(hit.malId, hit.anilistId, hit.ep, ctx.duration).then(function (r) {
-            if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: bindEp, bindingKey: bind._key });
-            var setTitle = hit.group && hit.group.entries && hit.group.entries.length > 1
-              ? hit.group.entries.map(function (e) { return e.title; }).join(' + ')
-              : (hit.title || bind.title);
-            return {
-              ok: true, manual: true, title: setTitle,
-              anilistId: hit.anilistId, malId: hit.malId,
-              episode: r.rm.ep, segments: r.segs, ep: bindEp, bindingKey: bind._key,
-              season: hit, seasonChain: bind.seasonChain, multiSeason: ms,
-              confidence: {
-                score: 100,
-                reasons: ['手动绑定 · 季链定位到第 ' + hit.season + ' 段（' + (hit.title || '') + '）第 ' + hit.ep + ' 话']
-              },
-              relationMapped: r.rm.mapped
-            };
-          });
-        }
-        // 分段模型下落空（段末的 OVA／特别篇、或该段没对上条目）：
-        // 明确不跳，不去猜一个 MAL 条目 —— 错跳比不跳糟糕十倍
-        if (bind.seasonChain.groups && bind.seasonChain.groups.length) {
-          var seg = null;
-          for (var si = 0; si < bind.seasonChain.seasons.length; si++) {
-            var cs2 = bind.seasonChain.seasons[si];
-            if (bindEp.num >= cs2.startAbs && bindEp.num <= cs2.endAbs) { seg = cs2; break; }
-          }
-          var why2 = (seg && seg.aligned === false)
-            ? '第 ' + seg.season + ' 段没能对上数据库条目，这一段不跳'
-            : '第 ' + bindEp.num + ' 话超出该段对应的条目（大概是 OVA／特别篇），不跳';
-          return Promise.resolve({
-            ok: false, reason: 'chain-miss', manual: true, multiSeason: ms,
-            seasonChain: bind.seasonChain, ep: bindEp,
-            confidence: { score: 0, reasons: [why2] }
-          });
-        }
-        // 越界、或落在话数未知的季上：不硬猜，退化单季并说明
-        chainMiss = true;
-      }
-
-      /* 兜底闸门：没有可用季链时，绑定条目自己是「第几季」必须和当前分P对得上。
-       * 少了这道闸门，一条「第二季、没有季链」的旧绑定会让 P1（第一季第1话）
-       * 直接去查 MAL 51179 第 1 话 —— 第一季用第二季的 OP 跳（用户实测报的
-       * 就是这个）。两边只要有一边认不出季号就不判，只挡「都认得且互相矛盾」。
-       * 后台补链（repairSeasonChain）成功后就不会再走到这里。 */
-      if (!chainUsable && ms && ms.multi) {
-        var partSeasonNo = partSeasonOf(ctx.partTitle || ctx.seasonEpisodeTitle || '');
-        var bindSeasonNo = titleSeasonNo(bind.title);
-        if (partSeasonNo && bindSeasonNo && partSeasonNo !== bindSeasonNo) {
-          return Promise.resolve({
-            ok: false, reason: 'season-mismatch', manual: true, multiSeason: ms, ep: bindEp,
-            seasonChain: null, chainMiss: true,
-            confidence: {
-              score: 0,
-              reasons: ['绑定的「' + bind.title + '」是第 ' + bindSeasonNo + ' 季，' +
-                '但这个分P属于第 ' + partSeasonNo + ' 季：正在补算季链，也可以重新绑定这一季']
-            }
-          });
-        }
-      }
-
-      return fetchSegsFor(bind.malId, bind.anilistId, bindEp.num, ctx.duration).then(function (r) {
-        if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: bindEp, bindingKey: bind._key });
-        var reasons = ['手动绑定 · 集号来自 ' + bindEp.from];
-        if (chainMiss) reasons.push('第 ' + bindEp.num + ' 话没落在季链范围内，按单季处理');
-        return {
-          ok: true, manual: true, title: bind.title,
-          anilistId: bind.anilistId, malId: bind.malId,
-          episode: r.rm.ep, segments: r.segs, ep: bindEp, bindingKey: bind._key,
-          seasonChain: bind.seasonChain || null, multiSeason: ms, chainMiss: chainMiss,
-          confidence: { score: chainMiss ? 55 : 100, reasons: reasons },
-          relationMapped: r.rm.mapped
-        };
-      });
-    }
+    if (bind) return identifyBoundEpisode(ctx, bind, ms, guess);
 
     // off 模式：没有绑定就不做任何推测，普通视频在这里直接止步
     if (config.autoDetect === 'off') {
       return Promise.resolve({ ok: false, reason: 'autodetect-off', multiSeason: ms });
     }
 
-    var ep = guess;
+    return identifyAutomaticEpisode(ctx, ms, guess);
+  }
+
+  function identifyBoundEpisode(ctx, bind, ms, guess) {
+    var ep = resolveEpisode(ctx, bind, guess);
+    var chain = savedSeasonChain(bind);
+    var chainUsable = !!chain;
+    if (!chainUsable && ms.multi && bind.anilistId) repairSeasonChain(ctx, bind, ms);
+
+    var hit = chainUsable ? mapBySeasonChain(chain, ep.num) : null;
+    var chainMiss = chainUsable && !hit;
+    // 分段季链中未对齐的段和段末的 OVA／特别篇都没有可用条目。
+    if (chainMiss && chain.groups && chain.groups.length) {
+      return Promise.resolve(unmappedSeasonResult(chain, ep, ms, true));
+    }
+
+    // 补链期间，只拦截绑定条目和当前分 P 都有季号且明确冲突的情况。
+    if (!chainUsable && ms.multi) {
+      var partSeasonNo = partSeasonOf(ctx.partTitle || ctx.seasonEpisodeTitle || '');
+      var bindSeasonNo = titleSeasonNo(bind.title);
+      if (partSeasonNo && bindSeasonNo && partSeasonNo !== bindSeasonNo) {
+        return Promise.resolve({
+          ok: false, reason: 'season-mismatch', manual: true, multiSeason: ms, ep: ep,
+          seasonChain: null, chainMiss: true,
+          confidence: {
+            score: 0,
+            reasons: ['绑定的「' + bind.title + '」是第 ' + bindSeasonNo + ' 季，' +
+              '但这个分P属于第 ' + partSeasonNo + ' 季：正在补算季链，也可以重新绑定这一季']
+          }
+        });
+      }
+    }
+
+    var target = hit || bind;
+    return fetchSegsFor(target.malId, target.anilistId, hit ? hit.ep : ep.num, ctx.duration).then(function (r) {
+      if (r.failed) return netFailResult({ manual: true, multiSeason: ms, ep: ep, bindingKey: bind._key });
+      var result = {
+        ok: true, manual: true, title: bind.title,
+        anilistId: target.anilistId, malId: target.malId,
+        episode: r.rm.ep, segments: r.segs, ep: ep, bindingKey: bind._key,
+        seasonChain: chain, multiSeason: ms,
+        confidence: { score: chainMiss ? 55 : 100, reasons: [] },
+        relationMapped: r.rm.mapped
+      };
+      if (hit) {
+        result.season = hit;
+        result.title = hit.group && hit.group.entries && hit.group.entries.length > 1
+          ? hit.group.entries.map(function (e) { return e.title; }).join(' + ')
+          : (hit.title || bind.title);
+        result.confidence.reasons.push('手动绑定 · 季链定位到第 ' + hit.season + ' 段（' + (hit.title || '') + '）第 ' + hit.ep + ' 话');
+      } else {
+        result.chainMiss = chainMiss;
+        result.confidence.reasons.push('手动绑定 · 集号来自 ' + ep.from);
+        if (chainMiss) result.confidence.reasons.push('第 ' + ep.num + ' 话没落在季链范围内，按单季处理');
+      }
+      return result;
+    });
+  }
+
+  function identifyAutomaticEpisode(ctx, ms, ep) {
     if (!ep || !ep.num) {
       return Promise.resolve({ ok: false, reason: 'no-episode', multiSeason: ms, confidence: { score: 0, reasons: ['未识别到集号'] } });
     }
@@ -2068,36 +2090,39 @@
       if (match.score < 22) {
         return { ok: false, reason: 'low-score', match: match, multiSeason: ms, confidence: { score: 0, reasons: ['番名匹配置信度不足，不敢采纳'] } };
       }
-      // 多季连播：先把季链推导出来，再把绝对集号定位到某一季的某一话。
-      // 触发条件有两个 ——
-      //   ① 标题 / 分P标题里有多季信号（「两季32话全集」、P21 的 part 是【S2】01）
-      //   ② 数据驱动：当前 P 序号已经超出这一季的话数
-      //      （实测 BV1kk7r6iEC4：在第 21 个 P，而第一季只有 20 话 → 必然跨季）
-      var needChain = ms.multi || (ctx.videos > 1 && match.episodes && ctx.page > match.episodes);
-      // baseName 传进去：续季链可能断掉（实测無職転生Ⅲ），要靠同名搜索补齐家族序列
-      var prep = needChain ? buildSeasonChain(match.anilistId, ms.totalEps, ctx, match.matchedName || match.title, match.family, match.title) : Promise.resolve(null);
-      return prep.then(function (chain) {
-        var hit = chain ? mapBySeasonChain(chain, ep.num) : null;
-        var useMal = (hit && hit.malId) ? hit.malId : match.malId;
-        var useAni = hit ? hit.anilistId : match.anilistId;
-        var useEp = hit ? hit.ep : ep.num;
+      return identifyMatchedEpisode(ctx, ms, ep, match);
+    });
+  }
 
-        return fetchSegsFor(useMal, useAni, useEp, ctx.duration).then(function (r) {
-          if (r.failed) return netFailResult({ manual: false, multiSeason: ms, ep: ep, match: match, seasonChain: chain || null });
-          var conf = computeConfidence(ctx, match, ep, r.segs);
-          if (chain) {
-            conf.reasons.push(chain.partial ? '季链（有话数未知的季）' : '季链 ' + chain.seasons.length + ' 季 / 共 ' + chain.total + ' 话');
-            if (hit) conf.reasons.push('第 ' + ep.num + ' 话 → 第 ' + hit.season + ' 季第 ' + hit.ep + ' 话');
-            if (chain.mismatch) { conf.score = Math.max(0, conf.score - 10); conf.reasons.push('季链话数与「全' + chain.totalEpsFromTitle + '话」对不上，已降权'); }
+  function identifyMatchedEpisode(ctx, ms, ep, match) {
+    // 有多季线索，或分 P 序号已经超出匹配季的话数时，才推算季链。
+    var needChain = ms.multi || (ctx.videos > 1 && match.episodes && ctx.page > match.episodes);
+    // 续集关系可能断开，同名候选可以用来补齐季链。
+    var chainPromise = needChain
+      ? buildSeasonChain(match.anilistId, ms.totalEps, ctx, match.matchedName || match.title, match.family, match.title)
+      : Promise.resolve(null);
+    return chainPromise.then(function (chain) {
+      var hit = chain ? mapBySeasonChain(chain, ep.num) : null;
+      if (needChain && !hit) return unmappedSeasonResult(chain, ep, ms, false);
+      var target = hit || match;
+      return fetchSegsFor(target.malId, target.anilistId, hit ? hit.ep : ep.num, ctx.duration).then(function (r) {
+        if (r.failed) return netFailResult({ manual: false, multiSeason: ms, ep: ep, match: match, seasonChain: chain || null });
+        var conf = computeConfidence(ctx, match, ep, r.segs);
+        if (chain) {
+          conf.reasons.push(chain.partial ? '季链（有话数未知的季）' : '季链 ' + chain.seasons.length + ' 季 / 共 ' + chain.total + ' 话');
+          if (hit) conf.reasons.push('第 ' + ep.num + ' 话 → 第 ' + hit.season + ' 季第 ' + hit.ep + ' 话');
+          if (chain.mismatch) {
+            conf.score = Math.max(0, conf.score - 10);
+            conf.reasons.push('季链话数与「全' + chain.totalEpsFromTitle + '话」对不上，已降权');
           }
-          return {
-            ok: true, manual: false, title: (hit && hit.title) || match.title,
-            anilistId: useAni, malId: useMal,
-            episode: r.rm.ep, segments: r.segs, confidence: conf, match: match, ep: ep,
-            season: hit || null, seasonChain: chain || null, multiSeason: ms,
-            relationMapped: r.rm.mapped
-          };
-        });
+        }
+        return {
+          ok: true, manual: false, title: target.title || match.title,
+          anilistId: target.anilistId, malId: target.malId,
+          episode: r.rm.ep, segments: r.segs, confidence: conf, match: match, ep: ep,
+          season: hit, seasonChain: chain || null, multiSeason: ms,
+          relationMapped: r.rm.mapped
+        };
       });
     });
   }
@@ -2146,17 +2171,13 @@
     lastLocKey: '',
     screen: 'normal',          // 'normal' | 'web' | 'full'（网页全屏=web：胶囊要临时收起别挡画面）
     autoNextDone: false,       // 自动切下一集：每个视频只切一次（换集/换视频由 rerun 清掉）
+    pendingNext: null,         // ED 之后等待撤回的播放器和计时器
     pillDragged: false,      // 胶囊刚被拖动过：紧跟着的那次 click 不算点击
     frameMatcher: null,      // { target, hits }：抽帧匹配的连续命中状态
     frameTimer: null,        // 抽帧 interval 句柄
     localSegs: null,         // 当前 binding 的本地指纹 { ops, eds }
     markOn: false            // 是否处于「标记模式」（工具条显示中）
   };
-
-  function shouldSkipThisSegment(seg) {
-    if (!segmentEnabled(seg)) return false;
-    return true;
-  }
 
   function doSeek(video, target) {
     try { video.currentTime = target; return true; }
@@ -2173,10 +2194,7 @@
     var b = seg.end + s;
     if (dur) b = Math.min(b, dur - 0.05);
     if (b - a < 1) b = a + Math.max(1, seg.end - seg.start);
-    return {
-      type: seg.type, start: a, end: b,
-      source: seg.source, shift: s
-    };
+    return Object.assign({}, seg, { start: a, end: b, shift: s });
   }
 
   /* 跳过片段的实际落点。config.skipOffset 让用户微调（上游按原片标的时间戳，
@@ -2202,8 +2220,38 @@
     return seg.fpKey ? 'fp:' + seg.fpKey : seg.type + ':' + Math.round(seg.start);
   }
 
+  function resumePlayback(video, wasPaused) {
+    if (wasPaused || !video.paused) return;
+    try {
+      var playing = video.play();
+      if (playing && playing.catch) playing.catch(function () {});
+    } catch (e) { /* ignore */ }
+  }
+
+  function takePendingNext() {
+    var pending = runtime.pendingNext;
+    if (pending) {
+      runtime.pendingNext = null;
+      clearTimeout(pending.timer);
+    }
+    return pending;
+  }
+
+  function scheduleNextEpisode(video, wasPaused, delay) {
+    var pending = { video: video, wasPaused: wasPaused, key: locKeyOf(), timer: null };
+    runtime.pendingNext = pending;
+    pending.timer = setTimeout(function () {
+      if (runtime.pendingNext !== pending) return;
+      takePendingNext();
+      runtime.undo = null;
+      // 地址已经变化时，即使 SPA 的轮询还没跑到，也不能再自动切一次。
+      if (pending.key !== locKeyOf() || !document.body.contains(video)) return;
+      if (!goNextEpisode()) resumePlayback(video, wasPaused);
+    }, delay);
+  }
+
   function performSkip(video, seg, force) {
-    if (runtime.skipping) return false;
+    if (runtime.skipping || runtime.pendingNext) return false;
     if (!force && Date.now() - runtime.lastSkipAt < COOLDOWN_MS) return false;
     var skey = skipKeyOf(seg);
     if (runtime.skipped[skey]) return false;
@@ -2215,17 +2263,26 @@
     var wasPaused = video.paused;
     var target = skipTarget(video, seg);
     var from = video.currentTime;
+    var autoNext = seg.type === 'ed' && config.autoNext && !runtime.autoNextDone && !seg.reviewReason;
+    var delay = autoNext && config.showToast ? (Number(config.undoSeconds) || 0) * 1000 : 0;
+    // 落点可能离结尾只有 50ms，暂停可防止 B 站自己的连播抢在撤回之前触发。
+    if (delay > 0 && !wasPaused) { try { video.pause(); } catch (e) { /* ignore */ } }
 
     var ok = doSeek(video, target);
     runtime.skipping = false;
 
-    if (ok) {
-      if (!wasPaused && video.paused) { try { video.play(); } catch (e) { /* ignore */ } }
-      notifySkip(seg, from, video, target);
-      // 自动切下一集：只认 ED；开启时「跳完 ED 就切」，没额外内容的番才该开它
-      if (seg.type === 'ed' && config.autoNext) goNextEpisode();
+    if (!ok) {
+      delete runtime.skipped[skey];
+      resumePlayback(video, wasPaused);
+      return false;
     }
-    return ok;
+    notifySkip(seg, from, video, target, delay);
+    if (delay > 0) scheduleNextEpisode(video, wasPaused, delay);
+    else {
+      resumePlayback(video, wasPaused);
+      if (autoNext) goNextEpisode();
+    }
+    return true;
   }
 
   /* 自动切下一集。切换入口依次退化（B 站的 DOM/URL 契约，找不到就什么都不做）：
@@ -2255,7 +2312,7 @@
     return false;
   }
 
-  function notifySkip(seg, from, video, target) {
+  function notifySkip(seg, from, video, target, nextDelay) {
     var label = seg.type === 'op' ? '片头 OP' : '片尾 ED';
     if (!config.showToast) return;
     var off = Number(config.skipOffset) || 0;
@@ -2263,17 +2320,20 @@
     if (off) desc += '（偏移 ' + (off > 0 ? '+' : '') + off + 's）';
     var sh = Number(config.skipShift) || 0;
     if (sh) desc += '（整体 ' + (sh > 0 ? '+' : '') + sh + 's）';
+    if (nextDelay > 0) desc += ' · ' + nextDelay / 1000 + ' 秒后切下一集';
+    var key = locKeyOf();
+    var gen = runtime.gen;
     var undo = function () {
-      /* 撤回：这是防错跳的最后一道保险。
-       * 注意 **不要再删 runtime.skipped 里那条记录** —— 原来删了，于是下一轮轮询
-       * （50ms 一次）看到播放头又落回区间里就一直重新跳过，用户点了撤回等于没点。
-       * 记录留着 = 这一集这段不再自动跳（换集／换视频时 runtime.skipped 会整体重置）。
-       * 回到原位也不用再减 1 秒了：那是当年为了绕开「删记录导致立刻重跳」才加的。 */
-      try { video.currentTime = Math.max(0, from); } catch (e) { /* ignore */ }
+      if (runtime.undo !== undo || gen !== runtime.gen || key !== locKeyOf() || !document.body.contains(video)) return;
+      var pending = takePendingNext();
+      runtime.undo = null;
+      // 保留已跳标记，回到片段内时不会立即再次跳过。
+      doSeek(video, Math.max(0, from));
+      if (pending) resumePlayback(video, pending.wasPaused);
       showToast('已撤回', '这一集不再自动跳过这段 ' + label);
     };
-    runtime.undo = undo;          // 调试钩子：控制台 / 测试里可以直接调用验证
-    showToast('已跳过 ' + label, desc, undo);
+    runtime.undo = config.undoSeconds > 0 ? undo : null;
+    showToast('已跳过 ' + label, desc, runtime.undo);
   }
 
   function checkOnce() {
@@ -2293,8 +2353,8 @@
 
     var t = video.currentTime;
     for (var i = 0; i < segs.length; i++) {
+      if (!segmentEnabled(segs[i]) || segmentReviewReason(segs[i], video.duration)) continue;
       var s = shiftSeg(segs[i]);
-      if (!shouldSkipThisSegment(s)) continue;
       if (t >= s.start && t < s.end - 0.2) {
         performSkip(video, s);
         return;
@@ -2651,26 +2711,23 @@
   var markHost = null, markShadow = null, markRoot = null;
 
   var MARK_BAR_CSS = 'position:absolute;left:16px;bottom:64px;width:300px;pointer-events:auto;' +
-    'background:rgba(20,22,26,.92);color:#fff;border-radius:12px;padding:10px 12px;' +
-    'box-shadow:0 8px 28px rgba(0,0,0,.4);backdrop-filter:blur(6px);' +
-    'font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;';
+    'max-width:calc(100vw - 32px);max-height:calc(100vh - 76px);overflow:auto;' +
+    'box-sizing:border-box;background:#fcfcf4;color:#1d2e22;border-radius:14px;';
 
   var MARK_CSS = [
     '.mkroot{position:absolute;top:0;left:0;width:100%;height:100%;}',
-    '.mkhead{display:flex;justify-content:space-between;align-items:center;font-weight:600;margin-bottom:8px;}',
-    '.mkclose{cursor:pointer;opacity:.75;padding:0 4px;} .mkclose:hover{opacity:1;}',
-    '.mkbtns{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;}',
-    'button.mkbtn{padding:5px 9px;border-radius:7px;border:1px solid rgba(255,255,255,.22);',
-    '  background:rgba(255,255,255,.08);color:#fff;font-size:12px;cursor:pointer;}',
-    'button.mkbtn:hover{background:rgba(255,255,255,.18);}',
-    'button.mkclr{color:#ff9a9e;border-color:rgba(255,120,120,.35);}',
-    '.mkstat{color:rgba(255,255,255,.72);font-size:12px;line-height:1.6;margin-bottom:6px;word-break:break-all;}',
-    '.mklist{max-height:132px;overflow:auto;margin-bottom:8px;}',
-    '.mkrow{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:12px;}',
-    '.mkrow .mktxt{cursor:pointer;opacity:.9;} .mkrow .mktxt:hover{opacity:1;text-decoration:underline;}',
-    '.mkrow .mkdel{cursor:pointer;opacity:.6;padding:0 4px;} .mkrow .mkdel:hover{opacity:1;color:#ff9a9e;}',
-    '.mkempty,.mkfoot{color:rgba(255,255,255,.55);font-size:12px;}',
-    '.mkfoot{margin-top:2px;}'
+    '.mkbar{border:1px solid var(--line);box-shadow:var(--lift);}',
+    '.mkhead,.mkfoot{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:var(--surface);}',
+    '.mkhead{cursor:grab;border-bottom:1px solid var(--line);font-size:15px;font-weight:700;}',
+    '.mkhead:active{cursor:grabbing;} .mkhead strong{border-left:3px solid var(--accent);padding-left:9px;}',
+    '.mkbody{padding:10px 12px;} .mkstat{color:var(--muted);font-size:12px;overflow-wrap:anywhere;margin-bottom:10px;}',
+    '.mktrack{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:5px;margin-bottom:6px;}',
+    '.mktrack b{color:var(--accent);font:700 12px var(--mono);margin-right:5px;} .mktrack span{font-size:12px;}',
+    '.mkbtn,.mkclose,.mkdel{padding:4px 7px;min-height:28px;font-size:12px;}',
+    '.mklist{max-height:120px;overflow:auto;color:var(--muted);font-size:12px;scrollbar-width:thin;}',
+    '.mkrow{display:flex;align-items:center;gap:6px;padding:3px 0;}',
+    '.mkrow .mktxt{flex:1;text-align:left;font:12px var(--mono);}',
+    '.mkfoot{border-top:1px solid var(--line);justify-content:flex-end;}'
   ].join('');
 
   /* 工具条该挂在谁下面：真全屏时浏览器只渲染全屏子树，挂在 body 上会看不见。
@@ -2689,11 +2746,9 @@
     if (!markHost) {
       markHost = document.createElement('div');
       markHost.id = 'bili-aniskip-mark-host';
-      markHost.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483000;pointer-events:none;';
+      markHost.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147482999;pointer-events:none;';
       markShadow = markHost.attachShadow({ mode: 'open' });
-      var st = document.createElement('style');
-      st.textContent = MARK_CSS;
-      markShadow.appendChild(st);
+      installUiStyle(markShadow, THEME_CSS + MARK_CSS);
       markRoot = document.createElement('div');
       markRoot.className = 'mkroot';
       markShadow.appendChild(markRoot);
@@ -2744,18 +2799,21 @@
     markRoot.innerHTML = '';
     var bar = document.createElement('div');
     bar.className = 'mkbar';
+    bar.setAttribute('role', 'region');
+    bar.setAttribute('aria-label', '本地帧标记');
     bar.style.cssText = MARK_BAR_CSS;
     bar.innerHTML =
-      '<div class="mkhead"><span>标记 OP / ED</span><button class="mkclose" title="退出标记模式">✕</button></div>' +
-      '<div class="mkbtns">' +
-      '<button class="mkbtn" data-mk="op-s">标 OP 开始</button>' +
-      '<button class="mkbtn" data-mk="op-e">标 OP 结束</button>' +
-      '<button class="mkbtn" data-mk="ed-s">标 ED 开始</button>' +
-      '<button class="mkbtn" data-mk="ed-e">标 ED 结束</button>' +
-      '</div>' +
-      '<div class="mkstat"></div>' +
+      '<div class="mkhead"><strong>本地帧标记</strong><button type="button" class="mkclose" aria-label="关闭帧标记">×</button></div>' +
+      '<div class="mkbody"><div class="mkstat" aria-live="polite"></div>' +
+      '<div class="mktrack"><span><b>OP</b>片头</span>' +
+      '<button type="button" class="mkbtn" data-mk="op-s" aria-label="标记片头开始">标开始</button>' +
+      '<button type="button" class="mkbtn" data-mk="op-e" aria-label="标记片头结束">标结束</button></div>' +
+      '<div class="mktrack"><span><b>ED</b>片尾</span>' +
+      '<button type="button" class="mkbtn" data-mk="ed-s" aria-label="标记片尾开始">标开始</button>' +
+      '<button type="button" class="mkbtn" data-mk="ed-e" aria-label="标记片尾结束">标结束</button></div>' +
       '<div class="mklist"></div>' +
-      '<div class="mkfoot"><button class="mkbtn mkclr" data-mk="clr">清空本番标记</button></div>';
+      '</div>' +
+      '<div class="mkfoot"><button type="button" class="mkbtn danger" data-mk="clr">清空本番标记</button></div>';
     /* 四个标记按钮：直接复用既有 handler（内部已有未绑定 / 抓帧失败的 toast 分支），
      * 点完不关工具条，就地刷新状态行与列表。 */
     var mkPairs = [['op-s', markOpStart], ['op-e', markOpEnd], ['ed-s', markEdStart], ['ed-e', markEdEnd]];
@@ -2792,9 +2850,9 @@
         renderPill();
       });
     }
-    applyMarkPos(bar);
     attachMarkDrag(bar);
     markRoot.appendChild(bar);
+    applyMarkPos(bar);
     refreshMarkBar();
   }
 
@@ -2847,16 +2905,18 @@
   function buildMarkRow(row) {
     var wrap = document.createElement('div');
     wrap.className = 'mkrow';
-    var txt = document.createElement('span');
+    var txt = document.createElement('button');
+    txt.type = 'button';
     txt.className = 'mktxt';
     txt.textContent = row.label + '  ' + fmtSec(row.s) + ' → ' + (row.e > row.s ? fmtSec(row.e) : '——');
     txt.title = '跳到这个标记点';
     noFocus(txt);
     txt.addEventListener('click', function () { seekTo(row.s); });
-    var del = document.createElement('span');
+    var del = document.createElement('button');
+    del.type = 'button';
     del.className = 'mkdel';
     del.textContent = '✕';
-    del.title = '删掉这一条';
+    del.setAttribute('aria-label', '删除 ' + row.label + ' ' + fmtSec(row.s) + ' 的标记');
     noFocus(del);
     del.addEventListener('click', function (ev) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
@@ -2899,6 +2959,10 @@
   function applyMarkPos(bar) {
     var p = readMarkPos();
     if (!p) return;
+    setMarkPosition(bar, p.left, p.top);
+  }
+  function setMarkPosition(bar, left, top) {
+    var p = clampToViewport(bar, left, top);
     bar.style.left = Math.round(p.left) + 'px';
     bar.style.top = Math.round(p.top) + 'px';
     bar.style.bottom = 'auto';
@@ -2911,9 +2975,7 @@
     var dx = (e.clientX || 0) - markDrag.x, dy = (e.clientY || 0) - markDrag.y;
     if (!markDrag.moved && Math.abs(dx) < MARK_DRAG_MIN && Math.abs(dy) < MARK_DRAG_MIN) return;
     markDrag.moved = true;
-    bar.style.left = Math.round(markDrag.l + dx) + 'px';
-    bar.style.top = Math.round(markDrag.t + dy) + 'px';
-    bar.style.bottom = 'auto';
+    setMarkPosition(bar, markDrag.l + dx, markDrag.t + dy);
   }
   function onMarkDragUp() {
     if (!markDrag) return;
@@ -2938,8 +3000,7 @@
     bar.addEventListener('mousedown', function (e) {
       // 点在按钮或列表行上时不拖，免得把点击吃掉
       var t = e && e.target;
-      if (t && t.getAttribute && t.getAttribute('data-mk')) return;
-      if (t && t.className && String(t.className).indexOf('mkrow') >= 0) return;
+      if (t && (t.tagName === 'BUTTON' || (t.closest && !t.closest('.mkhead')))) return;
       var r = bar.getBoundingClientRect ? bar.getBoundingClientRect() : { left: 0, top: 0 };
       markDrag = { bar: bar, moved: false, x: e.clientX || 0, y: e.clientY || 0, l: r.left, t: r.top };
       if (e.preventDefault) e.preventDefault();
@@ -2953,9 +3014,7 @@
     host.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483000;pointer-events:none;';
     (document.body || document.documentElement).appendChild(host);
     shadow = host.attachShadow({ mode: 'open' });
-    var style = document.createElement('style');
-    style.textContent = UI_CSS;
-    shadow.appendChild(style);
+    installUiStyle(shadow, THEME_CSS + UI_CSS);
 
     uiRoot = document.createElement('div');
     uiRoot.className = 'root';
@@ -2966,56 +3025,94 @@
     shadow.appendChild(toastRoot);
   }
 
+  function installUiStyle(root, css) {
+    try {
+      if ('adoptedStyleSheets' in root && typeof CSSStyleSheet === 'function') {
+        var sheet = new CSSStyleSheet();
+        sheet.replaceSync(css);
+        root.adoptedStyleSheets = [sheet];
+        return;
+      }
+    } catch (e) { /* fall back for older engines */ }
+    var style = document.createElement('style');
+    style.textContent = css;
+    root.appendChild(style);
+  }
+
+  var THEME_CSS = [
+    ':host{all:initial;color-scheme:light;--base:#fcfcf4;--surface:#f1f4e8;--well:#fffef7;--line:#c7d3bf;',
+    '--ink:#1d2e22;--muted:#506254;--accent:#286044;--accent-ink:#fff;--danger:#a43124;--amber:#824e12;',
+    '--lift:0 12px 32px rgba(31,56,35,.18);--mono:"Cascadia Mono",Consolas,monospace;',
+    '--text:"PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC",sans-serif;',
+    'font:13px/1.55 var(--text);color:var(--ink);}',
+    '*,*::before,*::after{box-sizing:border-box;} [hidden]{display:none!important;}',
+    'button{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);',
+    'border-radius:7px;padding:7px 11px;min-height:34px;cursor:pointer;}',
+    'button:hover{background:#e4eddc;border-color:#7d9c80;}',
+    'button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:700;}',
+    'button.primary:hover{background:#1b4b33;} button.danger{color:var(--danger);}',
+    'button:disabled{opacity:.5;cursor:default;} button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}',
+    '::slotted(input[type=text]),::slotted(input[type=number]),::slotted(select),::slotted(textarea){color-scheme:light;}',
+    '::slotted(input:focus-visible),::slotted(select:focus-visible),::slotted(textarea:focus-visible){outline:2px solid var(--accent);outline-offset:2px;}'
+  ].join('');
+
   var UI_CSS = [
-    '.root{position:fixed;top:64px;right:20px;pointer-events:auto;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;line-height:1.5;}',
-    '.pill{display:inline-flex;align-items:center;gap:6px;background:rgba(20,22,26,.86);color:#fff;',
-    '  border-radius:18px;padding:6px 12px;box-shadow:0 4px 16px rgba(0,0,0,.3);backdrop-filter:blur(6px);cursor:pointer;user-select:none;}',
-    '.pill:hover{background:rgba(30,34,40,.92);}',
-    '.pill .dot{width:7px;height:7px;border-radius:50%;background:#00d1b2;flex:0 0 auto;}',
-    '.pill .dot.warn{background:#ffb648;} .pill .dot.off{background:#8a9099;} .pill .dot.err{background:#ff5b5b;}',
-    '.pill .sep{width:1px;height:12px;background:rgba(255,255,255,.22);}',
-    '.pill .act{padding:0 2px;opacity:.8;} .pill .act:hover{opacity:1;}',
-    // z-index 必须高于遮罩，否则半透明遮罩会盖在面板上 —— 面板看起来是灰的且点不到
-    '.mask{position:fixed;inset:0;background:rgba(0,0,0,.4);pointer-events:auto;z-index:2147483001;}',
-    '.panel{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:600px;max-width:92vw;max-height:88vh;overflow:auto;',
-    '  z-index:2147483002;background:#fff;color:#222;border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.35);padding:20px 22px;pointer-events:auto;}',
-    '.panel h3{margin:0 0 4px;font-size:16px;}',
-    '.panel .sub{color:#8a9099;font-size:12px;margin-bottom:10px;}',
-    '.row{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;padding:7px 0;border-bottom:1px solid #f0f2f5;}',
-    '.row:last-child{border-bottom:0;}',
-    '.row .lab{font-weight:600;} .row .tip{color:#8a9099;font-size:12px;margin-top:2px;}',
-    // 输入控件在 light DOM（靠 <slot> 投影进来），所以样式选择器要用 ::slotted ——
-    // ::slotted 只支持单个复合选择器，不能写后代选择器
-    '::slotted(input[type=text]),::slotted(input[type=number]){outline:none;}',
-    '::slotted(input[type=text]:focus),::slotted(input[type=number]:focus){border-color:#00a1d6;}',
-    '::slotted(select){outline:none;}',
-    '::slotted(input[type=checkbox]){width:16px;height:16px;}',
-    // 设置面板里的复选框在影子树内（不是 slot 投影），所以要单独给样式：
-    // flex:0 0 auto 防止被同行超长的说明文字挤小，cursor 给出手感
-    '.panel input[type=checkbox]{width:17px;height:17px;margin:0;flex:0 0 auto;cursor:pointer;accent-color:#00a1d6;}',
-    '.chainbox{margin-top:10px;padding:9px 12px;border:1px solid #ffe2b8;background:#fffaf1;border-radius:9px;}',
-    '.epmap{margin:6px 0 0;font-size:12px;color:#0077a8;background:#f0fafd;border-radius:7px;padding:6px 10px;line-height:1.5;}',
-    '.chainbox .chainrow{padding:3px 0;border-top:1px dashed #f0e2c8;font-size:13px;}',
-    '.chainbox .chainrow:first-of-type{border-top:0;}',
-    '.chainbox .chainrow .cn{color:#8a9099;font-size:12px;}',
-    '.btns{display:flex;gap:10px;justify-content:flex-end;margin-top:16px;}',
-    'button{padding:7px 16px;border-radius:8px;border:1px solid #d7dbe0;background:#fff;cursor:pointer;font-size:13px;}',
-    'button:hover{background:#f5f7fa;}',
-    'button.primary{background:#00a1d6;color:#fff;border-color:#00a1d6;} button.primary:hover{background:#0091c2;}',
-    'button.danger{color:#e5484d;border-color:#ffd0d1;}',
-    '.cand{max-height:215px;overflow:auto;border:1px solid #eef0f3;border-radius:9px;margin-top:10px;}',
-    '.candhint{color:#8a9099;font-size:12px;margin-top:4px;}',
-    '.cand-item{padding:8px 11px;border-bottom:1px solid #f4f6f8;cursor:pointer;}',
-    '.cand-item:hover{background:#f0fafd;} .cand-item.on{background:#e6f7ff;}',
-    '.cand-item .nm{font-weight:600;} .cand-item .meta{color:#8a9099;font-size:12px;}',
-    '.hintbox{background:#f7f9fb;border-radius:8px;padding:8px 12px;font-size:12px;color:#5a6472;margin:10px 0;}',
-    '.toast-root{position:fixed;bottom:88px;left:50%;transform:translateX(-50%);pointer-events:auto;}',
-    '.toast{background:rgba(20,22,26,.9);color:#fff;border-radius:10px;padding:10px 16px;display:flex;align-items:center;gap:14px;',
-    '  box-shadow:0 8px 28px rgba(0,0,0,.32);animation:in .18s ease;}',
-    '.toast .t{font-weight:600;} .toast .d{opacity:.75;font-size:12px;}',
-    '.toast button{background:transparent;border:1px solid rgba(255,255,255,.4);color:#fff;padding:4px 10px;font-size:12px;}',
-    '.toast button:hover{background:rgba(255,255,255,.14);}',
-    '@keyframes in{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:none;}}'
+    '.root{position:fixed;top:72px;right:18px;pointer-events:auto;}',
+    '.pill{width:278px;max-width:calc(100vw - 24px);padding:8px 9px 9px;',
+    'border:1px solid var(--line);border-radius:12px;box-shadow:var(--lift);user-select:none;touch-action:none;}',
+    '.pill-head,.pill-actions{display:flex;align-items:center;gap:5px;} .pill-head{justify-content:space-between;}',
+    '.pill-head strong{font-size:12px;letter-spacing:.05em;} .pill-head .signal{margin-right:6px;}',
+    '.pill-head .act{min-height:24px;width:24px;padding:0;font:18px var(--mono);}',
+    '.pill-info{display:block;width:100%;text-align:left;padding:6px 3px;background:transparent;border-color:transparent;}',
+    '.pill-info b,.pill-info small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    '.pill-info b{font-size:14px;} .pill-info small{color:var(--muted);font-size:11px;}',
+    '.pill-actions{border-top:1px solid var(--line);padding-top:7px;flex-wrap:wrap;}',
+    '.pill-actions button{min-height:28px;font-size:12px;padding:3px 7px;}',
+    '.pill-actions .primary{margin-left:auto;} .pill-actions .is-active{color:var(--accent);border-color:#6f9b77;background:#deedd8;}',
+    '.pill-head strong{cursor:grab;} .pill-head strong:active{cursor:grabbing;}',
+    '.pill.mini{width:36px;height:32px;padding:0;justify-content:center;align-items:center;}',
+    '.panel{border:1px solid var(--line);box-shadow:var(--lift);overflow-wrap:anywhere;}',
+    '.panel-head,.panel-foot{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 20px;background:var(--surface);}',
+    '.panel-head{border-bottom:1px solid var(--line);} .panel-head h3{margin:0;padding-left:11px;border-left:4px solid var(--accent);font-size:19px;line-height:1.2;}',
+    '.panel-dismiss{width:32px;min-height:30px;padding:0;font:18px var(--mono);}',
+    '.panel-body{min-height:0;overflow:auto;padding:16px 20px;scrollbar-width:thin;overscroll-behavior:contain;}',
+    '.panel-foot{border-top:1px solid var(--line);flex-wrap:wrap;} .panel-foot .btns{margin-left:auto;}',
+    '.layout{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:12px;align-items:start;}',
+    '.settings-layout{grid-template-columns:repeat(2,minmax(0,1fr));}',
+    '.section{min-width:0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--surface);}',
+    '.section h4{margin:0 0 9px;color:var(--accent);font-size:13px;}',
+    '.row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line);}',
+    '.row:first-of-type{border-top:0;} .row>:first-child{min-width:0;} .row .lab{font-weight:650;}',
+    '.stack,.row-stack{display:grid;gap:6px;min-width:0;} .row-stack{padding:7px 0;}',
+    '.tip,.sub,.cn{color:var(--muted);font-size:12px;} .caution{color:var(--amber);} .picked{color:var(--accent);}',
+    '.check-row{cursor:pointer;} .check-row input{width:17px;height:17px;flex:0 0 auto;margin:0;accent-color:var(--accent);}',
+    '.check-row input:focus-visible{outline:2px solid var(--accent);outline-offset:3px;}',
+    '.section button{max-width:100%;} .row>button{flex-shrink:0;}',
+    '.hintbox,.willbind,.epmap,.chainbox{border-radius:8px;background:var(--well);border:1px solid var(--line);padding:8px 10px;}',
+    '.hintbox{display:flex;gap:8px;align-items:baseline;margin-bottom:12px;font-size:12px;color:var(--muted);}',
+    '.hintbox b{color:var(--ink);font-weight:600;} .hintbox span{white-space:nowrap;}',
+    '.willbind,.epmap,.chainbox{margin-top:8px;} .epmap{font-size:12px;color:var(--accent);}',
+    '.chainbox{padding:8px;} .chainrow{margin-top:6px;padding:6px 7px;border:1px solid var(--line);border-radius:6px;}',
+    '.chainrow.on{border-color:#749775;background:#edf5e7;}',
+    '.btns{display:flex;gap:6px;align-items:center;flex-wrap:wrap;} .section .btns{margin-top:8px;}',
+    '.cand{max-height:325px;overflow:auto;scrollbar-width:thin;margin-top:9px;display:grid;gap:5px;}',
+    '.cand-item{display:block;width:100%;min-width:0;text-align:left;padding:7px 9px;overflow-wrap:anywhere;}',
+    '.cand-item.on{border-color:var(--accent);background:#e3efdf;} .cand-item .nm{display:block;font-weight:700;}',
+    '.cand-item .meta,.candhint{color:var(--muted);font-size:11px;} .candhint{margin-top:6px;}',
+    '.result-empty{padding:9px;color:var(--muted);font-size:12px;border:1px dashed var(--line);border-radius:7px;}',
+    '.bktip{min-height:1.55em;margin:8px 0 0;}',
+    '.segment{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line);}',
+    '.segment b,.segment time{font-family:var(--mono);} .segment b{color:var(--accent);}',
+    '.segment-review{grid-column:2 / -1;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;}',
+    '.toast-root{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);width:max-content;max-width:calc(100vw - 28px);z-index:2147483003;}',
+    '.toast-root.above-panel{top:12px;bottom:auto;}',
+    '.toast{pointer-events:auto;background:var(--base);color:var(--ink);border:1px solid var(--line);border-left:4px solid var(--accent);',
+    'border-radius:10px;padding:9px 12px;display:flex;align-items:center;gap:14px;box-shadow:var(--lift);animation:notice-in .16s ease-out;}',
+    '.toast .t{font-weight:700;} .toast .d{color:var(--muted);font-size:12px;overflow-wrap:anywhere;}',
+    '.toast button{white-space:nowrap;}',
+    '@keyframes notice-in{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:none;}}',
+    '@media(max-width:660px){.layout{grid-template-columns:minmax(0,1fr);}.panel-head,.panel-foot,.panel-body{padding-left:12px;padding-right:12px;}.cand{max-height:220px;}.hintbox{display:block;}.hintbox span{margin-right:6px;}.row>button{flex-shrink:1;}}',
+    '@media(prefers-reduced-motion:reduce){.toast{animation:none;}}'
   ].join('');
 
   var toastTimer = null;
@@ -3025,12 +3122,15 @@
     var el = document.createElement('div');
     el.className = 'toast';
     var left = document.createElement('div');
+    left.setAttribute('role', 'status');
     left.innerHTML = '<div class="t"></div><div class="d"></div>';
     left.querySelector('.t').textContent = title;
     left.querySelector('.d').textContent = desc || '';
     el.appendChild(left);
     if (onUndo && config.undoSeconds > 0) {
       var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'primary';
       btn.textContent = '撤回';
       btn.addEventListener('click', function () {
         var mine = el;
@@ -3064,10 +3164,12 @@
    * 症状就是在搜索框里打 q 触发点赞。
    * 另：只靠 stopPropagation 不够 —— 实测它只拦得住冒泡阶段的监听。
    * ================================================================== */
-  var INP_CSS = 'width:180px;padding:6px 9px;border:1px solid #d7dbe0;border-radius:7px;font-size:13px;' +
-                'outline:none;box-sizing:border-box;background:#fff;color:#222;font-family:inherit;';
-  var SEL_CSS = 'padding:6px 8px;border:1px solid #d7dbe0;border-radius:7px;font-size:13px;' +
-                'background:#fff;color:#222;font-family:inherit;';
+
+  var FIELD_CSS = 'min-width:0;max-width:100%;box-sizing:border-box;padding:7px 8px;' +
+    'border:1px solid #9cb29b;border-radius:7px;background:#fffef7;color:#1d2e22;' +
+    'font:inherit;color-scheme:light;pointer-events:auto;';
+  var FILL_FIELD_CSS = FIELD_CSS + 'width:100%;';
+  var SHORT_FIELD_CSS = FIELD_CSS + 'width:84px;';
 
   function mkSlot(tag, name, cssText) {
     ensureUI();
@@ -3184,8 +3286,9 @@
   }
 
   /* ---- 状态胶囊：所有交互的入口 ---- */
-  /* 状态圆点颜色：off 灰 / warn 橙 / err 红 / '' 绿 */
-  var DOT_COLORS = { 'off': '#8a9099', 'warn': '#ffb648', 'err': '#ff5b5b', '': '#00d1b2' };
+
+  var DOT_COLORS = { 'off': '#64766b', 'warn': '#9e6415', 'err': '#ad4535', '': '#30804f' };
+  var PILL_SURFACE = 'box-sizing:border-box;background:#fcfcf4;color:#1d2e22;pointer-events:auto;';
 
   function pillDotCls(r) {
     if (!r) return 'off';
@@ -3195,8 +3298,8 @@
       if (r.reason === 'net-error') return 'warn';
       return 'err';
     }
-    var segCount = (r.segments || []).filter(segmentEnabled).length;
-    return segCount ? '' : 'warn';
+    var segs = (r.segments || []).filter(segmentEnabled);
+    return segs.length && !segs.some(function (s) { return s.reviewReason; }) ? '' : 'warn';
   }
 
   function isMiniPill() {
@@ -3226,179 +3329,130 @@
     if (runtime.markOn) renderMark();
   }
 
+
+  function pillSignal(tone) {
+    return '<span class="signal" aria-hidden="true" style="display:inline-block;vertical-align:middle;' +
+      'width:7px;height:7px;border-radius:2px;background:' + DOT_COLORS[tone] + '"></span>';
+  }
+
   function renderMiniPill(r) {
-    var m = document.createElement('div');
-    m.className = 'pill mini';
-    m.innerHTML = '<span class="dot"></span>';
-    m.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;' +
-      'border-radius:50%;background:rgba(20,22,26,.72);cursor:pointer;user-select:none;touch-action:none;';
-    var dot = m.querySelector('.dot');
-    if (dot) {
-      dot.style.cssText = 'display:block;width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:' +
-        (DOT_COLORS[pillDotCls(r)] || '#8a9099') + ';';
-    }
-    attachPillDrag(m);
-    m.addEventListener('click', function () {
+    var mini = document.createElement('button');
+    mini.type = 'button';
+    mini.className = 'pill mini';
+    mini.setAttribute('aria-label', '展开番剧跳过');
+    mini.title = '展开番剧跳过';
+    mini.innerHTML = pillSignal(pillDotCls(r));
+    mini.style.cssText = PILL_SURFACE + 'display:inline-flex;min-height:32px;touch-action:none;';
+    attachPillDrag(mini);
+    mini.addEventListener('click', function (e) {
       if (runtime.pillDragged) { runtime.pillDragged = false; return; }
       config.pillCollapsed = false;
       gmSet('pillCollapsed', false);
       renderPill();
+      if (e.detail === 0) uiRoot.querySelector('[data-a=collapse]').focus();
     });
+    uiRoot.appendChild(mini);
     applyPillPos();
-    uiRoot.appendChild(m);
   }
 
   function renderPill() {
     ensureUI();
     uiRoot.innerHTML = '';
-    // 网页全屏 / 真实全屏：胶囊整个隐藏（连圆点都不留），退出全屏由 applyScreen 再渲染回来。
-    // 这是自带行为，不是开关。
+    // 标记工具条在全屏和收起时也需要更新当前分 P。
+    if (runtime.markOn && markRoot) refreshMarkBar();
     if (runtime.screen === 'web' || runtime.screen === 'full') return;
-    var pill = document.createElement('div');
-    pill.className = 'pill';
 
     var r = runtime.result;
     var ctx = runtime.ctx;
-    var bound = false;
-    try { bound = !!(ctx && getBinding(ctx)); } catch (e) { bound = false; }
-
-    // 「隐藏胶囊（普通视频）」：普通视频（自动识别关闭时的默认态）上整个不显示 ——
-    // 连收起的小圆点也一起藏。已绑定的番剧例外：绑过代表用户明确要它跳，得留着方便随时改。
+    var bound = !!(ctx && getBinding(ctx));
     if (r && !r.ok && r.reason === 'autodetect-off' && !config.showIdlePill && !bound) return;
-
-    /* 收起态：只剩一颗状态色小圆点，点它展开。 */
     if (isMiniPill()) { renderMiniPill(r); return; }
 
-    var parts = [];
-    var fallback = openBindPanel;      // 点胶囊空白处做什么
-
-    if (!ctx) {
-      parts.push('<span class="dot off"></span><span>番剧跳过</span>');
-      fallback = function () { alert('尚未读取到视频信息'); };
-    } else if (!r) {
-      parts.push('<span class="dot off"></span><span>番剧跳过 · 未识别</span>');
-    } else if (!r.ok) {
-      // 自动识别关闭时（默认），普通视频不留任何视觉痕迹 —— 上面的「隐藏胶囊」早退已处理。
-      var idleOff = r.reason === 'autodetect-off';
-      var why = {
+    var title = ctx ? '未识别' : '正在读取视频';
+    var meta = ctx ? '可手动绑定番剧' : '等待播放器';
+    var infoAction = openBindPanel;
+    var waiting = false;
+    var reviewCount = 0;
+    if (r && r.ok) {
+      var segs = (r.segments || []).filter(segmentEnabled);
+      reviewCount = segs.filter(function (s) { return s.reviewReason; }).length;
+      title = r.title || '已识别番剧';
+      meta = '第 ' + r.episode + ' 话 · ' + segs.length + ' 段' +
+        (reviewCount ? ' · ' + reviewCount + ' 段待核对' :
+          (r.manual ? ' · 已绑定' : (r.autoSkip ? ' · 自动跳过' : ' · 手动确认')));
+      waiting = r.autoSkip === false && segs.length > reviewCount;
+      infoAction = showDetails;
+    } else if (r) {
+      title = {
         'autodetect-off': '未识别',
-        blacklisted: '已标记「不是番剧」· 不会再跳',
-        'no-episode': '没找到集号', 'no-name': '标题无番名',
-        'chain-miss': '这一话不跳（OVA／段没对上条目）',
+        blacklisted: '已标记为非番剧',
+        'no-episode': '没找到集号',
+        'no-name': '标题无番名',
+        'chain-miss': '本话无匹配片段',
         'season-mismatch': '绑定的季和这一话对不上',
-        // 这三个以前没登记，一律掉进「识别失败」的红点 ——
-        // 但「番名没匹配上」「置信度不足」根本不是错误，更不是网络故障
-        'no-match': '没匹配到番剧，可点「绑定」',
-        'low-score': '番名不太确定，可点「绑定」',
+        'no-match': '没匹配到番剧',
+        'low-score': '番名不太确定',
         'net-error': netFailText()
       }[r.reason] || '识别失败';
-      // autodetect-off 是「正常状态」、net-error 是「外部故障」，都不该用红点吓人
-      var dotCls = (idleOff || r.reason === 'no-match' || r.reason === 'low-score') ? 'off'
-                 : (r.reason === 'net-error' ? 'warn' : 'err');
-      parts.push('<span class="dot ' + dotCls + '"></span>' +
-        '<span>' + (idleOff ? '番剧跳过 · ' : '') + escapeHtml(why) + '</span>');
-      parts.push('<span class="sep"></span><span class="act" data-a="bind">' + (bound ? '改' : '绑定') + '</span>');
-      // 已经拉黑的：给一个「取消」出口（标记入口在 0.4.7 已按用户要求删掉）
-      if (r.reason === 'blacklisted') {
-        parts.push('<span class="sep"></span><span class="act" data-a="unbl">取消</span>');
-      }
-    } else {
-      var segCount = (r.segments || []).filter(segmentEnabled).length;
-      var dotClass = segCount ? '' : 'warn';
-      // ask 模式（或 auto 但置信度没过门槛）：识别结果摆在这儿，跳不跳由用户点
-      var waiting = r.autoSkip === false;
-      parts.push('<span class="dot ' + dotClass + '"></span>' +
-        '<span>' + escapeHtml(r.title) + ' 第' + r.episode + '集</span>' +
-        '<span class="sep"></span><span>' + segCount + ' 段</span>');
-      if (waiting && segCount) {
-        parts.push('<span class="sep"></span><span class="act" data-a="go">跳过</span>');
-      }
-      parts.push('<span class="sep"></span><span class="act" data-a="bind">改</span>');
-      fallback = (waiting && segCount) ? skipNow : showDetails;
+      if (r.reason === 'autodetect-off') meta = '自动识别已关闭';
+      if (r.reason === 'blacklisted') meta = '已停止识别及跳过';
+      if (r.reason === 'chain-miss') meta = (r.confidence && r.confidence.reasons[0]) || '季和集尚未对齐';
     }
-    // 标记模式入口：一键进出工具条，不用再钻设置面板（低频但关键的动作）
-    parts.push('<span class="sep"></span><span class="act" data-a="mark" title="标记 OP/ED 帧">🎯</span>');
-    // 末尾统一挂一个设置入口 —— 胶囊原来只有识别出来才出现，想改设置得去油猴菜单，太绕
-    parts.push('<span class="sep"></span><span class="act" data-a="cfg" title="番剧跳过设置">⚙</span>');
-    parts.push('<span class="sep"></span><span class="act" data-a="collapse" title="收起胶囊">–</span>');
-    pill.innerHTML = parts.join('');
-    /* 🎯 在标记模式下高亮。内联写死颜色：页面 CSP 拦掉 <style> 注入时也看得出状态 */
-    var markAct = pill.querySelector('[data-a=mark]');
-    if (markAct) {
-      markAct.style.cssText = 'padding:0 2px;opacity:1;color:' +
-        (runtime.markOn ? '#00d1b6' : 'rgba(255,255,255,.8)') + ';';
-    }
-    /* 关键样式内联：页面 CSP 拦掉 <style> 注入时（脚本仍能跑，只是样式没了），
-     * 面板早就靠内联活着，胶囊却会变成一个裸 div。这里补上最小可用的外观。 */
-    pill.style.cssText = 'display:inline-flex;align-items:center;gap:6px;' +
-      'background:rgba(20,22,26,.86);color:#fff;border-radius:18px;padding:6px 12px;' +
-      'box-shadow:0 4px 16px rgba(0,0,0,.3);cursor:pointer;user-select:none;touch-action:none;' +
-      'font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;';
-    try {
-      var dots = pill.querySelectorAll('.dot');
-      for (var di = 0; di < dots.length; di++) {
-        dots[di].style.cssText = 'display:inline-block;width:7px;height:7px;border-radius:50%;' +
-          'flex:0 0 auto;background:' + (/off/.test(dots[di].className) ? '#8a9099'
-            : (/warn/.test(dots[di].className) ? '#ffb648'
-            : (/err/.test(dots[di].className) ? '#ff5b5b' : '#00d1b2'))) + ';';
-      }
-      var seps = pill.querySelectorAll('.sep');
-      for (var sj = 0; sj < seps.length; sj++) {
-        seps[sj].style.cssText = 'display:inline-block;width:1px;height:12px;background:rgba(255,255,255,.22);';
-      }
-    } catch (e) { /* ignore */ }
+
+    var pill = document.createElement('div');
+    pill.className = 'pill';
+    pill.setAttribute('role', 'region');
+    pill.setAttribute('aria-label', '番剧跳过');
+    pill.style.cssText = PILL_SURFACE + 'display:block;';
+    pill.innerHTML =
+      '<div class="pill-head"><strong>' + pillSignal(pillDotCls(r)) + '番剧跳过</strong>' +
+      '<button type="button" class="act" aria-label="收起番剧跳过" data-a="collapse">−</button></div>' +
+      '<button type="button" class="pill-info" data-a="info"><b>' + escapeHtml(title) + '</b><small>' + escapeHtml(meta) + '</small></button>' +
+      '<div class="pill-actions">' +
+      '<button type="button" class="act" data-a="bind">' + (bound ? '改绑定' : '绑定') + '</button>' +
+      '<button type="button" class="act' + (runtime.markOn ? ' is-active' : '') +
+      '" aria-pressed="' + runtime.markOn + '" data-a="mark">标记</button>' +
+      '<button type="button" class="act" data-a="cfg">设置</button>' +
+      (r && r.reason === 'blacklisted' ? '<button type="button" class="act" data-a="unbl">取消</button>' : '') +
+      (reviewCount ? '<button type="button" class="act caution" data-a="review">核对</button>' : '') +
+      (waiting ? '<button type="button" class="act primary" data-a="go">跳过</button>' : '') + '</div>';
 
     function onAct(name, fn) {
       var node = pill.querySelector('[data-a=' + name + ']');
       if (!node) return;
-      node.addEventListener('click', function (e) { e.stopPropagation(); fn(); });
+      node.addEventListener('click', function (e) { e.stopPropagation(); fn(e); });
     }
+    onAct('info', infoAction);
     onAct('bind', openBindPanel);
-    onAct('mark', markToggle);
+    onAct('mark', function (e) {
+      markToggle();
+      if (e.detail === 0) uiRoot.querySelector('[data-a=mark]').focus();
+    });
     onAct('cfg', openSettings);
-    onAct('collapse', function () {
+    onAct('collapse', function (e) {
       config.pillCollapsed = true;
       gmSet('pillCollapsed', true);
       renderPill();
+      if (e.detail === 0) uiRoot.querySelector('.mini').focus();
     });
-    onAct('go', skipNow);
-    /* 「不是番剧」的**标记入口已经整个删掉**（0.4.6 试过挪进绑定面板，用户反馈
-     * 仍然「太突兀」）：它是个低频、误触代价很大的动作（一不小心整条视频再也不跳），
-     * 而价值又低。这里只留「取消」—— 给历史记录（以及调试 API 标记过的）留个出口。 */
+    onAct('review', showDetails);
+    onAct('go', function () { skipNow(); });
     onAct('unbl', function () {
-      var c = runtime.ctx;
-      var was = clearBlacklist(c);
+      var was = clearBlacklist(runtime.ctx);
       runtime.result = null;
       renderPill();
       showToast('已取消「不是番剧」', was ? '会照常识别这个视频' : '这个视频本来就没被标记');
       rerun();
     });
-    /* 拖动：位移小于 4px 当作点击，别把「点一下跳过」变成「拖了一下没反应」。
-     * 位置存进 GM 存储，刷新页面还在。 */
     attachPillDrag(pill);
-    /* 拖完手松开那一下的 click 要吃掉 —— 否则「拖一下胶囊」会顺手触发跳过／打开面板。
-     * 注意同节点上的多个 click 监听之间 stopPropagation 是拦不住的（只有
-     * stopImmediatePropagation 可以），所以捕获阶段掐掉之后，还得用旗子让下面那个
-     * 监听自己让路；捕获这一层同时负责拦住子节点（「跳过」等 span）上的动作。 */
-    var clickSwallowed = false;
     pill.addEventListener('click', function (e) {
       if (!runtime.pillDragged) return;
       runtime.pillDragged = false;
-      clickSwallowed = true;
-      if (e && e.stopPropagation) e.stopPropagation();
-      if (e && e.preventDefault) e.preventDefault();
+      e.stopPropagation();
+      e.preventDefault();
     }, true);
-    pill.addEventListener('click', function () {
-      if (clickSwallowed) { clickSwallowed = false; return; }
-      fallback();
-    });
-
-    applyPillPos();
     uiRoot.appendChild(pill);
-
-    /* 工具条的状态行跟着胶囊一起刷新：识别完成、换分P、换视频时
-     * 胶囊会重画，工具条不能停在「未绑定」。 */
-    if (runtime.markOn && markRoot) refreshMarkBar();
+    applyPillPos();
   }
 
   /* ---- 胶囊拖动 ---- */
@@ -3419,10 +3473,10 @@
     } catch (e) { /* ignore */ }
   }
 
-  function clampPillPos(left, top) {
+  function clampToViewport(node, left, top) {
     var w = 0, h = 0;
     try {
-      var rect = uiRoot.getBoundingClientRect();
+      var rect = node.getBoundingClientRect();
       w = rect.width || 0;
       h = rect.height || 0;
     } catch (e) { /* ignore */ }
@@ -3437,7 +3491,7 @@
   function applyPillPos() {
     var p = readPillPos();
     if (!p) { try { uiRoot.style.cssText = ''; } catch (e2) { /* ignore */ } return; }
-    var c = clampPillPos(p.left, p.top);
+    var c = clampToViewport(uiRoot, p.left, p.top);
     setPillRootPos(c.left, c.top);
   }
 
@@ -3449,7 +3503,7 @@
       var dx = (e.clientX || 0) - start.x, dy = (e.clientY || 0) - start.y;
       if (!runtime.pillDragged && Math.abs(dx) + Math.abs(dy) < PILL_DRAG_MIN) return;
       runtime.pillDragged = true;
-      last = clampPillPos(start.left + dx, start.top + dy);
+      last = clampToViewport(uiRoot, start.left + dx, start.top + dy);
       setPillRootPos(last.left, last.top);
     }
 
@@ -3499,11 +3553,13 @@
    * 等于一键跳过整集，和这个按钮的意思完全相反。 */
   var ASK_LOOKAHEAD = 15;
 
-  function nextSkippableSeg() {
-    var segs = (runtime.result && runtime.result.segments) || [];
-    var en = segs.filter(segmentEnabled).map(shiftSeg);
-    if (!en.length) return null;
+  function nextSkippableSeg(reviewed) {
     var v = runtime.video || getVideo();
+    var segs = (runtime.result && runtime.result.segments) || [];
+    var en = segs.filter(function (s) {
+      return segmentEnabled(s) && (reviewed ? s === reviewed : !segmentReviewReason(s, v && v.duration));
+    }).map(shiftSeg);
+    if (!en.length) return null;
     var t = (v && v.currentTime) || 0;
     for (var i = 0; i < en.length; i++) {
       if (t >= en[i].start && t < en[i].end - 0.2) return en[i];   // 正落在区间里
@@ -3514,27 +3570,49 @@
     return null;
   }
 
-  function skipNow() {
+  function skipNow(reviewed) {
     // 切过 P 之后 DOM 里可能是另一个 <video>，别对着已经卸载的元素设 currentTime
     var video = runtime.video;
     if (!video || !document.body.contains(video)) video = getVideo();
     runtime.video = video;
     if (!video) { showToast('没找到播放器', '稍后再试或手动拖一下进度条'); return false; }
-    var seg = nextSkippableSeg();
-    if (!seg) { showDetails(); return false; }    // 现在没有可跳的，把本集时间戳列出来
+    var seg = nextSkippableSeg(reviewed);
+    if (!seg) {
+      if (reviewed) showToast('当前不在该片段附近', '请将进度移到片段开始前 15 秒内或片段中');
+      else showDetails();
+      return false;
+    }
+    if (reviewed) seg = Object.assign({}, seg, { reviewReason: segmentReviewReason(reviewed, video.duration) });
     return performSkip(video, seg, true);         // force：用户手点的，跳过冷却
   }
+
 
   function showDetails() {
     var r = runtime.result;
     if (!r || !r.ok) return;
-    var segs = (r.segments || []);
-    var lines = segs.map(function (s) {
-      var label = s.type === 'op' ? 'OP' : 'ED';
-      var mark = segmentEnabled(s) ? '' : ' · 已关闭';
-      return label + '  ' + fmtTime(s.start) + ' – ' + fmtTime(s.end) + '  （' + s.source + mark + '）';
+    var segs = r.segments || [];
+    var video = runtime.video || getVideo();
+    var rows = segs.map(function (s, i) {
+      var reason = segmentReviewReason(s, video && video.duration);
+      return '<div class="segment"><b>' + (s.type === 'op' ? 'OP' : 'ED') + '</b>' +
+        '<time>' + fmtTime(s.start) + ' – ' + fmtTime(s.end) + '</time>' +
+        '<span class="tip">' + escapeHtml(s.source || '') + (segmentEnabled(s) ? '' : ' · 已关闭') + '</span>' +
+        (reason ? '<div class="segment-review"><span class="caution">' + escapeHtml(reason) + '</span>' +
+          (segmentEnabled(s) ? '<button type="button" data-review="' + i + '">确认跳过</button>' : '') + '</div>' : '') +
+        '</div>';
+    }).join('');
+    var panel = document.createElement('div');
+    panel.className = 'panel';
+    panel.innerHTML = panelContent('本集时间戳',
+      '<div class="hintbox"><b>' + escapeHtml(r.title) + ' · 第 ' + r.episode + ' 话</b></div>' +
+      (rows || '<p class="result-empty">本集没有可用时间戳</p>'), '');
+    var close = mountPanel(panel);
+    Array.prototype.forEach.call(panel.querySelectorAll('[data-review]'), function (btn) {
+      btn.addEventListener('click', function () {
+        if (r !== runtime.result) { close(); return; }
+        if (skipNow(segs[Number(btn.getAttribute('data-review'))])) close();
+      });
     });
-    showToast(r.title + ' 第' + r.episode + '集', lines.join('　　') || '本集没有可用时间戳');
   }
 
   /* 「不是番剧」固定按 BV 粒度落表。
@@ -3563,26 +3641,33 @@
     return hit;
   }
 
-  // 按钮 / 复选框不给焦点：它们一旦被聚焦，按空格、回车就会在触发自身的同时
-  // 打到 B 站快捷键（空格＝播放暂停）。mousedown 阻止默认行为即可不抢焦点。
+
+  // 鼠标操作工具条时保留播放器焦点。键盘仍能通过 Tab 到达原生控件。
   function noFocus(node) {
     if (!node) return node;
-    try { node.setAttribute('tabindex', '-1'); } catch (e) { /* ignore */ }
     node.addEventListener('mousedown', function (e) { e.preventDefault(); });
     return node;
   }
-  /* ==================================================================
-   * 15.2 复选框为什么不能自己翻转 checked
-   *
-   * 踩过的坑：曾经给复选框挂 click 监听，preventDefault + 手动 n.checked = !n.checked。
-   * 结果「点一下完全没反应」。原因是复选框的激活流程分三步：
-   *   1) pre-click activation  ：浏览器先把 checked 取反
-   *   2) 派发 click 事件       ：我们的监听跑，preventDefault + 手动再取反 → 回到原值
-   *   3) canceled activation   ：事件被取消，浏览器把 checked 还原成事件前的值 → 又是原值
-   * 两次取反互相抵消，外加浏览器的还原兜底，最终纹丝不动。
-   * 正确做法：只管「不给焦点」，翻转完全交给浏览器原生行为。
-   * （Edge 无头实测：不加 click 监听时 mousedown+preventDefault 不影响原生翻转）
-   * ================================================================== */
+
+  function panelContent(title, body, footer) {
+    return '<div class="panel-head"><h3>' + title + '</h3>' +
+      '<button class="panel-dismiss" type="button" aria-label="关闭">×</button></div>' +
+      '<div class="panel-body">' + body + '</div>' +
+      (footer ? '<div class="panel-foot">' + footer + '</div>' : '');
+  }
+
+  function panelTabStops(panel) {
+    var stops = [];
+    function add(node) {
+      if (!node.disabled && node.tabIndex >= 0 && node.getClientRects().length) stops.push(node);
+    }
+    Array.prototype.forEach.call(panel.querySelectorAll('button, input, select, textarea, slot'), function (node) {
+      if (node.tagName === 'SLOT') {
+        if (node.assignedElements) node.assignedElements().forEach(add);
+      } else add(node);
+    });
+    return stops;
+  }
 
   var openPanels = [];   // 当前打开的面板节点（给下面的捕获阶段兜底用）
 
@@ -3594,7 +3679,7 @@
    * （window 捕获早于 document 捕获，所以这里是最后一道能抢在前面拦的机会） */
   function panelCaptureGuard(e) {
     if (!openPanels.length) return;
-    if (e.key === 'Escape' || e.key === 'Esc') return;
+    if (e.key === 'Escape' || e.key === 'Esc' || e.key === 'Tab') return;
     var path = (e.composedPath && e.composedPath()) || [];
     var inPanel = false, inInput = false;
     for (var i = 0; i < path.length; i++) {
@@ -3613,19 +3698,42 @@
   function mountPanel(panel, onClose) {
     ensureUI();
     var mask = document.createElement('div');
+    var previousFocus = shadow.activeElement || document.activeElement;
+    var dismiss = panel.querySelector('.panel-dismiss');
+    var heading = panel.querySelector('h3');
+    mask.className = 'mask';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-label', heading.textContent);
     // 关键样式用内联而不依赖 CSS 类 —— 万一页面 CSP 拦了 <style> 注入，
     // 面板至少还能正常显示和点击（CSS 只负责子元素外观，失效了也还能用）
     mask.style.cssText =
-      'position:fixed;inset:0;background:rgba(0,0,0,.4);pointer-events:auto;z-index:2147483001;';
+      'position:fixed;inset:0;background:rgba(25,44,32,.36);pointer-events:auto;z-index:2147483001;';
     panel.style.cssText =
       'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);' +
-      'width:600px;max-width:92vw;max-height:88vh;overflow:auto;' +
-      'z-index:2147483002;background:#fff;color:#222;border-radius:14px;' +
-      'box-shadow:0 18px 60px rgba(0,0,0,.35);padding:18px 22px;pointer-events:auto;';
+      'display:flex;flex-direction:column;width:720px;max-width:calc(100vw - 24px);max-height:90vh;overflow:auto;' +
+      'z-index:2147483002;background:#fcfcf4;color:#1d2e22;border-radius:14px;pointer-events:auto;';
     var closed = false;
     openPanels.push(panel);
+    toastRoot.classList.add('above-panel');
     try { window.addEventListener('keydown', panelCaptureGuard, true); } catch (e) { /* ignore */ }
-    function onKey(e) { if (e.key === 'Escape' || e.key === 'Esc') close(); }
+    function onKey(e) {
+      if (openPanels[openPanels.length - 1] !== panel) return;
+      if (e.key === 'Escape' || e.key === 'Esc') {
+        e.preventDefault();
+        e.stopPropagation();
+        close();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      var stops = panelTabStops(panel);
+      if (!stops.length) return;
+      var index = stops.indexOf(shadow.activeElement || document.activeElement);
+      if (index < 0 || (e.shiftKey ? index === 0 : index === stops.length - 1)) {
+        e.preventDefault();
+        stops[e.shiftKey ? stops.length - 1 : 0].focus();
+      }
+    }
     function close() {
       if (closed) return;
       closed = true;
@@ -3634,12 +3742,15 @@
       var idx = openPanels.indexOf(panel);
       if (idx >= 0) openPanels.splice(idx, 1);
       if (!openPanels.length) {
+        toastRoot.classList.remove('above-panel');
         try { window.removeEventListener('keydown', panelCaptureGuard, true); } catch (e) { /* ignore */ }
       }
       try { document.removeEventListener('keydown', onKey, true); } catch (e) { /* ignore */ }
       try { onClose && onClose(); } catch (e) { /* ignore */ }
+      if (previousFocus && previousFocus.focus) previousFocus.focus();
     }
     mask.addEventListener('click', close);
+    dismiss.addEventListener('click', close);
     try { document.addEventListener('keydown', onKey, true); } catch (e) { /* ignore */ }
     // 面板内所有按键都不许传出去：B 站的快捷键监听挂在 document / window 上，
     // 在冒泡阶段截断即可 —— 打字不受影响，因为事件已经先到达输入框本体、
@@ -3647,7 +3758,8 @@
     // 注意：B 站若用捕获阶段监听，这里拦不到，那部分靠「输入控件在 light DOM」让它自己的判断生效。
     panel.addEventListener('keydown', function (e) { e.stopPropagation(); });
     shadow.appendChild(mask);   // 先遮罩
-    shadow.appendChild(panel);  // 后面板，同层时按 DOM 顺序面板在上
+    shadow.appendChild(panel);
+    dismiss.focus();
     return close;
   }
 
@@ -3659,30 +3771,26 @@
 
     var panel = document.createElement('div');
     panel.className = 'panel';
-    panel.innerHTML =
-      '<h3>绑定番剧</h3>' +
-      '<div class="sub">标题乱码／没有番名／自动认错时用这里。绑一次，整个合集的每一集都会复用。</div>' +
-      '<div class="hintbox">当前标题：<b class="cur-title"></b></div>' +
-      '<div class="row"><div><div class="lab">搜索番剧</div><div class="tip">中文名 / 罗马字 / 日文 / 英文都行，Re:0 这类简写也可以</div></div>' +
-      '<slot name="q"></slot></div>' +
-      '<div class="btns" style="justify-content:flex-start"><button class="search primary">搜索</button>' +
-      '<button class="autofill">用标题自动填</button></div>' +
-      '<div class="cand"></div>' +
-      '<div class="candhint" hidden></div>' +
-      '<div class="willbind" hidden></div>' +
-      '<div class="row"><div><div class="lab">当前是第几话</div>' +
-      '<div class="tip">填你正在看的这一集在<b>这个合集里</b>的序号。例：合集共 32 话、你在看第 21 个视频，就填 21 —— 多季连播时脚本会自己算出它是第几季第几话。</div></div>' +
-      '<slot name="ep"></slot></div>' +
-      '<div class="epmap" hidden></div>' +
-      '<div class="row"><div><div class="lab">生效范围</div><div class="tip">这条绑定管到哪儿。搬运番多数是「一个视频装多个分P」，所以默认管全部分P就够</div></div>' +
-      '<slot name="scope"></slot></div>' +
-      '<div class="chainbox" hidden></div>' +
-      '<div class="btns"><button class="clear danger">清除绑定</button>' +
-      '<button class="cancel">取消</button><button class="save primary" disabled>保存</button></div>';
+    panel.innerHTML = panelContent('绑定番剧',
+      '<div class="hintbox"><span>当前视频</span><b class="cur-title"></b></div>' +
+      '<div class="layout"><section class="section"><h4>搜索番剧</h4>' +
+      '<slot name="q"></slot>' +
+      '<div class="btns"><button type="button" class="search primary">搜索</button>' +
+      '<button type="button" class="autofill">从视频标题识别</button></div>' +
+      '<div class="cand"></div><div class="candhint" hidden></div></section>' +
+      '<section class="section"><h4>应用到视频</h4>' +
+      '<div class="row"><div><div class="lab">当前集序号</div><div class="tip">填这集在合集里的排序</div></div>' +
+      '<slot name="ep"></slot></div><div class="epmap" hidden></div>' +
+      '<div class="row-stack"><div class="lab">生效范围</div><slot name="scope"></slot></div>' +
+      '<div class="willbind" hidden></div><div class="chainbox" hidden></div></section></div>',
+      '<button type="button" class="clear danger">清除绑定</button>' +
+      '<div class="btns"><button type="button" class="cancel">取消</button>' +
+      '<button type="button" class="save primary" disabled>保存绑定</button></div>');
 
     // 输入控件一律走 light DOM + slot 投影（见 15.1 的说明）
     var slotted = [];
-    var closePanel = mountPanel(panel, function () { dropNodes(slotted); });
+    var active = true;
+    var closePanel = mountPanel(panel, function () { active = false; dropNodes(slotted); });
     var mk = function (tag, name, css, cls) {
       var n = mkSlot(tag, name, css);
       if (cls) n.className = cls;
@@ -3692,7 +3800,7 @@
 
     panel.querySelector('.cur-title').textContent = ctx.mainTitle + (ctx.partTitle ? ' / ' + ctx.partTitle : '');
 
-    var selScope = mk('select', 'scope', SEL_CSS, 'scope');
+    var selScope = mk('select', 'scope', FILL_FIELD_CSS, 'scope');
     var keys = bindingKeys(ctx);
     keys.forEach(function (k, i) {
       var o = document.createElement('option');
@@ -3702,12 +3810,15 @@
       selScope.appendChild(o);
     });
 
-    var qInput = mk('input', 'q', INP_CSS, 'q');
+    var qInput = mk('input', 'q', FILL_FIELD_CSS, 'q');
     qInput.type = 'text';
-    qInput.placeholder = '例如：葬送的芙莉莲 / Re:0';
+    qInput.placeholder = '番名，例如 葬送的芙莉莲';
+    qInput.setAttribute('aria-label', '搜索番剧');
 
-    var epInput = mk('input', 'ep', INP_CSS + 'width:90px;', 'ep');
+    var epInput = mk('input', 'ep', SHORT_FIELD_CSS, 'ep');
     epInput.type = 'number'; epInput.min = '1'; epInput.max = '500'; epInput.value = '1';
+    epInput.setAttribute('aria-label', '当前集序号');
+    selScope.setAttribute('aria-label', '绑定生效范围');
 
     var candBox = panel.querySelector('.cand');
     var candHint = panel.querySelector('.candhint');
@@ -3715,9 +3826,6 @@
     var chainBox = panel.querySelector('.chainbox');
     var epMapEl = panel.querySelector('.epmap');
     var willBindEl = panel.querySelector('.willbind');
-    // 关键样式内联：CSP 拦掉 <style> 时这块提示仍然看得见
-    willBindEl.style.cssText = 'margin:8px 0 2px;padding:8px 10px;border-radius:8px;' +
-      'background:#f4f7fb;color:#2b3a4a;font-size:12.5px;line-height:1.6;';
     // 用户手动点过的条目 id：搜索回来不许把它换掉（见 pickAfterSearch）
     var userPickedId = null;
 
@@ -3737,12 +3845,17 @@
 
     var picked = exist ? { id: exist.anilistId, idMal: exist.malId, title: exist.title, episodes: exist.episodes } : null;
     var searchResults = [];
+    var searched = false;
+    var searchRequest = 0;
 
     /* ---- 多季连播：季链推导 + 可见可改 ---- */
     var ms = detectMultiSeason(ctx);
-    var chainState = { chain: (exist && exist.seasonChain) || null, loading: false };
-    // 已存下来的季链就是为这条绑定算的 —— 补上 builtFor 章，守卫才认它
-    if (exist && exist.seasonChain && exist.anilistId) exist.seasonChain.builtFor = exist.anilistId;
+    var originalChain = savedSeasonChain(exist);
+    var chainState = {
+      chain: originalChain ? Object.assign({}, originalChain, { builtFor: exist.anilistId }) : null,
+      loading: false
+    };
+    var chainRequest = 0;
     var seasonInput = null;
 
     function renderChain() {
@@ -3774,16 +3887,16 @@
           }).join(' + ');
           if (s.entries.length > 1) entryTxt += ' = ' + s.entriesSum + ' 话';
         } else {
-          entryTxt = '<span style="color:#d97706">没能对上数据库条目</span>';
+          entryTxt = '<span class="caution">没能对上数据库条目</span>';
         }
         var warn = '';
-        if (s.aligned === false) warn = ' <b style="color:#d97706">这一段不会跳</b>';
+        if (s.aligned === false) warn = ' <b class="caution">这一段不会跳</b>';
         else if (s.diff) warn = ' <span class="cn">（比段内 P 数少 ' + Math.abs(s.diff) + ' 话，多半是 OVA／特别篇）</span>';
 
         // 标出「你选的那条番剧落在这一段」——
         // 三段季边界跟选了哪季无关，不标的话选错条目用户根本看不出来
         var isPicked = !!(picked && (s.entries || []).some(function (e) { return e.anilistId === picked.id; }));
-        var mark = isPicked ? ' <b style="color:#0a7d63">← 你选的是这一段</b>' : '';
+        var mark = isPicked ? ' <b class="picked">← 你选的是这一段</b>' : '';
 
         return '<div class="chainrow' + (isPicked ? ' on' : '') + '"><b>第 ' + (s.season || (i + 1)) + ' 段</b>' +
                (s.startPage ? ' P' + s.startPage + '–P' + s.endPage : '') +
@@ -3796,16 +3909,16 @@
         : '依据：AniList 续季关系推导。';
       var unresolved = (chain.seasons || []).filter(function (x) { return x.aligned === false; }).length;
       if (unresolved) {
-        tip += '<b style="color:#d97706">有 ' + unresolved + ' 段没能自动对上条目，那几段不会跳 —— 换个关键词重搜、或选另一季的条目再试。</b>';
+        tip += '<b class="caution">有 ' + unresolved + ' 段没能自动对上条目，那几段不会跳 —— 换个关键词重搜、或选另一季的条目再试。</b>';
       } else if (chain.mismatch) {
-        tip += '<b style="color:#d97706">与你标题里写的话数对不上，请核对。</b>';
+        tip += '<b class="caution">与你标题里写的话数对不上，请核对。</b>';
       }
 
       var editor = fromParts
         ? ''
         : ('<div class="row"><div><div class="lab">每季话数</div><div class="tip">逗号分隔，按季顺序。改完点「应用话数」</div></div>' +
            '<slot name="seasons"></slot></div>' +
-           '<div class="btns" style="justify-content:flex-start"><button class="applyEps">应用话数</button></div>');
+           '<div class="btns"><button type="button" class="applyEps">应用话数</button></div>');
 
       chainBox.innerHTML =
         '<div class="lab">多季连播合集 · 季边界</div>' +
@@ -3813,8 +3926,9 @@
 
       if (!fromParts) {
         if (!seasonInput) {
-          seasonInput = mk('input', 'seasons', INP_CSS + 'width:130px;', 'seasons');
+          seasonInput = mk('input', 'seasons', FIELD_CSS + 'width:104px;', 'seasons');
           seasonInput.type = 'text';
+          seasonInput.setAttribute('aria-label', '每季话数');
         }
         seasonInput.value = chain.seasons.map(function (s) { return s.episodes || ''; }).join(',');
         var btn = panel.querySelector('.applyEps');
@@ -3844,7 +3958,7 @@
       willBindEl.hidden = false;
       var txt = '将绑定：<b>' + escapeHtml(picked.title || '') + '</b>' +
         (picked.episodes ? '（' + picked.episodes + ' 集）' : '') +
-        '<span style="color:#8a9099"> · AniList ' + picked.id + (picked.idMal ? ' / MAL ' + picked.idMal : '') + '</span>';
+        '<span class="tip"> · AniList ' + picked.id + (picked.idMal ? ' / MAL ' + picked.idMal : '') + '</span>';
 
       var segNo = 0;
       if (chainUsableFor(chainState.chain, picked.id)) {
@@ -3853,9 +3967,9 @@
         });
       }
       if (segNo) txt += '<br>它对应上面的<b>第 ' + segNo + ' 段</b>：保存后这一段里的分P都用它的时间戳。';
-      else if (ms.multi && chainState.loading) txt += '<br><span style="color:#d97706">正在推算季边界…</span>';
+      else if (ms.multi && chainState.loading) txt += '<br><span class="caution">正在推算季边界…</span>';
       else if (ms.multi && !chainUsableFor(chainState.chain, picked.id)) {
-        txt += '<br><span style="color:#d97706">季边界没算出来：保存后会按单季处理（合集里只有这一季就没问题）。</span>';
+        txt += '<br><span class="caution">季边界没算出来：保存后会按单季处理（合集里只有这一季就没问题）。</span>';
       }
       willBindEl.innerHTML = txt;
     }
@@ -3930,17 +4044,19 @@
       if (chainUsableFor(chainState.chain, picked.id)) { renderChain(); return; }
       if (!ms.multi) { renderChain(); return; }
       var forId = picked.id;          // 发起构建时记住是谁的季链（回调里 picked 可能已经变了）
+      var request = ++chainRequest;
       chainState.loading = true;
       renderChain();
       /* 看门狗：万一请求既不回也不报错，别让「保存」永远灰着（宁可让用户存单季+提示） */
       var watchdog = setTimeout(function () {
-        if (!chainState.loading) return;
+        if (!active || request !== chainRequest || !chainState.loading) return;
         chainState.loading = false;
         renderChain();
       }, 12000);
       // ctx 必须传进去 —— 有了分P标题里的季标记，边界才能按 UP 主自己分的段来算
       buildSeasonChain(forId, ms.totalEps, ctx, qInput.value.trim() || picked.title, searchResults, picked.title).then(function (chain) {
         try { clearTimeout(watchdog); } catch (e) { /* ignore */ }
+        if (!active || request !== chainRequest) return;
         chainState.loading = false;
         if (chain) {
           // 章要盖在「为谁算的」上，不能盖在回调那一刻的 picked 上
@@ -3981,9 +4097,11 @@
 
     function renderCands() {
       if (mergeChainCands()) { /* 新补进来的条目在下面一起画 */ }
+      var focused = shadow.activeElement;
+      var focusId = focused && focused.getAttribute('data-candidate');
       candBox.innerHTML = '';
       if (!searchResults.length) {
-        candBox.innerHTML = '<div class="cand-item"><div class="nm" style="color:#8a9099">没有结果，换个关键词试试</div></div>';
+        candBox.innerHTML = searched ? '<div class="result-empty">没有找到候选，试试其他番名。</div>' : '';
         candHint.hidden = true;
         updateSaveState();
         return;
@@ -3993,11 +4111,14 @@
       candHint.textContent = '共 ' + searchResults.length + ' 条候选' +
         (searchResults.length > 3 ? '，框内可上下滚动' : '');
       searchResults.forEach(function (m) {
-        var item = document.createElement('div');
-        item.className = 'cand-item';
-        if (picked && picked.id === m.id) item.className += ' on';
+        var item = document.createElement('button');
+        item.type = 'button';
+        var selected = !!(picked && picked.id === m.id);
+        item.className = 'cand-item' + (selected ? ' on' : '');
+        item.setAttribute('aria-pressed', selected ? 'true' : 'false');
+        item.setAttribute('data-candidate', m.id);
         var titles = [m.cn, m.title.romaji, m.title.english, m.title.native].filter(Boolean).join(' / ');
-        item.innerHTML = '<div class="nm"></div><div class="meta"></div>';
+        item.innerHTML = '<span class="nm"></span><span class="meta"></span>';
         item.querySelector('.nm').textContent = titles;
         item.querySelector('.meta').textContent = [
           m.via === 'bangumi' ? '经 Bangumi 中文库命中'
@@ -4019,15 +4140,19 @@
           refreshChain();
         });
         candBox.appendChild(item);
+        if (focusId === String(m.id)) item.focus();
       });
     }
 
     function runSearch() {
       var q = qInput.value.trim();
       if (!q) return;
-      candBox.innerHTML = '<div class="cand-item"><div class="nm" style="color:#8a9099">搜索中…</div></div>';
+      var request = ++searchRequest;
+      searched = true;
+      candBox.innerHTML = '<div class="result-empty" role="status">正在搜索…</div>';
       saveBtn.disabled = true;
       searchByName(q).then(function (list) {
+        if (!active || request !== searchRequest) return;
         // 拷一份：searchByName 可能直接把 6 小时缓存里的数组交出来，
         // 后面的「季族补全」会往列表里加东西，别把缓存改了
         searchResults = (list || []).slice();
@@ -4106,7 +4231,7 @@
     renderCands();
     renderChain();
     if (picked) { updateSaveState(); refreshChain(); }
-    setTimeout(function () { qInput.focus(); qInput.select(); }, 50);
+    setTimeout(function () { if (active) { qInput.focus(); qInput.select(); } }, 50);
   }
 
   /* ---- 数据备份与恢复（导出 / 导入 / 撤销） ----
@@ -4293,70 +4418,68 @@
   }
 
   /* ---- 设置面板 ---- */
+
+  function checkRow(cls, title, tip) {
+    return '<label class="row check-row"><span><span class="lab">' + title + '</span>' +
+      (tip ? '<br><span class="tip">' + tip + '</span>' : '') +
+      '</span><input type="checkbox" class="' + cls + '"></label>';
+  }
+
   function openSettings() {
     ensureUI();
     var panel = document.createElement('div');
     panel.className = 'panel';
-    panel.innerHTML =
-      '<h3>番剧 OP/ED 跳过 · 设置</h3>' +
-      '<div class="sub">默认「不自动识别」—— 除非你手动绑定过，普通视频永远不会被处理。</div>' +
-      '<div class="row"><div><div class="lab">自动识别</div>' +
-      '<div class="tip">off＝不自动（推荐，最安全）｜ask＝识别后让你点着跳｜auto＝全自动</div></div>' +
-      '<slot name="mode"></slot></div>' +
-      '<div class="row"><div><div class="lab">跳过 OP</div></div><input type="checkbox" class="op"></div>' +
-      '<div class="row"><div><div class="lab">跳过 ED</div></div><input type="checkbox" class="ed"></div>' +
-      '<div class="row"><div><div class="lab">跳过偏移（秒）</div><div class="tip">在数据库给的时间戳上再挪一点。正数＝多跳（跳过 OP 后的黑屏／静帧），负数＝少跳（保留 OP 尾巴，最多减到片段起点，不会倒着跳）</div></div>' +
-      '<slot name="offset"></slot></div>' +
-      '<div class="row"><div><div class="lab">片头/片尾整段平移（秒）</div><div class="tip">UP 主在开头多加了片段时用：起点和落点一起挪。比如开头多加了 20 秒就填 20，OP/ED 会整段顺延 20 秒</div></div>' +
-      '<slot name="skipshift"></slot></div>' +
-      '<div class="row"><div><div class="lab">撤回提示秒数</div><div class="tip">跳过后可以点「撤回」回到原位置，0＝不显示</div></div>' +
-      '<slot name="undo"></slot></div>' +
-      '<div class="row"><div><div class="lab">显示跳转提示</div></div><input type="checkbox" class="toast"></div>' +
-      '<div class="row"><div><div class="lab">优先用合集单集标题</div><div class="tip">UP 主在合集里改过的标题往往比原始标题干净</div></div><input type="checkbox" class="seasonT"></div>' +
-      '<div class="row"><div><div class="lab">隐藏胶囊（普通视频）</div><div class="tip">未识别出番剧的普通视频上不显示胶囊；识别成功／已绑定的番剧照常显示。想找回入口用油猴菜单</div></div><input type="checkbox" class="hide"></div>' +
-      '<div class="row"><div><div class="lab">自动切下一集</div><div class="tip">ED 跳完直接切下一个 P／下一话（依次退化：播放器的下一集按钮 → 同 BV 分P → UGC 合集下一话）。只给「ED 后面没有彩蛋」的番用，默认关</div></div><input type="checkbox" class="autonext"></div>' +
-      '<div class="row"><div><div class="lab">胶囊位置</div><div class="tip">胶囊可以直接用鼠标／手指拖到任意位置，位置会记住；拖累了就点这里回到右上角</div></div>' +
-      '<button class="resetpos">重置位置</button></div>' +
-      '<div class="row"><div><div class="lab">数据备份</div>' +
-      '<div class="tip">导出绑定 / 本地标记 / 设置，换浏览器或重装后导回来。本地标记是手标的画面指纹，丢了没法重建</div></div>' +
-      '<button class="backup">导出 / 导入</button></div>' +
-      '<div class="btns"><button class="clr">清空缓存</button>' +
-      '<button class="cancel">取消</button><button class="save primary">保存</button></div>';
+    panel.innerHTML = panelContent('跳过设置',
+      '<div class="layout settings-layout"><section class="section"><h4>识别与播放</h4>' +
+      '<div class="stack"><div class="lab">自动识别</div><slot name="mode"></slot></div>' +
+      checkRow('op', '跳过 OP') + checkRow('ed', '跳过 ED') +
+      checkRow('autonext', '片尾跳完后切下一集', '适用于片尾后没有彩蛋的番剧') +
+      checkRow('seasonT', '优先使用合集的单集标题') +
+      '</section><section class="section"><h4>时间校准</h4>' +
+      '<div class="row"><div><div class="lab">跳过偏移</div><div class="tip">只调整落点，单位为秒</div></div><slot name="offset"></slot></div>' +
+      '<div class="row"><div><div class="lab">整段平移</div><div class="tip">起点和落点同时移动，单位为秒</div></div><slot name="skipshift"></slot></div>' +
+      '<div class="row"><div><div class="lab">撤回提示秒数</div><div class="tip">填 0 隐藏撤回按钮</div></div><slot name="undo"></slot></div>' +
+      '</section><section class="section"><h4>播放器界面</h4>' +
+      checkRow('toast', '显示跳转提示') + checkRow('hide', '普通视频隐藏状态卡', '仍可从脚本管理器打开设置') +
+      '<div class="row"><span>状态卡位置</span><button type="button" class="resetpos">重置位置</button></div></section>' +
+      '<section class="section"><h4>本地数据</h4>' +
+      '<div class="row"><div><div class="lab">数据备份</div><div class="tip">转移设置、绑定和帧标记</div></div>' +
+      '<button type="button" class="backup">导出 / 导入</button></div>' +
+      '<div class="row"><div><div class="lab">识别缓存</div><div class="tip">清空后将重新查询</div></div>' +
+      '<button type="button" class="clr">清空缓存</button></div></section></div>',
+      '<div class="btns"><button type="button" class="cancel">取消</button><button type="button" class="save primary">保存设置</button></div>');
 
     // 输入控件同样走 light DOM + slot（见 15.1）
     var slotted = [];
     var closePanel = mountPanel(panel, function () { dropNodes(slotted); });
-    var modeSel = mkSlot('select', 'mode', SEL_CSS);
+    var modeSel = mkSlot('select', 'mode', FILL_FIELD_CSS);
     modeSel.className = 'mode';
+    modeSel.setAttribute('aria-label', '自动识别');
     slotted.push(modeSel);
-    [['off', 'off · 不自动识别'], ['ask', 'ask · 识别后询问'], ['auto', 'auto · 全自动']].forEach(function (o) {
+    [['off', '仅手动绑定'], ['ask', '识别后手动跳过'], ['auto', '高置信度时自动跳过']].forEach(function (o) {
       var op = document.createElement('option');
       op.value = o[0]; op.textContent = o[1];
       modeSel.appendChild(op);
     });
-    var undoInput = mkSlot('input', 'undo', INP_CSS + 'width:90px;');
+    var undoInput = mkSlot('input', 'undo', SHORT_FIELD_CSS);
     undoInput.className = 'undo';
     undoInput.type = 'number'; undoInput.min = '0'; undoInput.max = '30';
+    undoInput.setAttribute('aria-label', '撤回提示秒数');
     slotted.push(undoInput);
-    var offInput = mkSlot('input', 'offset', INP_CSS + 'width:90px;');
+    var offInput = mkSlot('input', 'offset', SHORT_FIELD_CSS);
     offInput.className = 'offset';
     offInput.type = 'number'; offInput.min = '-30'; offInput.max = '30'; offInput.step = '1';
+    offInput.setAttribute('aria-label', '跳过偏移秒数');
     slotted.push(offInput);
-    var shiftInput = mkSlot('input', 'skipshift', INP_CSS + 'width:90px;');
+    var shiftInput = mkSlot('input', 'skipshift', SHORT_FIELD_CSS);
     shiftInput.className = 'skipshift';
     shiftInput.type = 'number'; shiftInput.min = '-30'; shiftInput.max = '30'; shiftInput.step = '1';
+    shiftInput.setAttribute('aria-label', '整段平移秒数');
     slotted.push(shiftInput);
 
-    // 复选框：只做「不给焦点」（tabindex=-1 + 阻止 mousedown 默认行为），
-    // 翻转交给浏览器原生行为 —— 自己翻的实现见 15.2 的踩坑记录
-    ['op', 'ed', 'toast', 'seasonT', 'hide', 'autonext'].forEach(function (cls) {
-      noFocus(panel.querySelector('.' + cls));
-    });
-    noFocus(panel.querySelector('.clr'));
-    noFocus(panel.querySelector('.cancel'));
-    noFocus(panel.querySelector('.save'));
+
+
     var resetPosBtn = panel.querySelector('.resetpos');
-    noFocus(resetPosBtn);
 
     modeSel.value = config.autoDetect;
     panel.querySelector('.op').checked = config.jumpOp;
@@ -4381,7 +4504,6 @@
       showToast('胶囊位置已重置', '回到右上角');
     });
     var backupBtn = panel.querySelector('.backup');
-    noFocus(backupBtn);
     backupBtn.addEventListener('click', function () {
       closePanel();
       openBackupPanel();
@@ -4432,20 +4554,23 @@
     ensureUI();
     var panel = document.createElement('div');
     panel.className = 'panel';
-    panel.innerHTML =
-      '<h3>数据备份</h3>' +
-      '<div class="sub">导出＝把绑定 / 本地标记 / 设置存成一段文本，粘到记事本或网盘即可。' +
-      '导入＝用备份整包替换当前数据（导入前会自动留一份快照，可以撤销）。</div>' +
-      '<textarea class="bktext" spellcheck="false" style="width:100%;height:150px;box-sizing:border-box;' +
-      'font:12px/1.6 Consolas,Menlo,monospace;padding:8px;border:1px solid #ddd;border-radius:8px;"></textarea>' +
-      '<div class="btns" style="justify-content:flex-start">' +
-      '<button class="bkfill primary">导出到框里</button>' +
-      '<button class="bkcopy">复制</button>' +
-      '<button class="bkimport">从框里导入</button>' +
-      '<button class="bkundo">撤销导入</button></div>' +
-      '<div class="sub bktip"></div>';
-    var close = mountPanel(panel);
-    var box = panel.querySelector('.bktext');
+    panel.innerHTML = panelContent('数据备份',
+      '<section class="section"><h4>备份文本</h4>' +
+      '<p class="tip">备份包含设置、绑定和帧标记。导入会替换当前数据，并保留一次撤销机会。</p>' +
+      '<slot name="bktext"></slot><p class="bktip sub" role="status"></p></section>',
+      '<button type="button" class="bkback">返回设置</button><div class="btns">' +
+      '<button type="button" class="bkundo">撤销导入</button>' +
+      '<button type="button" class="bkimport">导入</button>' +
+      '<button type="button" class="bkcopy">复制</button>' +
+      '<button type="button" class="bkfill primary">生成备份</button></div>');
+    var close = mountPanel(panel, function () { dropNodes([box]); });
+    var box = mkSlot('textarea', 'bktext', FIELD_CSS +
+      'display:block;width:100%;min-height:160px;height:210px;resize:vertical;font:12px/1.6 Consolas,monospace;');
+    box.className = 'bktext';
+    box.spellcheck = false;
+    box.setAttribute('aria-label', '备份 JSON 文本');
+    box.placeholder = '生成备份，或在这里粘贴备份文本';
+    panel.querySelector('.bkback').addEventListener('click', function () { close(); openSettings(); });
     var tip = panel.querySelector('.bktip');
     var undoBtn = panel.querySelector('.bkundo');
     undoBtn.style.display = hasBackupSnapshot() ? '' : 'none';
@@ -4461,7 +4586,7 @@
         Object.keys(bk.localSegs).length + ' 套（已全选，Ctrl+C 复制）');
     });
     panel.querySelector('.bkcopy').addEventListener('click', function () {
-      if (!box.value) { say('先点「导出到框里」生成内容'); return; }
+      if (!box.value) { say('先生成备份或粘贴备份文本'); return; }
       copyText(box.value);
     });
     panel.querySelector('.bkimport').addEventListener('click', function () {
@@ -4501,6 +4626,10 @@
     runtime.autoNextDone = false;
     stopMonitor();
     stopFrameMonitor();
+    var pending = takePendingNext();
+    if (pending && pending.key === locKeyOf() && document.body.contains(pending.video)) {
+      resumePlayback(pending.video, pending.wasPaused);
+    }
     return buildContext().then(function (ctx) {
       if (gen !== runtime.gen) return null;          // 已经切走了，这次结果作废
       runtime.ctx = ctx;

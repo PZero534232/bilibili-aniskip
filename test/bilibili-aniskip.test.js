@@ -593,8 +593,8 @@ function makeEnv(opts) {
   global.window = win;
   global.unsafeWindow = {};
   global.location = opts.location || { pathname: '/video/BV_TEST000001', search: '?p=1' };
-  global.setTimeout = () => 0;
-  global.clearTimeout = () => {};
+  global.setTimeout = opts.trackTimers ? (run, delay) => timers.push({ run, delay }) : () => 0;
+  global.clearTimeout = (id) => { if (timers[id - 1]) timers[id - 1].cancelled = true; };
   global.clearInterval = (id) => { cleared.push(id); };
   global.setInterval = (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; };
   global.alert = () => {};      // 浏览器全局；老版本某些兜底路径会调，桩一下免得崩溃
@@ -602,7 +602,7 @@ function makeEnv(opts) {
   global.prompt = () => null;
 
   eval(SRC);
-  return { api: global.unsafeWindow.__biliAniskip, store, intervals, cleared, win, body, doc: global.document };
+  return { api: global.unsafeWindow.__biliAniskip, store, timers, intervals, cleared, win, body, doc: global.document };
 }
 
 function ctxOf(bvid, page) {
@@ -687,6 +687,12 @@ function ctxOf(bvid, page) {
     check('近似重复去重', validateSegs([S('op', 10, 100), S('op', 11, 101)], 1500).length, 1);
     check('OP+ED 都保留', validateSegs([S('op', 10, 100), S('ed', 1300, 1390)], 1500).length, 2);
     check('未知类型丢弃', validateSegs([S('preview', 10, 100)], 1500).length, 0);
+    const early = validateSegs([S('ed', 4.688, 94.688)], 1950);
+    checkTrue('开场附近的 ED 保留为待确认', !!early[0].reviewReason);
+    const { shouldAutoSkip } = makeEnv().api.api_;
+    check('本集只有待确认片段时，即使已绑定也不会启用自动跳过',
+      shouldAutoSkip({ ok: true, manual: true, segments: early }), false);
+    check('视频后段的正常 ED 无需确认', validateSegs([S('ed', 1328, 1419)], 1798)[0].reviewReason, undefined);
   }
 
   /* --- 5. 双源合并 --- */
@@ -767,6 +773,16 @@ function ctxOf(bvid, page) {
       partTitle: '', seasonId: null, seasonEpisodeTitle: '', seasonTitle: ''
     });
     checkTrue('跳过 number:null 的整剧级记录', !(r3.segments || []).some(s => s.source === 'animeskip'), r3.segments);
+
+    const overlap = makeEnv({ net: {
+      ...net,
+      'https://api.aniskip.com/v2/skip-times': { found: true, results: [
+        { skipType: 'op', interval: { startTime: 5, endTime: 14 } }
+      ] }
+    } });
+    const fallback = await overlap.api.api_.fetchSegsFor(52991, 154587, 1, 1440);
+    check('主源无效片段不挡住重叠的备用时间戳',
+      fallback.segs.find(s => s.type === 'op'), S('op', 3, 93, 'animeskip'));
   }
 
   /* --- 6. 多分P锚点推算 --- */
@@ -833,7 +849,7 @@ function ctxOf(bvid, page) {
       e.api.blacklistKeys(ctxOf('BV_TEST000001', 1)).indexOf('b:BV_TEST000001') >= 0);
   }
 
-  /* --- 10. 绑定作用域顺序（bvid 优先于 season） --- */
+  /* --- 10. 绑定作用域：表单默认宽范围，读取优先用局部覆盖 --- */
   head('10. 绑定作用域优先级');
   {
     const e = makeEnv();
@@ -842,6 +858,11 @@ function ctxOf(bvid, page) {
     check('作用域按 season → bvid → cid 排列', keys[0], 'season');
     checkTrue('同时存在 bvid 粒度', keys.indexOf('bvid') >= 0);
     checkTrue('同时存在 cid 粒度', keys.indexOf('cid') >= 0);
+    const bindings = { 's:12345': { title: '合集' }, 'b:BV_A': { title: '视频' }, 'c:999': { title: '单 P' } };
+    const scoped = makeEnv({ store: { _bindings: JSON.stringify(bindings) } });
+    check('单 P 覆盖视频及合集绑定', scoped.api.getBinding(ctx)._key, 'c:999');
+    check('其他分 P 用视频绑定', scoped.api.getBinding({ ...ctx, cid: 998 })._key, 'b:BV_A');
+    check('同合集的其他视频用合集绑定', scoped.api.getBinding({ ...ctx, bvid: 'BV_B', cid: 998 })._key, 's:12345');
   }
 
   /* --- 11. 长视频（结尾塞别的片段）不应被时长否决 --- */
@@ -918,6 +939,29 @@ function ctxOf(bvid, page) {
     rt.video = v5; rt.skipped = {}; rt.lastSkipAt = 0;
     e.api._checkOnce();
     check('时长未知时不跳', v5.currentTime, 50);
+
+    const earlyE = makeEnv({ store: { autoNext: true, cfgVersion: 4 } });
+    const early = makeVideo(25, 1950, false);
+    const clips = earlyE.api.api_.validateSegs([
+      { type: 'ed', start: 4.688, end: 94.688 },
+      { type: 'op', start: 110, end: 180 }
+    ], 1950);
+    earlyE.api._runtime.video = early;
+    earlyE.api._runtime.result = { ok: true, title: '测试', episode: 1, segments: clips };
+    earlyE.api._checkOnce();
+    check('可疑 ED 不自动跳', early.currentTime, 25);
+    early.currentTime = 25;
+    earlyE.api._runtime.skipped = {};
+    check('快捷跳过也不会未经确认就跳', earlyE.api._skipNow(), false);
+    const panel = byClass('panel');
+    const confirmation = panel && panel.querySelector('[data-review=0]');
+    checkTrue('详情里可确认跳过该 ED', !!confirmation);
+    if (confirmation) confirmation.click();
+    checkTrue('确认后才跳过可疑 ED', early.currentTime > 94, early.currentTime);
+    early.currentTime = 120;
+    earlyE.api._runtime.lastSkipAt = 0;
+    earlyE.api._checkOnce();
+    checkTrue('同一集的正常 OP 仍自动跳过', early.currentTime > 180, early.currentTime);
   }
 
   /* --- 13. 防认错季（用户名义用例） --- */
@@ -937,8 +981,11 @@ function ctxOf(bvid, page) {
   /* --- 14. UI 层级回归（曾因遮罩压住面板导致"灰色点不到"） --- */
   head('14. UI 层级回归');
   {
-    const panelZ = /'z-index:(\d+);background:#fff/.exec(SRC);
-    const maskZ = /background:rgba\(0,0,0,\.4\);pointer-events:auto;z-index:(\d+)/.exec(SRC);
+    const env = makeEnv();
+    const panel = openPanelVia(env, 'settings');
+    const mask = byClass('mask');
+    const panelZ = /z-index:(\d+)/.exec(panel.style.cssText);
+    const maskZ = /z-index:(\d+)/.exec(mask.style.cssText);
     checkTrue('面板 z-index 高于遮罩',
       panelZ && maskZ && (+panelZ[1] > +maskZ[1]),
       { panelZ: panelZ && panelZ[1], maskZ: maskZ && maskZ[1] });
@@ -1089,7 +1136,7 @@ function ctxOf(bvid, page) {
   {
     checkTrue('输入控件经 <slot> 放 light DOM', /function mkSlot\(/.test(SRC) && /host\.appendChild\(node\)/.test(SRC));
     checkTrue('面板内 keydown 冒泡阶段截断', /panel\.addEventListener\('keydown', function \(e\) \{ e\.stopPropagation\(\); \}\)/.test(SRC));
-    checkTrue('按钮/复选框不抢焦点', /function noFocus\(/.test(SRC) && /tabindex/.test(SRC) && /mousedown/.test(SRC));
+    checkTrue('面板通过 Tab 在可见控件间循环', /function panelTabStops\(/.test(SRC) && /stops\[e\.shiftKey/.test(SRC));
     checkTrue('输入控件样式走 ::slotted（它们在影子树外）', /::slotted\(input\[type=text\]\)/.test(SRC));
     checkTrue('不再有 <input> 直接写在面板 innerHTML 里', !/innerHTML[\s\S]{0,80}<input type="text"/.test(SRC));
   }
@@ -1202,7 +1249,7 @@ function ctxOf(bvid, page) {
   head('21. 面板表述');
   {
     checkTrue('「P1 是预告」已删除', !/P1 是预告/.test(SRC) && !/class="off"/.test(SRC));
-    checkTrue('集号标注为「当前是第几话」', /当前是第几话/.test(SRC));
+    checkTrue('集号输入说明填写的是当前集在合集里的排序', /当前集序号/.test(SRC) && /填这集在合集里的排序/.test(SRC));
     checkTrue('集号有实时换算提示', /function updateEpMap/.test(SRC) && /合集第 ' \+ val \+ ' 话 → 第/.test(SRC));
     checkTrue('作用域改叫「生效范围」', /生效范围/.test(SRC));
     checkTrue('清洗开关已从设置面板移除', !/清洗标题噪声/.test(SRC));
@@ -1378,6 +1425,21 @@ function ctxOf(bvid, page) {
     // OVA：明确不跳，而不是猜一个条目去跳
     const rOva = await e3.api.identify(lzCtx(24));
     checkTrue('P24（OVA）明确不跳', !rOva.ok && rOva.reason === 'chain-miss', rOva.reason);
+
+    const automatic = makeEnv({ net: netLZ(), store: { autoDetect: 'auto' } });
+    const autoOvaCtx = { ...lzCtx(24), mainTitle: '無職転生 ～異世界行ったら本気だす～', partTitle: '第一季24' };
+    const autoOva = await automatic.api.identify(autoOvaCtx);
+    check('自动识别定位不到季内条目时也不猜时间戳', [autoOva.ok, autoOva.reason], [false, 'chain-miss']);
+    checkTrue('自动识别季链落空时不查询时间戳', !Object.keys(cacheOf(automatic)).some(k => /^seg:/.test(k)));
+
+    const offline = makeEnv({
+      net: netLZ(), store: { _bindings: JSON.stringify(bindLZ) },
+      netFail: (req) => /api\.(aniskip|anime-skip)\.com/.test(req.url) ? 'timeout' : null
+    });
+    const rOffline = await offline.api.identify(lzCtx(26));
+    check('季链定位后时间戳请求失败，保留本地指纹兜底需要的绑定键',
+      [rOffline.reason, rOffline.netFailed, rOffline.manual, rOffline.bindingKey],
+      ['net-error', true, true, 'b:BV1KspF6iELH']);
   }
 
   /* --- 23. 真实案例：尖帽子的魔法工坊（BV1jfDYBSEKs） ---
@@ -1899,6 +1961,17 @@ function ctxOf(bvid, page) {
     checkTrue('失败的结果不写进时间戳缓存',
       !Object.keys(cacheOf(e1)).some(k => /^seg:/.test(k)), Object.keys(cacheOf(e1)));
 
+    const bound = makeEnv({
+      store: { _bindings: JSON.stringify({
+        'b:BV_TEST000001': { anilistId: 154587, malId: 52991, title: '葬送のフリーレン', anchorPage: 1, anchorEp: 3 }
+      }) },
+      netFail: (req) => /api\.(aniskip|anime-skip)\.com/.test(req.url) ? 'timeout' : null
+    });
+    const rBound = await bound.api.identify(ctxOf('BV_TEST000001', 1));
+    check('单季绑定时间戳请求失败，保留本地指纹兜底需要的绑定键',
+      [rBound.reason, rBound.netFailed, rBound.manual, rBound.bindingKey],
+      ['net-error', true, true, 'b:BV_TEST000001']);
+
     /* ② 上游明确回答「这一集没有」→ 仍然是成功 + 0 段（不能把老行为改坏） */
     const e2 = makeEnv({
       store: { autoDetect: 'auto' },
@@ -1953,6 +2026,18 @@ function ctxOf(bvid, page) {
     await callHook(e5, 'applyRelationRules', 52991, 1);
     checkTrue('404 才允许缓存「这部番没有分季规则」',
       Object.keys(cacheOf(e5)).some(k => /^rel:/.test(k)), Object.keys(cacheOf(e5)));
+
+    let limited = 0;
+    const retry = makeEnv({
+      net: makeNet({ 'https://api.aniskip.com/v2/relation-rules': { rules: [
+        { from: { start: 1, end: 2 }, to: { malId: 200, start: 1 } }
+      ] } }),
+      netFail: (req) => /relation-rules/.test(req.url) && limited++ === 0 ? { status: 429 } : null
+    });
+    await retry.api.api_.applyRelationRules(100, 1);
+    check('429 放行后重新取得分季规则', (await retry.api.api_.applyRelationRules(100, 1)).malId, 200);
+    retry.api.api_._cacheSet('rel:101', []);
+    check('旧版未标记来源的空规则缓存会重新查询', (await retry.api.api_.applyRelationRules(101, 1)).malId, 200);
 
     /* ⑥ 缓存只存用得上的字段（整份 view JSON 会把 GM 存储撑爆） */
     const big = {
@@ -2223,7 +2308,7 @@ function ctxOf(bvid, page) {
   head('32. CSP 兜底 / 落盘时机（v0.4.5）');
   {
     checkTrue('胶囊关键样式内联（CSP 拦掉 <style> 也还能看）', /pill\.style\.cssText\s*=/.test(SRC));
-    checkTrue('胶囊圆点/分隔线也补了内联兜底', /dots\[di\]\.style\.cssText/.test(SRC));
+    checkTrue('状态卡的指示灯有内联颜色兜底', /function pillSignal\(/.test(SRC) && /DOT_COLORS\[tone\]/.test(SRC));
     checkTrue('关页前立刻落盘（pagehide）', /addEventListener\('pagehide', flushCache\)/.test(SRC));
     checkTrue('切到后台标签页时落盘', /visibilitychange/.test(SRC));
     checkTrue('ask 模式胶囊上有「跳过」入口', /data-a="go">跳过/.test(SRC));
@@ -2520,7 +2605,7 @@ function ctxOf(bvid, page) {
     e2.win.dispatch('pointerup', { clientX: 430, clientY: 200, pointerId: 1 });
     pill2.dispatch('click', {});
     check('拖完那一下不算点击（不会误跳）', v2.currentTime, 50);
-    pill2.dispatch('click', {});
+    pill2.querySelector('[data-a=go]').dispatch('click', {});
     checkTrue('正常点击仍然跳（按钮没被拖拽功能吃掉）', v2.currentTime > 50, v2.currentTime);
 
     // 设置面板里能重置（在 e2 上做：它是最后一个 env，GM_* 全局归它）
@@ -2619,6 +2704,27 @@ function ctxOf(bvid, page) {
     checkTrue('补算出来的季链写回了 GM 存储（下次开页面就正常）',
       !!(savedStale.seasonChain && savedStale.seasonChain.seasons && savedStale.seasonChain.seasons.length === 3),
       savedStale.seasonChain && savedStale.seasonChain.seasons && savedStale.seasonChain.seasons.length);
+
+    const bindingKey = 'b:BV1KspF6iELH';
+    const racing = makeEnv({
+      net: net37(), location: LOC37,
+      store: { _bindings: JSON.stringify({ [bindingKey]: { ...savedStale, seasonChain: null } }) }
+    });
+    const send = global.GM_xmlhttpRequest;
+    const held = [];
+    global.GM_xmlhttpRequest = (req) => {
+      if (/graphql\.anilist/.test(req.url)) held.push(req);
+      else send(req);
+    };
+    await racing.api.identify(ctx37(1));
+    const replacement = { ...savedStale, anilistId: 108465, malId: 39535,
+      seasonChain: { ...savedStale.seasonChain, builtFor: 108465 } };
+    racing.api.api_.applyBackup({ bindings: { [bindingKey]: replacement } });
+    global.GM_xmlhttpRequest = send;
+    held.forEach(send);
+    await tick(200);
+    const active = JSON.parse(racing.store._bindings)[bindingKey];
+    check('迟到的补链不会覆盖重新绑定或导入的季链', [active.anilistId, active.seasonChain.builtFor], [108465, 108465]);
 
     /* 季链是「按分P标题的季标记 + 累计话数」对齐的，跟拿哪一条当锚点无关 ——
      * 这正是自动补链能救回一条「绑错的旧绑定」的原因。 */
@@ -2904,7 +3010,7 @@ function ctxOf(bvid, page) {
   }
 
   /* ==================================================================
-   * 42. 自动切下一集（默认关；ED 跳完就切；开关在设置面板里）
+   * 42. 自动切下一集与撤回窗口
    * ================================================================== */
   head('42. 自动切下一集');
   {
@@ -2918,6 +3024,7 @@ function ctxOf(bvid, page) {
     const mkVideo = (o) => Object.assign({
       currentTime: 95, duration: 120, paused: false, ended: false,
       play() { this.paused = false; },
+      pause() { this.paused = true; },
       addEventListener() {}, getBoundingClientRect: () => ({ width: 800, height: 450 })
     }, o);
     const ED = { type: 'ed', start: 90, end: 100 };
@@ -2931,12 +3038,44 @@ function ctxOf(bvid, page) {
     check('默认关：ED 跳完不切下一集', b1.clicked, 0);
 
     /* ② 开启后：ED 跳完切一次（播放器自带的下一集按钮） */
-    const on = makeEnv({ store: { autoDetect: 'off', autoNext: true, cfgVersion: 4 } });
+    const on = makeEnv({ trackTimers: true, store: { autoDetect: 'off', autoNext: true, cfgVersion: 4 } });
     const b2 = mkNext(on);
     on.api._runtime.video = mkVideo();
     on.api._runtime.result = { ok: true, segments: [ED] };
     on.api._skipNow();
-    check('开启后：ED 跳完切一次', b2.clicked, 1);
+    check('撤回窗口内暂停当前播放，尚未切集', [b2.clicked, on.api._runtime.video.paused], [0, true]);
+    function elapseUndo(env) {
+      env.timers.filter(timer => timer.delay === 4000 && !timer.cancelled).forEach(timer => timer.run());
+    }
+    elapseUndo(on);
+    check('撤回窗口结束后切一次', b2.clicked, 1);
+
+    const undone = makeEnv({ trackTimers: true, store: { autoNext: true, cfgVersion: 4 } });
+    const undoNext = mkNext(undone);
+    const beforeUndo = mkVideo();
+    undone.api._runtime.video = beforeUndo;
+    undone.api._runtime.result = { ok: true, segments: [ED] };
+    undone.api._skipNow();
+    undone.api._runtime.undo();
+    elapseUndo(undone);
+    check('撤回恢复原位置和播放状态，同时取消切集', [beforeUndo.currentTime, beforeUndo.paused, undoNext.clicked], [95, false, 0]);
+
+    const changedLocation = { pathname: '/video/BV1TEST00001', search: '?p=1' };
+    const moved = makeEnv({ trackTimers: true, location: changedLocation, store: { autoNext: true, cfgVersion: 4 } });
+    const movedNext = mkNext(moved);
+    moved.api._runtime.video = mkVideo();
+    moved.api._runtime.result = { ok: true, segments: [ED] };
+    moved.api._skipNow();
+    changedLocation.search = '?p=2';
+    elapseUndo(moved);
+    check('用户先手动换集时，旧倒计时不会再次切集', movedNext.clicked, 0);
+
+    const atEnd = makeEnv({ trackTimers: true, store: { autoNext: true, cfgVersion: 4 } });
+    atEnd.api._runtime.video = mkVideo();
+    atEnd.api._runtime.result = { ok: true, segments: [ED] };
+    atEnd.api._skipNow();
+    elapseUndo(atEnd);
+    check('没有下一集可切时恢复原播放状态', atEnd.api._runtime.video.paused, false);
 
     /* ③ 不是 ED（比如 OP）不切 */
     const onOp = makeEnv({ store: { autoDetect: 'off', autoNext: true, cfgVersion: 4 } });
@@ -2948,7 +3087,7 @@ function ctxOf(bvid, page) {
 
     /* ④ 没有下一集按钮 → 多分P退化成改 ?p= */
     const loc3 = { pathname: '/video/BV1TEST00001', search: '?p=1', href: 'https://www.bilibili.com/video/BV1TEST00001?p=1' };
-    const mp = makeEnv({ store: { autoNext: true, cfgVersion: 4 }, location: loc3 });
+    const mp = makeEnv({ store: { autoNext: true, undoSeconds: 0, cfgVersion: 4 }, location: loc3 });
     mp.api._runtime.video = mkVideo();
     mp.api._runtime.ctx = { bvid: 'BV1TEST00001', page: 1, pages: [1, 2, 3] };
     mp.api._runtime.result = { ok: true, segments: [ED] };
@@ -3805,10 +3944,13 @@ function ctxOf(bvid, page) {
     checkTrue('设置面板有帮助「数据备份」按钮', !!sp.querySelector('.backup'));
     sp.querySelector('.backup').dispatch('click');
     const bp = orNode(byClass('panel'));
-    const box = bp.querySelector('.bktext');
+    const box = e.body.querySelector('[slot=bktext]');
     const tip = bp.querySelector('.bktip');
-    checkTrue('浮层有文本框', !!box);
+    checkTrue('备份文本框经 slot 投影，输入时保留原生文本控件身份', !!box && !!bp.querySelector('slot[name=bktext]'));
     checkTrue('浮层有导入按钮', !!bp.querySelector('.bkimport'));
+    check('备份面板带可访问的对话框语义', [bp.getAttribute('role'), bp.getAttribute('aria-label')], ['dialog', '数据备份']);
+
+    if (!box) throw new Error('备份文本框没有挂到 light DOM');
 
     box.value = '不是 json';
     bp.querySelector('.bkimport').dispatch('click');
